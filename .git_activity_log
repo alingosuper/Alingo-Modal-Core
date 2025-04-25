@@ -326,3 +326,4 @@ commit at 2025-04-23T09:00:00 - fix(runtime): resolve memory leak during asynchr
 commit at 2025-04-23T09:00:00 - test(suite): add comprehensive unit tests and mock integration helpers
 commit at 2025-04-24T09:00:00 - style(ui): align rounded cards and green/blue aesthetic guidelines
 commit at 2025-04-25T09:00:00 - docs: update API reference, architectural diagrams, and migration guides
+commit at 2025-04-25T09:00:00 - feat(core): initialize modular architecture and base parser bindings

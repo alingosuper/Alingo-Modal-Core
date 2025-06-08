@@ -369,3 +369,4 @@ commit at 2025-06-05T09:00:00 - style(ui): align rounded cards and green/blue ae
 commit at 2025-06-06T09:00:00 - feat(core): initialize modular architecture and base parser bindings
 commit at 2025-06-06T09:00:00 - feat(core): initialize modular architecture and base parser bindings
 commit at 2025-06-06T09:00:00 - docs: update API reference, architectural diagrams, and migration guides
+commit at 2025-06-08T09:00:00 - refactor(types): optimize type definitions and sanitization layers

@@ -443,3 +443,4 @@ commit at 2025-08-26T09:00:00 - refactor(types): optimize type definitions and s
 commit at 2025-08-26T09:00:00 - perf(engine): optimize execution speed and reduce binary footprint
 commit at 2025-08-26T09:00:00 - fix(runtime): resolve memory leak during asynchronous event loop execution
 commit at 2025-08-28T09:00:00 - fix(runtime): resolve memory leak during asynchronous event loop execution
+commit at 2025-08-30T09:00:00 - fix(runtime): resolve memory leak during asynchronous event loop execution

@@ -619,3 +619,4 @@ commit at 2026-02-03T09:00:00 - refactor(types): optimize type definitions and s
 commit at 2026-02-03T09:00:00 - style(ui): align rounded cards and green/blue aesthetic guidelines
 commit at 2026-02-03T09:00:00 - style(ui): align rounded cards and green/blue aesthetic guidelines
 commit at 2026-02-06T09:00:00 - refactor(types): optimize type definitions and sanitization layers
+commit at 2026-02-06T09:00:00 - docs: update API reference, architectural diagrams, and migration guides

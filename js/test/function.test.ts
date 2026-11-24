@@ -1,0 +1,796 @@
+import { ClientError, Status } from "nice-grpc";
+import { tc } from "../test-support/test-client";
+import { InvalidError, NotFoundError, Retries } from "modal";
+import { expect, test } from "vitest";
+import { createMockModalClients } from "../test-support/grpc_mock";
+import { Function_ } from "../src/function";
+import {
+  FunctionGetTimeRangeStatsRequest,
+  FunctionGetTimeRangeStatsResponse,
+  StatsPercentileDistribution,
+  AutoscalerSettings,
+  DataFormat,
+  FunctionUpdateSchedulingParamsRequest,
+  FunctionMessage,
+} from "../proto/modal_proto/api";
+
+test("FunctionCall", async () => {
+  const function_ = await tc.functions.fromName(
+    "libmodal-test-support",
+    "echo_string",
+  );
+
+  const resultKwargs = await function_.remote([], { s: "hello" });
+  expect(resultKwargs).toBe("output: hello");
+
+  const resultArgs = await function_.remote(["hello"]);
+  expect(resultArgs).toBe("output: hello");
+});
+
+test("FunctionCallJsMap", async () => {
+  const function_ = await tc.functions.fromName(
+    "libmodal-test-support",
+    "identity_with_repr",
+  );
+
+  const resultKwargs = await function_.remote([new Map([["a", "b"]])]);
+  expect(resultKwargs).toStrictEqual([{ a: "b" }, "{'a': 'b'}"]);
+});
+
+test("FunctionCallDateTimeRoundtrip", async () => {
+  const function_ = await tc.functions.fromName(
+    "libmodal-test-support",
+    "identity_with_repr",
+  );
+
+  const testDate = new Date("2024-01-15T10:30:45.123Z");
+  const result = await function_.remote([testDate]);
+
+  expect(Array.isArray(result)).toBe(true);
+  expect(result).toHaveLength(2);
+
+  const [identityResult, reprResult] = result as [unknown, string];
+
+  expect(reprResult).toContain("datetime.datetime");
+  expect(reprResult).toContain("2024");
+
+  expect(identityResult).toBeInstanceOf(Date);
+  const receivedDate = identityResult as Date;
+
+  // Check precision - JavaScript Date has millisecond precision
+  // Python datetime has microsecond precision
+  // We should get back millisecond precision (lose sub-millisecond)
+  const timeDiff = Math.abs(testDate.getTime() - receivedDate.getTime());
+
+  // JavaScript Date only has millisecond precision, so we should have no loss
+  expect(timeDiff).toBeLessThan(1); // Less than 1 millisecond
+  expect(receivedDate.getTime()).toBe(testDate.getTime());
+});
+
+test("FunctionCallLargeInput", async () => {
+  const function_ = await tc.functions.fromName(
+    "libmodal-test-support",
+    "bytelength",
+  );
+  const len = 3 * 1000 * 1000; // More than 2 MiB, offload to blob storage
+  const input = new Uint8Array(len);
+  const result = await function_.remote([input]);
+  expect(result).toBe(len);
+});
+
+test("FunctionNotFound", async () => {
+  const promise = tc.functions.fromName(
+    "libmodal-test-support",
+    "not_a_real_function",
+  );
+  await expect(promise).rejects.toThrow(NotFoundError);
+});
+
+test("FunctionCallInputPlane", async () => {
+  const function_ = await tc.functions.fromName(
+    "libmodal-test-support",
+    "input_plane",
+  );
+  const result = await function_.remote(["hello"]);
+  expect(result).toBe("output: hello");
+});
+
+test("FunctionGetCurrentStats", async () => {
+  const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+
+  mock.handleUnary("/FunctionGetCurrentStats", (req) => {
+    expect(req).toMatchObject({ functionId: "fid-stats" });
+    return { backlog: 3, numTotalTasks: 7 };
+  });
+
+  const function_ = new Function_(mc, "fid-stats");
+  const stats = await function_.getCurrentStats();
+  expect(stats).toEqual({ backlog: 3, numTotalRunners: 7 });
+
+  mock.assertExhausted();
+});
+
+test("FunctionUpdateAutoscaler", async () => {
+  const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+
+  let curSettings: AutoscalerSettings = {};
+
+  mock.handleUnary("/FunctionUpdateSchedulingParams", (req) => {
+    expect(req).toMatchObject({
+      functionId: "fid-auto",
+      settings: {
+        minContainers: 1,
+        maxContainers: 10,
+        bufferContainers: 2,
+        scaledownWindow: 300,
+      },
+    });
+
+    const newSettings = (req as FunctionUpdateSchedulingParamsRequest).settings;
+
+    curSettings = {
+      minContainers: newSettings?.minContainers ?? curSettings.minContainers,
+      maxContainers: newSettings?.maxContainers ?? curSettings.maxContainers,
+      bufferContainers:
+        newSettings?.bufferContainers ?? curSettings.bufferContainers,
+      scaledownWindow:
+        newSettings?.scaledownWindow ?? curSettings.scaledownWindow,
+    };
+
+    return {
+      currentSettings: { ...curSettings },
+    };
+  });
+
+  const function_ = new Function_(mc, "fid-auto");
+  let settings = await function_.updateAutoscaler({
+    minContainers: 1,
+    maxContainers: 10,
+    bufferContainers: 2,
+    scaledownWindowMs: 300 * 1000,
+  });
+
+  expect(settings).toMatchObject({
+    minContainers: 1,
+    maxContainers: 10,
+    bufferContainers: 2,
+    scaledownWindowMs: 300 * 1000,
+  });
+
+  mock.handleUnary("/FunctionUpdateSchedulingParams", (req) => {
+    expect(req).toMatchObject({
+      functionId: "fid-auto",
+      settings: { minContainers: 2 },
+    });
+
+    const newSettings = (req as FunctionUpdateSchedulingParamsRequest).settings;
+
+    curSettings = {
+      minContainers: newSettings?.minContainers ?? curSettings.minContainers,
+      maxContainers: newSettings?.maxContainers ?? curSettings.maxContainers,
+      bufferContainers:
+        newSettings?.bufferContainers ?? curSettings.bufferContainers,
+      scaledownWindow:
+        newSettings?.scaledownWindow ?? curSettings.scaledownWindow,
+    };
+
+    return {
+      currentSettings: { ...curSettings },
+    };
+  });
+
+  settings = await function_.updateAutoscaler({ minContainers: 2 });
+  expect(settings).toMatchObject({
+    minContainers: 2,
+    maxContainers: 10,
+    bufferContainers: 2,
+    scaledownWindowMs: 300 * 1000,
+  });
+
+  mock.assertExhausted();
+});
+
+test("FunctionGetWebUrl", async () => {
+  const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+
+  mock.handleUnary("FunctionGet", (req) => {
+    expect(req).toMatchObject({
+      appName: "libmodal-test-support",
+      objectTag: "web_endpoint",
+    });
+    return {
+      functionId: "fid-web",
+      handleMetadata: { webUrl: "https://endpoint.internal" },
+    };
+  });
+
+  const web_endpoint = await mc.functions.fromName(
+    "libmodal-test-support",
+    "web_endpoint",
+  );
+  expect(await web_endpoint.getWebUrl()).toBe("https://endpoint.internal");
+
+  mock.assertExhausted();
+});
+
+test("FunctionGetWebUrlOnNonWebFunction", async () => {
+  const function_ = await tc.functions.fromName(
+    "libmodal-test-support",
+    "echo_string",
+  );
+  expect(await function_.getWebUrl()).toBeUndefined();
+});
+
+test("FunctionFromNameWithVersion", async () => {
+  const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+
+  mock.handleUnary("FunctionGet", (req) => {
+    expect(req).toMatchObject({
+      appName: "libmodal-test-support",
+      objectTag: "echo_string",
+      appVersion: 3,
+    });
+    return {
+      functionId: "fid-versioned",
+      handleMetadata: {},
+    };
+  });
+
+  const function_ = await mc.functions.fromName(
+    "libmodal-test-support",
+    "echo_string",
+    { version: 3 },
+  );
+  expect(function_.functionId).toBe("fid-versioned");
+
+  mock.assertExhausted();
+});
+
+test("FunctionFromNameWithDotNotation", async () => {
+  const promise = tc.functions.fromName(
+    "libmodal-test-support",
+    "MyClass.myMethod",
+  );
+  await expect(promise).rejects.toThrow(
+    `Cannot retrieve Cls methods using 'functions.fromName()'. Use:\n  const cls = await client.cls.fromName("libmodal-test-support", "MyClass");\n  const instance = await cls.instance();\n  const m = instance.method("myMethod");`,
+  );
+});
+
+test("FunctionCallPreCborVersionError", async () => {
+  // test that calling a pre 1.2 function raises an error
+  const function_ = await tc.functions.fromName(
+    "test-support-1-1",
+    "identity_with_repr",
+  );
+
+  // Represent Python kwargs.
+  const promise = function_.remote([], { s: "hello" });
+  await expect(promise).rejects.toThrow(
+    /Redeploy with Modal Python SDK >= 1.2/,
+  );
+});
+
+test("WebEndpointRemoteCallError", async () => {
+  const function_ = await tc.functions.fromName(
+    "libmodal-test-support",
+    "web_endpoint_echo",
+  );
+
+  const promise = function_.remote(["hello"]);
+  await expect(promise).rejects.toThrow(InvalidError);
+  await expect(promise).rejects.toThrow(
+    /A webhook Function cannot be invoked for remote execution with '\.remote'/,
+  );
+});
+
+test("WebEndpointSpawnCallError", async () => {
+  const function_ = await tc.functions.fromName(
+    "libmodal-test-support",
+    "web_endpoint_echo",
+  );
+
+  const promise = function_.spawn(["hello"]);
+  await expect(promise).rejects.toThrow(InvalidError);
+  await expect(promise).rejects.toThrow(
+    /A webhook Function cannot be invoked for remote execution with '\.spawn'/,
+  );
+});
+
+test("DynamicConfigurationE2ETest", async () => {
+  const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+
+  mock.handleUnary("FunctionGet", (req) => {
+    expect(req).toMatchObject({
+      appName: "libmodal-test-support",
+      objectTag: "echo_string",
+    });
+
+    return {
+      functionId: "fid-unbound",
+      handleMetadata: {},
+    };
+  });
+
+  mock.handleUnary("FunctionBindParams", (req) => {
+    expect(req).toMatchObject({
+      functionId: "fid-unbound",
+      serializedParams: new Uint8Array(),
+      functionOptions: {
+        resources: {
+          milliCpu: 2000,
+          milliCpuMax: 2000,
+        },
+        maxConcurrentInputs: 10,
+        batchMaxSize: 10,
+        batchLingerMs: 100,
+      },
+    });
+
+    return {
+      boundFunctionId: "fid-bound",
+    };
+  });
+
+  const f = await mc.functions.fromName("libmodal-test-support", "echo_string");
+
+  const configured = f
+    .withOptions({ cpu: 2.0 })
+    .withOptions({ cpuLimit: 2.0 })
+    .withConcurrency({ maxInputs: 10 })
+    .withBatching({ maxBatchSize: 10, waitMs: 100 });
+
+  expect(configured).toMatchObject({
+    functionId: "fid-unbound",
+  });
+
+  // note(ayush): we check that the proto is created correctly in the mock rpc call
+  const boundF = await configured.instance();
+
+  expect(boundF.functionId).not.toBe(f.functionId);
+});
+
+test("Function.withOptions routingRegion", async () => {
+  const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+
+  mock.handleUnary("FunctionGet", (req) => {
+    expect(req).toMatchObject({
+      appName: "libmodal-test-support",
+      objectTag: "echo_string",
+    });
+    return {
+      functionId: "fid-unbound",
+      handleMetadata: {},
+    };
+  });
+
+  mock.handleUnary("FunctionBindParams", (req) => {
+    expect(req).toMatchObject({
+      functionId: "fid-unbound",
+      functionOptions: { routingRegion: "us-east" },
+    });
+    return {
+      boundFunctionId: "fid-bound",
+      handleMetadata: {
+        inputPlaneUrl: "https://us-east.modal.example",
+        inputPlaneRegion: "us-east",
+      },
+    };
+  });
+
+  const f = await mc.functions.fromName("libmodal-test-support", "echo_string");
+  const boundF = await f.withOptions({ routingRegion: "us-east" }).instance();
+
+  expect(boundF.functionId).toBe("fid-bound");
+});
+
+test("TestOptionsMutations", async () => {
+  const { mockClient: mc } = createMockModalClients();
+
+  const opts = {};
+  const f1 = new Function_(mc, "fid", "", undefined, opts);
+  const f2 = f1.withOptions({ cpu: 2.0 });
+  const f3 = f1.withOptions({ cpu: 2.0 });
+
+  // assert that opts wasn't mutated, reverse ordering of `{}` and opts is intentional
+  expect({}).toMatchObject(opts);
+
+  expect(f1).not.toBe(f2);
+  expect(f1).not.toBe(f3);
+  expect(f2).not.toBe(f3);
+});
+
+test("TestEmptyInstance", async () => {
+  const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+
+  mock.handleUnary("FunctionGet", (req) => {
+    expect(req).toMatchObject({
+      appName: "libmodal-test-support",
+      objectTag: "echo_string",
+    });
+
+    return {
+      functionId: "fid-unbound",
+      handleMetadata: {},
+    };
+  });
+
+  const f = await mc.functions.fromName("libmodal-test-support", "echo_string");
+
+  // shouldn't fail because it won't call the RPC
+  const bound = await f.instance();
+
+  expect(f.functionId).toBe(bound.functionId);
+});
+
+test("InstanceUsesBoundHandleMetadataThresholds", async () => {
+  const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+
+  mock.handleUnary("FunctionGet", () => ({
+    functionId: "fid-unbound",
+    handleMetadata: {
+      supportedInputFormats: [DataFormat.DATA_FORMAT_CBOR],
+    },
+  }));
+
+  // The bind response carries a tiny maxObjectSizeBytes so that even a small input must be
+  // offloaded to blob storage. The bound variant should adopt this metadata (matching Python).
+  mock.handleUnary("FunctionBindParams", () => ({
+    boundFunctionId: "fid-bound",
+    handleMetadata: {
+      supportedInputFormats: [DataFormat.DATA_FORMAT_CBOR],
+      maxObjectSizeBytes: 1,
+    },
+  }));
+
+  const f = await mc.functions.fromName("libmodal-test-support", "echo_string");
+  const boundF = await f.withOptions({ cpu: 2.0 }).instance();
+  expect(boundF.functionId).toBe("fid-bound");
+
+  // With the tiny bound threshold, remote() must reach BlobCreate even for a small input. We
+  // return a response without an upload URL so the upload fails deterministically, proving the
+  // bound metadata was used. If the bound metadata were ignored (stale 2 MiB base limit), the
+  // input would inline and BlobCreate would never be called.
+  mock.handleUnary("BlobCreate", () => ({ blobId: "bl-1" }));
+
+  await expect(boundF.remote(["hello"])).rejects.toThrow(
+    "Missing upload URL in BlobCreate response",
+  );
+});
+
+test("FunctionFromId", async () => {
+  const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+  mock.handleUnary("/FunctionGetById", (req) => {
+    expect(req).toMatchObject({ functionId: "fu-test" });
+    return {
+      handleMetadata: { webUrl: "https://test.modal.run", appId: "ap-test" },
+    };
+  });
+  const fn = await mc.functions.fromId("fu-test");
+  expect(fn.functionId).toBe("fu-test");
+  expect(await fn.getWebUrl()).toBe("https://test.modal.run");
+  mock.assertExhausted();
+  mc.close();
+});
+
+test.each(["isClass", "isServer"])(
+  "FunctionFromId rejects %s",
+  async (kind) => {
+    const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+    mock.handleUnary("/FunctionGetById", () => ({
+      function: { [kind]: true },
+    }));
+    await expect(mc.functions.fromId("fu-test")).rejects.toThrow(InvalidError);
+    mc.close();
+  },
+);
+
+test.each([Status.NOT_FOUND, Status.PERMISSION_DENIED])(
+  "FunctionFromId error %s",
+  async (code) => {
+    const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+    const error = new ClientError("/FunctionGetById", code, "lookup failed");
+    mock.handleUnary("/FunctionGetById", () => {
+      throw error;
+    });
+    await expect(mc.functions.fromId("fu-test")).rejects.toThrow(
+      code === Status.NOT_FOUND ? NotFoundError : ClientError,
+    );
+    mc.close();
+  },
+);
+
+test("FunctionStats maps historical results and filters", async () => {
+  const { mockClient, mockCpClient } = createMockModalClients();
+  const since = new Date("2026-09-01T00:00:00Z");
+  const until = new Date("2026-09-01T01:00:00Z");
+  const distribution = StatsPercentileDistribution.create({
+    unit: "seconds",
+    percentiles: [{ percentileBasisPoints: 9990, value: 1.5 }],
+  });
+  mockCpClient.handleUnary("FunctionGetTimeRangeStats", (request) => {
+    expect(request).toEqual(
+      FunctionGetTimeRangeStatsRequest.create({
+        functionId: "fu-stats",
+        since,
+        until,
+        containerId: "ta-container",
+        rollup: true,
+      }),
+    );
+    return FunctionGetTimeRangeStatsResponse.create({
+      since,
+      until,
+      inputSuccessCount: 10,
+      inputFailureCount: 2,
+      inputTimeoutCount: 3,
+      inputRunningAtEndCount: 4,
+      containerStartedCount: 5,
+      containerErrorCount: 6,
+      containerCreatingAtEndCount: 7,
+      variantCount: 8,
+      inputPercentileStats: { execution_time: distribution },
+      containerPercentileStats: { custom_metric: distribution },
+    });
+  });
+  const result = await new Function_(mockClient, "fu-stats").stats({
+    since,
+    until,
+    container: "ta-container",
+    allVariants: true,
+  });
+  expect(result).toEqual({
+    since,
+    until,
+    inputSuccessCount: 10,
+    inputFailureCount: 2,
+    inputTimeoutCount: 3,
+    inputRunningAtEndCount: 4,
+    containerStartedCount: 5,
+    containerErrorCount: 6,
+    containerCreatingAtEndCount: 7,
+    variantCount: 8,
+    allVariants: true,
+    inputPercentileStats: {
+      execution_time: {
+        unit: "seconds",
+        percentiles: [{ percentile: 99.9, value: 1.5 }],
+      },
+    },
+    containerPercentileStats: {
+      custom_metric: {
+        unit: "seconds",
+        percentiles: [{ percentile: 99.9, value: 1.5 }],
+      },
+    },
+  });
+  mockCpClient.assertExhausted();
+});
+
+test("FunctionStats defaults and empty results", async () => {
+  for (const params of [{}, { until: new Date("2026-09-01T00:00:00Z") }]) {
+    const { mockClient, mockCpClient } = createMockModalClients();
+    const before = Date.now();
+    mockCpClient.handleUnary("FunctionGetTimeRangeStats", (request) => {
+      const req = request as FunctionGetTimeRangeStatsRequest;
+      expect(req.until!.getTime() - req.since!.getTime()).toBe(3600000);
+      expect(req.rollup).toBe(false);
+      expect(req.containerId).toBeUndefined();
+      if (params.until) expect(req.until).toEqual(params.until);
+      else expect(req.until!.getTime()).toBeGreaterThanOrEqual(before);
+      return FunctionGetTimeRangeStatsResponse.create({
+        since: req.since,
+        until: req.until,
+      });
+    });
+    const result = await new Function_(mockClient, "fu-stats").stats(params);
+    expect(result.inputPercentileStats).toEqual({});
+    expect(result.containerPercentileStats).toEqual({});
+    expect(result.inputSuccessCount).toBe(0);
+    expect(result.allVariants).toBe(false);
+    mockCpClient.assertExhausted();
+  }
+});
+
+test("FunctionStats rejects invalid ranges and propagates RPC errors", async () => {
+  const { mockClient, mockCpClient } = createMockModalClients();
+  const f = new Function_(mockClient, "fu-stats");
+  const until = new Date("2026-09-01T00:00:00Z");
+  for (const since of [until, new Date(until.getTime() + 1), new Date(NaN)]) {
+    await expect(f.stats({ since, until })).rejects.toThrow(InvalidError);
+  }
+  await expect(f.stats({ until: new Date(NaN) })).rejects.toThrow(InvalidError);
+  mockCpClient.handleUnary("FunctionGetTimeRangeStats", () => {
+    throw new Error("stats unavailable");
+  });
+  await expect(f.stats()).rejects.toThrow("stats unavailable");
+  mockCpClient.assertExhausted();
+});
+
+test("FunctionInfo", async () => {
+  const f = await tc.functions.fromName("libmodal-test-support", "echo_string");
+
+  const freshInfo = await f.info();
+
+  expect(freshInfo.blockNetwork).toEqual(false);
+  expect(freshInfo.cloudBucketMounts).toEqual(new Map());
+  expect(freshInfo.gpus).toEqual([]);
+  expect(freshInfo.nonpreemptible).toEqual(false);
+  expect(freshInfo.restrictModalAccess).toEqual(false);
+  expect(freshInfo.routingRegion).toEqual("");
+  expect(freshInfo.secretIds).toEqual([]);
+  expect(freshInfo.singleUseContainers).toEqual(false);
+  expect(freshInfo.startupTimeoutSecs).toEqual(300);
+  expect(freshInfo.timeoutSecs).toEqual(300);
+  expect(freshInfo.volumes).toEqual(new Map());
+
+  const configured = f
+    .withOptions({
+      cpu: 1,
+      cpuLimit: 2,
+      memoryMiB: 512,
+      memoryLimitMiB: 1024,
+      gpu: "H100:8",
+      env: { test: "value" },
+      secrets: [await tc.secrets.fromName("libmodal-test-secret")],
+      volumes: {
+        "/mnt/tmp": (
+          await tc.volumes.fromName("libmodal-test-volume")
+        ).withMountOptions({ readOnly: true }),
+      },
+      retries: new Retries({ maxRetries: 10 }),
+      maxContainers: 4,
+      bufferContainers: 2,
+      scaledownWindowMs: 30_000,
+      timeoutMs: 60_000,
+      routingRegion: "us-west",
+    })
+    .withBatching({
+      maxBatchSize: 10,
+      waitMs: 100,
+    })
+    .withConcurrency({
+      maxInputs: 100,
+      targetInputs: 10,
+    });
+
+  const newUnhydratedInfo = await configured.info();
+
+  expect(newUnhydratedInfo.batchingInfo).toEqual({
+    maxBatchSize: 10,
+    waitMs: 100,
+  });
+  expect(newUnhydratedInfo.blockNetwork).toEqual(false);
+  expect(newUnhydratedInfo.concurrencyInfo).toEqual({
+    maxInputs: 100,
+    targetInputs: 10,
+  });
+  expect(newUnhydratedInfo.cpu).toEqual([1, 2]);
+  expect(newUnhydratedInfo.gpus).toEqual([{ count: 8, gpuType: "H100" }]);
+  expect(newUnhydratedInfo.maxRetries).toEqual(10);
+  expect(newUnhydratedInfo.memoryMiB).toEqual([512, 1024]);
+  expect(newUnhydratedInfo.nonpreemptible).toEqual(false);
+  expect(newUnhydratedInfo.restrictModalAccess).toEqual(false);
+  expect(newUnhydratedInfo.routingRegion).toEqual("us-west");
+  expect(newUnhydratedInfo.singleUseContainers).toEqual(false);
+  expect(newUnhydratedInfo.startupTimeoutSecs).toEqual(300);
+  expect(newUnhydratedInfo.timeoutSecs).toEqual(60);
+
+  expect(newUnhydratedInfo.volumes.size).toEqual(1);
+  expect(newUnhydratedInfo.volumes.get("/mnt/tmp")?.readOnly).toEqual(true);
+  expect(newUnhydratedInfo.secretIds.length).toEqual(1);
+
+  const newHydratedInfo = await (await configured.instance()).info();
+
+  expect(newHydratedInfo.batchingInfo).toEqual({
+    maxBatchSize: 10,
+    waitMs: 100,
+  });
+  expect(newHydratedInfo.blockNetwork).toEqual(false);
+  expect(newHydratedInfo.concurrencyInfo).toEqual({
+    maxInputs: 100,
+    targetInputs: 10,
+  });
+  expect(newHydratedInfo.cpu).toEqual([1, 2]);
+  expect(newHydratedInfo.gpus).toEqual([{ count: 8, gpuType: "H100" }]);
+  expect(newHydratedInfo.maxRetries).toEqual(10);
+  expect(newHydratedInfo.memoryMiB).toEqual([512, 1024]);
+  expect(newHydratedInfo.nonpreemptible).toEqual(false);
+  expect(newHydratedInfo.restrictModalAccess).toEqual(false);
+  expect(newHydratedInfo.routingRegion).toEqual("us-west");
+  expect(newHydratedInfo.singleUseContainers).toEqual(false);
+  expect(newHydratedInfo.startupTimeoutSecs).toEqual(300);
+  expect(newHydratedInfo.timeoutSecs).toEqual(60);
+
+  expect(newHydratedInfo.volumes.size).toEqual(1);
+  expect(newHydratedInfo.volumes.get("/mnt/tmp")?.readOnly).toEqual(true);
+  expect(newHydratedInfo.secretIds.length).toEqual(2);
+});
+
+test("FunctionInfoIsCached", async () => {
+  const { mockClient: mc, mockCpClient: mock } = createMockModalClients();
+  let numCalls = 0;
+
+  for (let i = 0; i < 2; i++) {
+    mock.handleUnary("/FunctionGetById", (req) => {
+      numCalls++;
+
+      expect(req).toMatchObject({ functionId: "fu-test" });
+      return {
+        handleMetadata: { appId: `ap-${i}` },
+        function: {
+          rankedFunctions: [
+            {
+              rank: 0,
+              function: FunctionMessage.create({ imageId: `im-${i}` }),
+            },
+          ],
+          methodDefinitions: {},
+        },
+      };
+    });
+  }
+  const f = await mc.functions.fromId("fu-test");
+  expect(numCalls).toEqual(1);
+
+  // reuse proto from the fromId call
+  const freshInfo = await f.info();
+  expect(numCalls).toEqual(1);
+
+  const secondCall = await f.info();
+  expect(numCalls).toEqual(1);
+
+  expect(freshInfo).toEqual(secondCall);
+
+  const configured = f
+    .withOptions({
+      cpu: 1,
+      cpuLimit: 2,
+      memoryMiB: 512,
+      memoryLimitMiB: 1024,
+      gpu: "H100:8",
+      env: { test: "value" },
+      retries: new Retries({ maxRetries: 10 }),
+      maxContainers: 4,
+      bufferContainers: 2,
+      scaledownWindowMs: 30_000,
+      timeoutMs: 60_000,
+      routingRegion: "us-west",
+    })
+    .withBatching({
+      maxBatchSize: 10,
+      waitMs: 100,
+    })
+    .withConcurrency({
+      maxInputs: 100,
+      targetInputs: 10,
+    });
+
+  // should still be reusing the cached proto here
+  const configuredInfo = await configured.info();
+  expect(configuredInfo).not.toEqual(freshInfo);
+  expect(numCalls).toEqual(1);
+
+  const refreshedInfo = await f.info({ refresh: true });
+  expect(refreshedInfo).not.toEqual(freshInfo);
+  expect(numCalls).toEqual(2);
+
+  // check that multiple withOptions calls don't poison the cached functionData
+  const cpuInfo = await f
+    .withOptions({
+      cpu: 1,
+      cpuLimit: 2,
+    })
+    .info();
+  const memInfo = await f
+    .withOptions({
+      memoryMiB: 512,
+      memoryLimitMiB: 1024,
+    })
+    .info();
+
+  expect(cpuInfo.cpu).toEqual([1, 2]);
+  expect(cpuInfo.memoryMiB).toBeUndefined();
+
+  expect(memInfo.cpu).toBeUndefined();
+  expect(memInfo.memoryMiB).toEqual([512, 1024]);
+});

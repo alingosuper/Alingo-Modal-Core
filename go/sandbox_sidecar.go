@@ -1,0 +1,628 @@
+package modal
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	pb "github.com/modal-labs/Alingo-Modal-Core/go/proto/modal_proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+)
+
+// mainContainerName is the reserved name of a Sandbox's main container.
+const mainContainerName = "main"
+
+// containerWaitPollTimeout is the per-RPC server-side wait timeout used while
+// polling for a sidecar's terminal status.
+const containerWaitPollTimeout = 10 * time.Second
+
+// SidecarService creates and manages sidecar containers inside a Sandbox.
+//
+// EXPERIMENTAL: the API is subject to change.
+type SidecarService interface {
+	// Create starts a new sidecar container in the Sandbox. The Image must
+	// already be built by calling [Image.Build] before it's passed to Create.
+	Create(ctx context.Context, name string, image *Image, params *SidecarCreateParams) (*SidecarContainer, error)
+	// Get returns a sidecar container by name.
+	Get(ctx context.Context, name string, params *SidecarGetParams) (*SidecarContainer, error)
+	// List returns all sidecar containers (not including the main container).
+	List(ctx context.Context, params *SidecarListParams) ([]*SidecarContainer, error)
+}
+
+type sidecarServiceImpl struct{ sandbox *Sandbox }
+
+// SidecarCreateParams holds options for creating a sidecar container.
+type SidecarCreateParams struct {
+	// Command to run in the sidecar container on startup.
+	Command []string
+	// Env are environment variables to set in the sidecar container.
+	Env map[string]string
+	// Secrets to inject into the sidecar container as environment variables.
+	Secrets []*Secret
+	// Workdir sets the working directory of the sidecar container.
+	Workdir string
+	// Volumes to mount in the sidecar container, keyed by mount path.
+	Volumes map[string]*Volume
+	// CloudBucketMounts to mount in the sidecar container, keyed by mount path. Not
+	// supported for GPU Sandboxes.
+	CloudBucketMounts map[string]*CloudBucketMount
+	// OutboundCIDRAllowlist restricts the sidecar's outbound traffic to these CIDRs. Independent of the main
+	// container; nil means all CIDRs are allowed. A non-nil allowlist with empty Entries blocks all external
+	// egress while preserving connectivity to the main container.
+	OutboundCIDRAllowlist *Allowlist
+	// OutboundDomainAllowlist restricts the sidecar's outbound TLS connections (port 443) to these SNI domains.
+	// Supports wildcard prefixes (*.example.com). Independent of the main container.
+	OutboundDomainAllowlist *Allowlist
+	// IncludeOidcIdentityToken gives the sidecar a MODAL_IDENTITY_TOKEN env var for OIDC-based auth
+	// (e.g. to AWS, GCP). The token identifies the sidecar container itself, not the main container.
+	// Not supported for GPU Sandboxes; Create returns an InvalidError for them.
+	IncludeOidcIdentityToken bool
+	// Proxy routes the sidecar's outbound traffic through a Modal Proxy, giving it a static outbound
+	// IP of its own, independent of the main container. Not supported for GPU Sandboxes; Create
+	// returns an InvalidError for them.
+	Proxy *Proxy
+	// PTY sets whether to enable a PTY for the sidecar container.
+	PTY bool
+	// ExperimentalMemoryReserveConsumeMiB is the memory, in MiB, the sidecar consumes from
+	// the Sandbox's sidecar memory reserve (the vm_sidecar_memory_reserve_mib
+	// experimental option); zero consumes whatever is left of it. Ignored by
+	// Sandboxes without a reserve. Experimental.
+	ExperimentalMemoryReserveConsumeMiB int
+}
+
+// SidecarGetParams holds options for retrieving a sidecar by name.
+type SidecarGetParams struct {
+	IncludeTerminated bool
+}
+
+// SidecarListParams holds options for listing sidecars.
+type SidecarListParams struct {
+	IncludeTerminated bool
+}
+
+// SidecarExecParams holds options for [SidecarContainer.Exec].
+type SidecarExecParams SandboxExecParams
+
+// SidecarWaitParams holds options for [SidecarContainer.Wait].
+type SidecarWaitParams struct{}
+
+// SidecarPollParams holds options for [SidecarContainer.Poll].
+type SidecarPollParams struct{}
+
+// SidecarTerminateParams holds options for [SidecarContainer.Terminate].
+type SidecarTerminateParams struct {
+	// Wait, when true, will wait for the sidecar container to terminate.
+	Wait bool
+}
+
+// SidecarSnapshotFilesystemParams configures a [SidecarContainer.SnapshotFilesystem] call.
+type SidecarSnapshotFilesystemParams struct {
+	// Timeout is the overall budget for the snapshot call. Zero means the default (55 seconds).
+	Timeout time.Duration
+	// TTL is the lifetime of the resulting image. Zero means 30 days; pass [NoExpiryTTL] to
+	// retain the image indefinitely.
+	TTL time.Duration
+}
+
+// SidecarReloadVolumesParams are options for [SidecarContainer.ReloadVolumes].
+type SidecarReloadVolumesParams struct {
+	// Timeout bounds how long the call waits. Defaults to 55 seconds.
+	Timeout time.Duration
+}
+
+// SidecarMountImageParams holds options for [SidecarContainer.MountImage].
+type SidecarMountImageParams SandboxMountImageParams
+
+// SidecarUnmountImageParams holds options for [SidecarContainer.UnmountImage].
+type SidecarUnmountImageParams struct{}
+
+// SidecarSnapshotDirectoryParams holds options for [SidecarContainer.SnapshotDirectory].
+type SidecarSnapshotDirectoryParams SandboxSnapshotDirectoryParams
+
+func validateSidecarName(name string) error {
+	if name == "" {
+		return InvalidError{Exception: "sidecar name must not be empty"}
+	}
+	if name == mainContainerName {
+		return InvalidError{Exception: fmt.Sprintf("the name %q is reserved for the Sandbox's main container. Use the Sandbox methods directly to interact with it", mainContainerName)}
+	}
+	return nil
+}
+
+func buildSidecarVolumeMounts(volumes map[string]*Volume) ([]*pb.VolumeMount, error) {
+	if volumes == nil {
+		return nil, nil
+	}
+	mountPathsByVolumeID := make(map[string][]string, len(volumes))
+	volumeMounts := make([]*pb.VolumeMount, 0, len(volumes))
+	for mountPath, volume := range volumes {
+		if volume == nil {
+			return nil, InvalidError{Exception: fmt.Sprintf("Volume mounted at %q must not be nil", mountPath)}
+		}
+		mountPathsByVolumeID[volume.VolumeID] = append(mountPathsByVolumeID[volume.VolumeID], mountPath)
+		volumeMounts = append(volumeMounts, volumeToMountProto(mountPath, volume))
+	}
+	for _, mountPaths := range mountPathsByVolumeID {
+		if len(mountPaths) > 1 {
+			sort.Strings(mountPaths)
+			return nil, InvalidError{Exception: fmt.Sprintf(
+				"The same Volume cannot be mounted at multiple paths in a sidecar: %s", strings.Join(mountPaths, ", "),
+			)}
+		}
+	}
+	return volumeMounts, nil
+}
+
+// sidecarCreateInputs is the definition shared by both create paths.
+type sidecarCreateInputs struct {
+	name              string
+	image             *Image
+	params            *SidecarCreateParams
+	secretSources     []*pb.SecretSource
+	secretIds         []string
+	volumeMounts      []*pb.VolumeMount
+	cloudBucketMounts []*pb.CloudBucketMount
+	networkAccess     *pb.NetworkAccess
+	proxyID           *string
+	ptyInfo           *pb.PTYInfo
+	// nil when unset; otherwise MiB taken from the sandbox's sidecar reserve.
+	memoryReserveConsumeMib *uint32
+}
+
+// sidecarCreateResult is what either create path reports back.
+type sidecarCreateResult struct {
+	containerID   string
+	containerName string
+}
+
+func sidecarCreateError(err error) error {
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.AlreadyExists:
+			return AlreadyExistsError{Exception: st.Message()}
+		case codes.InvalidArgument:
+			return InvalidError{Exception: st.Message()}
+		}
+	}
+	return err
+}
+
+func (s *sidecarServiceImpl) Create(ctx context.Context, name string, image *Image, params *SidecarCreateParams) (*SidecarContainer, error) {
+	if err := validateSidecarName(name); err != nil {
+		return nil, err
+	}
+	if image == nil || image.ImageID == "" {
+		return nil, InvalidError{Exception: "sidecar image must already be built. Call image.Build(ctx, app) first or use Images.FromID(...)"}
+	}
+	if params == nil {
+		params = &SidecarCreateParams{}
+	}
+	if err := validateWorkdir(params.Workdir); err != nil {
+		return nil, err
+	}
+	if err := validateExecArgs(params.Command); err != nil {
+		return nil, err
+	}
+	if params.ExperimentalMemoryReserveConsumeMiB < 0 {
+		return nil, InvalidError{Exception: fmt.Sprintf("ExperimentalMemoryReserveConsumeMiB (%d) must be a positive number", params.ExperimentalMemoryReserveConsumeMiB)}
+	}
+	var memoryReserveConsumeMib *uint32
+	if params.ExperimentalMemoryReserveConsumeMiB > 0 {
+		memoryReserveConsumeMib = proto.Uint32(uint32(params.ExperimentalMemoryReserveConsumeMiB))
+	}
+
+	if err := s.sandbox.ensureAttached(); err != nil {
+		return nil, err
+	}
+	if err := s.sandbox.impl.validateSidecarCreate(params); err != nil {
+		return nil, err
+	}
+
+	var proxyID *string
+	if params.Proxy != nil {
+		proxyID = &params.Proxy.ProxyID
+	}
+
+	var ptyInfo *pb.PTYInfo
+	if params.PTY {
+		ptyInfo = defaultSandboxPTYInfo()
+	}
+
+	// Secrets and params.Env are sent as ordered secret_sources. Locally-created
+	// Secrets (FromMap) are inlined, avoiding a SecretGetOrCreate round-trip;
+	// only the remaining resolvable Secrets (e.g. from FromName) need hydrating
+	// to secret IDs, which are also recorded on the definition.
+	for k := range params.Env {
+		if err := validateEnvVarName(k); err != nil {
+			return nil, err
+		}
+	}
+	resolvable := resolvableSecrets(params.Secrets)
+	if err := hydrateSandboxSecrets(ctx, s.sandbox.client, resolvable, params.CloudBucketMounts); err != nil {
+		return nil, err
+	}
+	secretIds, err := collectSecretIDs(resolvable)
+	if err != nil {
+		return nil, err
+	}
+	sources, err := secretSources(params.Secrets, params.Env)
+	if err != nil {
+		return nil, err
+	}
+
+	cloudBucketMounts, err := buildCloudBucketMountProtos(params.CloudBucketMounts)
+	if err != nil {
+		return nil, err
+	}
+
+	networkAccess, err := buildOutboundNetworkAccess(false, params.OutboundCIDRAllowlist, params.OutboundDomainAllowlist)
+	if err != nil {
+		return nil, err
+	}
+
+	volumeMounts, err := buildSidecarVolumeMounts(params.Volumes)
+	if err != nil {
+		return nil, err
+	}
+
+	inputs := sidecarCreateInputs{
+		name:                    name,
+		image:                   image,
+		params:                  params,
+		secretSources:           sources,
+		secretIds:               secretIds,
+		volumeMounts:            volumeMounts,
+		cloudBucketMounts:       cloudBucketMounts,
+		networkAccess:           networkAccess,
+		proxyID:                 proxyID,
+		ptyInfo:                 ptyInfo,
+		memoryReserveConsumeMib: memoryReserveConsumeMib,
+	}
+
+	result, err := s.sandbox.impl.createSidecar(ctx, inputs)
+	if err != nil {
+		return nil, err
+	}
+
+	containerName := result.containerName
+	if containerName == "" {
+		containerName = name
+	}
+	s.sandbox.client.logger.DebugContext(ctx, "Created SidecarContainer",
+		"container_id", result.containerID,
+		"container_name", containerName,
+		"sandbox_id", s.sandbox.SandboxID)
+	return newSidecarContainer(s.sandbox, result.containerID, containerName, nil), nil
+}
+
+func (s *sidecarServiceImpl) Get(ctx context.Context, name string, params *SidecarGetParams) (*SidecarContainer, error) {
+	if err := validateSidecarName(name); err != nil {
+		return nil, err
+	}
+	if params == nil {
+		params = &SidecarGetParams{}
+	}
+
+	taskID, client, err := s.sandbox.getCommandRouter(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.ContainerGet(ctx, pb.TaskContainerGetRequest_builder{
+		TaskId:            taskID,
+		ContainerName:     name,
+		IncludeTerminated: params.IncludeTerminated,
+	}.Build())
+	if err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			return nil, NotFoundError{Exception: fmt.Sprintf("Sidecar container %q not found", name)}
+		}
+		return nil, err
+	}
+	container := resp.GetContainer()
+	if container == nil {
+		return nil, ExecutionError{Exception: fmt.Sprintf("server returned no container for sidecar %q", name)}
+	}
+	return sidecarContainerFromProto(s.sandbox, container), nil
+}
+
+func (s *sidecarServiceImpl) List(ctx context.Context, params *SidecarListParams) ([]*SidecarContainer, error) {
+	if params == nil {
+		params = &SidecarListParams{}
+	}
+
+	taskID, client, err := s.sandbox.getCommandRouter(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.ContainerList(ctx, pb.TaskContainerListRequest_builder{
+		TaskId:            taskID,
+		IncludeTerminated: params.IncludeTerminated,
+	}.Build())
+	if err != nil {
+		return nil, err
+	}
+
+	containers := resp.GetContainers()
+	out := make([]*SidecarContainer, 0, len(containers))
+	for _, info := range containers {
+		if info.GetContainerName() == mainContainerName {
+			continue
+		}
+		out = append(out, sidecarContainerFromProto(s.sandbox, info))
+	}
+	return out, nil
+}
+
+// SidecarContainer is a handle to a sidecar container running in a Sandbox.
+type SidecarContainer struct {
+	// ContainerID is the fully qualified container ID.
+	ContainerID string
+	// ContainerName is the logical name of the container within the Sandbox.
+	ContainerName string
+
+	// Filesystem provides high-level filesystem operations for this container.
+	Filesystem *SandboxFilesystem
+
+	sandbox *Sandbox
+
+	resultMu sync.Mutex
+	result   *pb.GenericResult
+}
+
+func newSidecarContainer(sandbox *Sandbox, id, name string, result *pb.GenericResult) *SidecarContainer {
+	c := &SidecarContainer{
+		ContainerID:   id,
+		ContainerName: name,
+		sandbox:       sandbox,
+		result:        result,
+	}
+	c.Filesystem = &SandboxFilesystem{sandbox: c, logger: sandbox.client.logger}
+	return c
+}
+
+func sidecarContainerFromProto(sandbox *Sandbox, info *pb.TaskContainerInfo) *SidecarContainer {
+	if info == nil {
+		return nil
+	}
+	var result *pb.GenericResult
+	if info.HasResult() {
+		result = info.GetResult()
+	}
+	return newSidecarContainer(sandbox, info.GetContainerId(), info.GetContainerName(), result)
+}
+
+// Exec runs a command in the sidecar container and returns the process handle.
+func (c *SidecarContainer) Exec(ctx context.Context, command []string, params *SidecarExecParams) (*ContainerProcess, error) {
+	return c.sandbox.execInternal(ctx, command, (*SandboxExecParams)(params), c.ContainerID)
+}
+
+// execForFilesystem satisfies the sandboxForFilesystem interface for SidecarContainer.
+func (c *SidecarContainer) execForFilesystem(ctx context.Context, command []string, params *SandboxExecParams) (*ContainerProcess, error) {
+	return c.sandbox.execInternal(ctx, command, params, c.ContainerID)
+}
+
+// Wait blocks until the sidecar container exits, and returns its exit code.
+func (c *SidecarContainer) Wait(ctx context.Context, _ *SidecarWaitParams) (int, error) {
+	c.resultMu.Lock()
+	cached := c.result
+	c.resultMu.Unlock()
+	if code := getReturnCode(cached); code != nil {
+		return *code, nil
+	}
+
+	taskID, client, err := c.sandbox.getCommandRouter(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		resp, err := client.ContainerWait(ctx, pb.TaskContainerWaitRequest_builder{
+			TaskId:      taskID,
+			ContainerId: c.ContainerID,
+			Timeout:     float32(containerWaitPollTimeout.Seconds()),
+		}.Build())
+		if err != nil {
+			return 0, err
+		}
+		result := resp.GetResult()
+		if result == nil || result.GetStatus() == pb.GenericResult_GENERIC_STATUS_UNSPECIFIED {
+			continue
+		}
+		c.resultMu.Lock()
+		c.result = result
+		c.resultMu.Unlock()
+		if code := getReturnCode(result); code != nil {
+			return *code, nil
+		}
+		return 0, nil
+	}
+}
+
+// Poll checks if the sidecar container has finished running.
+// Returns nil if the container is still running, else returns the exit code.
+func (c *SidecarContainer) Poll(ctx context.Context, _ *SidecarPollParams) (*int, error) {
+	c.resultMu.Lock()
+	cached := c.result
+	c.resultMu.Unlock()
+	if code := getReturnCode(cached); code != nil {
+		return code, nil
+	}
+
+	taskID, client, err := c.sandbox.getCommandRouter(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.ContainerWait(ctx, pb.TaskContainerWaitRequest_builder{
+		TaskId:      taskID,
+		ContainerId: c.ContainerID,
+		Timeout:     0,
+	}.Build())
+	if err != nil {
+		return nil, err
+	}
+	result := resp.GetResult()
+	if result == nil {
+		return nil, nil
+	}
+	if result.GetStatus() != pb.GenericResult_GENERIC_STATUS_UNSPECIFIED {
+		c.resultMu.Lock()
+		c.result = result
+		c.resultMu.Unlock()
+	}
+	return getReturnCode(result), nil
+}
+
+// Terminate stops the sidecar container.
+//
+// The returned exit code is only meaningful when Wait is true.
+func (c *SidecarContainer) Terminate(ctx context.Context, params *SidecarTerminateParams) (int, error) {
+	if params == nil {
+		params = &SidecarTerminateParams{}
+	}
+
+	taskID, client, err := c.sandbox.getCommandRouter(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	if err := client.ContainerTerminate(ctx, pb.TaskContainerTerminateRequest_builder{
+		TaskId:      taskID,
+		ContainerId: c.ContainerID,
+	}.Build()); err != nil {
+		return 0, err
+	}
+
+	if !params.Wait {
+		return 0, nil
+	}
+	return c.Wait(ctx, nil)
+}
+
+// SnapshotFilesystem snapshots this Sidecar container's filesystem into an Image.
+func (c *SidecarContainer) SnapshotFilesystem(ctx context.Context, params *SidecarSnapshotFilesystemParams) (*Image, error) {
+	var ttl time.Duration
+	timeout := 55 * time.Second
+	if params != nil {
+		ttl = params.TTL
+		if params.Timeout != 0 {
+			timeout = params.Timeout
+		}
+	}
+	if err := c.sandbox.ensureAttached(); err != nil {
+		return nil, err
+	}
+	return c.sandbox.impl.snapshotFilesystem(ctx, timeout, ttl, c.ContainerID)
+}
+
+// ReloadVolumes reloads all Volumes mounted in this sidecar container.
+//
+// Blocks until the reload completes, or returns a TimeoutError on timeout (the
+// reload may still complete in the background).
+func (c *SidecarContainer) ReloadVolumes(ctx context.Context, params *SidecarReloadVolumesParams) error {
+	var timeout time.Duration
+	if params != nil {
+		timeout = params.Timeout
+	}
+	if err := c.sandbox.ensureAttached(); err != nil {
+		return err
+	}
+	return c.sandbox.impl.reloadVolumes(ctx, c.ContainerID, timeout)
+}
+
+// MountImage mounts an Image at a path in this Sidecar container's filesystem.
+//
+// If image is nil, mounts an empty directory.
+func (c *SidecarContainer) MountImage(ctx context.Context, path string, image *Image, params *SidecarMountImageParams) error {
+	imageID, err := resolveMountImageID(image)
+	if err != nil {
+		return err
+	}
+
+	taskID, client, err := c.sandbox.getCommandRouter(ctx)
+	if err != nil {
+		return err
+	}
+	request, err := buildTaskMountDirectoryRequestProto(
+		taskID,
+		path,
+		imageID,
+		c.ContainerID,
+		(*SandboxMountImageParams)(params),
+	)
+	if err != nil {
+		return err
+	}
+	return client.MountDirectory(ctx, request)
+}
+
+// UnmountImage removes an Image mount from a path in this Sidecar container's filesystem.
+func (c *SidecarContainer) UnmountImage(ctx context.Context, path string, _ *SidecarUnmountImageParams) error {
+	taskID, client, err := c.sandbox.getCommandRouter(ctx)
+	if err != nil {
+		return err
+	}
+	return client.UnmountDirectory(ctx, pb.TaskUnmountDirectoryRequest_builder{
+		TaskId:      taskID,
+		Path:        []byte(path),
+		ContainerId: c.ContainerID,
+	}.Build())
+}
+
+// SnapshotDirectory snapshots and creates a new Image from a directory in the running Sidecar container.
+//
+// The Image can be used anywhere an Image is accepted, including as a mount or
+// as the base filesystem for another container.
+//
+// If params is nil, the resulting Image is retained for 30 days as a hard
+// cutoff measured from creation, and the call has a 55-second timeout.
+// See [SidecarSnapshotDirectoryParams] for control over both.
+func (c *SidecarContainer) SnapshotDirectory(ctx context.Context, path string, params *SidecarSnapshotDirectoryParams) (*Image, error) {
+	timeout := 55 * time.Second
+	var ttl time.Duration
+	if params != nil {
+		typedParams := (*SandboxSnapshotDirectoryParams)(params)
+		ttl = typedParams.TTL
+		if typedParams.Timeout != 0 {
+			timeout = typedParams.Timeout
+		}
+	}
+	wireTTL, err := resolveTTL(ttl)
+	if err != nil {
+		return nil, err
+	}
+	taskID, client, err := c.sandbox.getCommandRouter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	request, err := buildTaskSnapshotDirectoryRequestProto(
+		taskID,
+		path,
+		uuid.NewString(),
+		c.ContainerID,
+		wireTTL,
+		(*SandboxSnapshotDirectoryParams)(params),
+	)
+	if err != nil {
+		return nil, err
+	}
+	response, err := client.SnapshotDirectory(ctx, request, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if response.GetImageId() == "" {
+		return nil, ExecutionError{Exception: "Sidecar snapshot directory response missing image ID"}
+	}
+	return &Image{ImageID: response.GetImageId(), client: c.sandbox.client}, nil
+}

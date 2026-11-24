@@ -1,0 +1,705 @@
+# Copyright Modal Labs 2022-2023
+import platform
+import pytest
+import re
+import subprocess
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
+
+import click
+from grpclib import GRPCError, Status
+
+from modal import config as config_module
+from modal.cli.shell import _parse_experimental_options, _parse_sandbox_container_ref, _passed_forbidden_args, shell
+from modal.exception import InteractiveTimeoutError
+
+from .conftest import run_cli_command
+from .supports.skip import skip_windows
+
+app_file = Path("app_run_tests") / "default_app.py"
+app_file_as_module = "app_run_tests.default_app"
+webhook_app_file = Path("app_run_tests") / "webhook.py"
+cls_app_file = Path("app_run_tests") / "cls.py"
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize(
+    ["flags", "rel_file", "suffix"],
+    [
+        ([], app_file, "::foo"),  # Function is explicitly specified
+        (["-m"], app_file_as_module, "::foo"),  # Function is explicitly specified - module mode
+        ([], webhook_app_file, "::foo"),  # Function is explicitly specified
+        ([], webhook_app_file, ""),  # Function must be inferred
+        # TODO: fix modal shell auto-detection of a single class, even if it has multiple methods
+        # ([], cls_app_file, ""),  # Class must be inferred
+        # ([], cls_app_file, "AParametrized"),  # class name
+        ([], cls_app_file, "::AParametrized.some_method"),  # method name
+    ],
+)
+def test_shell(servicer, set_env_client, mock_shell_pty, suffix, monkeypatch, supports_dir, rel_file, flags):
+    monkeypatch.chdir(supports_dir)
+    fake_stdin, captured_out = mock_shell_pty
+
+    fake_stdin.clear()
+    fake_stdin.extend([b'echo "Hello World"\n', b"exit\n"])
+
+    shell_prompt = servicer.shell_prompt
+
+    run_cli_command(["shell"] + flags + [str(rel_file) + suffix])
+
+    # first captured message is the empty message the mock server sends
+    assert captured_out == [(1, shell_prompt), (1, b"Hello World\n")]
+    captured_out.clear()
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_cmd(servicer, set_env_client, test_dir, mock_shell_pty):
+    app_file = test_dir / "supports" / "app_run_tests" / "default_app.py"
+    _, captured_out = mock_shell_pty
+    shell_prompt = servicer.shell_prompt
+    run_cli_command(["shell", "--cmd", "pwd", app_file.as_posix() + "::foo"])
+    expected_output = subprocess.run(["pwd"], capture_output=True, check=True).stdout
+    assert captured_out == [(1, shell_prompt), (1, expected_output)]
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_preserve_token(servicer, set_env_client, mock_shell_pty, monkeypatch):
+    monkeypatch.setenv("MODAL_TOKEN_ID", "my-token-id")
+
+    fake_stdin, captured_out = mock_shell_pty
+    shell_prompt = servicer.shell_prompt
+
+    fake_stdin.clear()
+    fake_stdin.extend([b'echo "$MODAL_TOKEN_ID"\n', b"exit\n"])
+    run_cli_command(["shell"])
+
+    expected_output = b"my-token-id\n"
+    assert captured_out == [(1, shell_prompt), (1, expected_output)]
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize("image_args", [[], ["--image", "alpine"]])
+def test_shell_platform(servicer, set_env_client, mock_shell_pty, image_args):
+    fake_stdin, _ = mock_shell_pty
+    fake_stdin.clear()
+    fake_stdin.extend([b"exit\n"])
+    run_cli_command(["shell", "--platform", "linux/arm64", *image_args])
+
+    root_layers = [image for image in servicer.images.values() if not image.base_images]
+    assert [image.platform for image in root_layers] == ["linux/arm64"]
+
+
+def test_shell_unsuported_cmds_fails_on_windows(servicer, set_env_client, mock_shell_pty):
+    expected_exit_code = 1 if platform.system() == "Windows" else 0
+    res = run_cli_command(["shell"], expected_exit_code=expected_exit_code)
+
+    if expected_exit_code != 0:
+        assert re.search("Windows", str(res.exception)), "exception message does not match expected string"
+
+
+_V1_SANDBOX_ID = "sb-nGEijt9WbBMlGrsPH9FOaC"
+_V2_SANDBOX_ID = "sb-01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize(
+    ["sandbox_id", "access_rpc", "unused_access_rpc"],
+    [
+        (_V1_SANDBOX_ID, "TaskGetCommandRouterAccess", "SandboxGetCommandRouterAccess"),
+        (_V2_SANDBOX_ID, "SandboxGetCommandRouterAccess", "TaskGetCommandRouterAccess"),
+    ],
+)
+def test_shell_into_sandbox_execs_in_main_container(
+    servicer, set_env_client, mock_shell_pty, sandbox_id, access_rpc, unused_access_rpc
+):
+    fake_stdin, captured_out = mock_shell_pty
+    fake_stdin.clear()
+    fake_stdin.extend([b'echo "Hello World"\n', b"exit\n"])
+    shell_prompt = servicer.shell_prompt
+
+    with servicer.intercept() as ctx:
+        with servicer.task_command_router.intercept() as tcr_ctx:
+            run_cli_command(["shell", sandbox_id])
+
+    assert len(ctx.get_requests(access_rpc)) == 1
+    assert ctx.get_requests(unused_access_rpc) == []
+
+    (exec_req,) = tcr_ctx.get_requests("TaskExecStart")
+    assert list(exec_req.command_args) == ["/bin/bash"]
+    assert exec_req.pty_info.enabled
+
+    assert captured_out == [(1, shell_prompt), (1, b"Hello World\n")]
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_into_finished_v2_sandbox_shows_reason(servicer, set_env_client):
+    """When command router access is denied because the sandbox finished, the
+    CLI error must carry the server's reason instead of a generic 'not found'."""
+
+    async def _fail_access(servicer_self, stream):
+        await stream.recv_message()
+        raise GRPCError(Status.FAILED_PRECONDITION, "task has already finished")
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("SandboxGetCommandRouterAccess", _fail_access)
+        run_cli_command(
+            ["shell", "--no-pty", _V2_SANDBOX_ID],
+            expected_exit_code=1,
+            expected_stderr="task has already finished",
+        )
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_into_v2_sandbox_no_pty(servicer, set_env_client):
+    with servicer.intercept() as ctx:
+        with servicer.task_command_router.intercept() as tcr_ctx:
+            run_cli_command(["shell", "--no-pty", "--cmd", "echo hi", _V2_SANDBOX_ID])
+
+    (access_req,) = ctx.get_requests("SandboxGetCommandRouterAccess")
+    assert access_req.sandbox_id == _V2_SANDBOX_ID
+
+    (exec_req,) = tcr_ctx.get_requests("TaskExecStart")
+    assert list(exec_req.command_args) == ["echo", "hi"]
+    assert not exec_req.HasField("pty_info")
+
+
+# Task IDs carry a kind marker in the trailing ULID character: "V" for V2
+# sandbox tasks, "S" for V1 sandbox tasks.
+_V2_SANDBOX_TASK_ID = "ta-01ARZ3NDEKTSV4RRFFQ69G5FAV"
+_V1_SANDBOX_TASK_ID = "ta-01ARZ3NDEKTSV4RRFFQ69G5FAS"
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize("task_id", ["ta-abc123", _V1_SANDBOX_TASK_ID])
+def test_shell_into_task_ref_no_pty(servicer, set_env_client, task_id):
+    with servicer.intercept() as ctx:
+        with servicer.task_command_router.intercept() as tcr_ctx:
+            run_cli_command(["shell", "--no-pty", "--cmd", "echo hi", task_id])
+
+    assert len(ctx.get_requests("TaskGetCommandRouterAccess")) == 1
+    assert ctx.get_requests("SandboxGetCommandRouterAccess") == []
+
+    (exec_req,) = tcr_ctx.get_requests("TaskExecStart")
+    assert exec_req.task_id == task_id
+    assert list(exec_req.command_args) == ["echo", "hi"]
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_into_v2_task_ref_no_pty(servicer, set_env_client):
+    with servicer.intercept() as ctx:
+        with servicer.task_command_router.intercept() as tcr_ctx:
+            run_cli_command(["shell", "--no-pty", "--cmd", "echo hi", _V2_SANDBOX_TASK_ID])
+
+    (access_req,) = ctx.get_requests("SandboxGetCommandRouterAccess")
+    assert access_req.WhichOneof("target") == "task_id"
+    assert access_req.task_id == _V2_SANDBOX_TASK_ID
+    assert ctx.get_requests("TaskGetCommandRouterAccess") == []
+
+    (exec_req,) = tcr_ctx.get_requests("TaskExecStart")
+    assert exec_req.task_id == _V2_SANDBOX_TASK_ID
+    assert list(exec_req.command_args) == ["echo", "hi"]
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize("container_id", [("sb-abc123"), ("ta-abc123")])
+@pytest.mark.parametrize(
+    "forbidden_args",
+    [
+        (["--image", "debian:latest"]),
+        (["--cpu", "2"]),
+        (["--memory", "1024"]),
+        (["--gpu", "a10g"]),
+        (["--volume", "my-volume"]),
+        (["--secret", "my-secret"]),
+        (["--cloud", "aws"]),
+        (["--region", "us-east-1"]),
+        (["--add-python", "3.11"]),
+        (["--env", "main"]),
+        (["--add-local", "/tmp/file.txt"]),
+        (["--experimental-option", "sparkle_mode=true"]),
+        (["-m"]),
+    ],
+)
+def test_shell_forbids_config_args_with_container_id(container_id, forbidden_args):
+    run_cli_command(
+        ["shell", container_id] + forbidden_args,
+        expected_exit_code=1,
+        expected_stderr="Cannot specify container configuration arguments",
+    )
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize("func_ref_args", [["app.py::my_func"], ["-m", "mymodule::my_func"]])
+@pytest.mark.parametrize(
+    "forbidden_args",
+    [
+        (["--image", "debian:latest"]),
+        (["--cpu", "2"]),
+        (["--memory", "1024"]),
+        (["--gpu", "a10g"]),
+        (["--volume", "my-volume"]),
+        (["--secret", "my-secret"]),
+        (["--cloud", "aws"]),
+        (["--region", "us-east-1"]),
+        (["--add-python", "3.11"]),
+        (["--add-local", "/tmp/file.txt"]),
+    ],
+)
+def test_shell_forbids_config_args_with_function_ref(
+    servicer, set_env_client, mock_shell_routing, func_ref_args, forbidden_args
+):
+    run_cli_command(
+        ["shell"] + func_ref_args + forbidden_args,
+        expected_exit_code=1,
+        expected_stderr="Cannot specify container configuration arguments",
+    )
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize(
+    "forbidden_args",
+    [
+        (["--image", "debian:latest"]),
+        (["--add-python", "3.11"]),
+        (["--platform", "linux/arm64"]),
+    ],
+)
+def test_shell_forbids_image_args_with_image_id(servicer, set_env_client, forbidden_args):
+    run_cli_command(
+        ["shell", "im-abc123"] + forbidden_args,
+        expected_exit_code=1,
+        expected_stderr="Cannot specify",
+    )
+
+
+def _shell_defaults(ctx: click.Context) -> dict[str, object]:
+    """Effective defaults for every shell param, matching what click passes when the user
+    omits the flag entirely."""
+    return {p.name: p.process_value(ctx, p.get_default(ctx)) for p in shell.params if p.name is not None}
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({}, []),
+        ({"ref": "sb-123", "cmd": "/bin/sh", "pty": True}, []),
+        ({"ref": "sb-123", "cpu": 2, "memory": 1024}, ["--cpu", "--memory"]),
+    ],
+)
+def test_passed_forbidden_args_with_shell_function(overrides, expected):
+    with click.Context(shell) as ctx:
+        passed = {**_shell_defaults(ctx), **overrides}
+        result = _passed_forbidden_args(
+            shell.params, ctx, passed, allowed=lambda p: p in {"cmd", "pty", "ref", "use_module_mode"}
+        )
+    assert result == expected
+
+
+def test_passed_forbidden_args_with_predicate():
+    # Uses a hand-rolled command instead of `shell` to exercise the helper's
+    # genericity — its signature takes arbitrary params + ctx. Every option
+    # declares an explicit default, matching the invariant
+    # test_shell_params_have_concrete_defaults enforces on the real shell.
+    @click.command()
+    @click.option("--image", default=None)
+    @click.option("--cpu", type=int, default=None)
+    @click.option("--memory", type=int, default=None)
+    def dummy(image, cpu, memory):
+        pass
+
+    with click.Context(dummy) as ctx:
+        _pfa = _passed_forbidden_args
+        params = dummy.params
+        assert _pfa(params, ctx, {"image": "debian:latest", "cpu": 2}, allowed=lambda p: p == "image") == ["--cpu"]
+        assert _pfa(params, ctx, {"image": "debian:latest", "cpu": 2}, allowed=lambda _: True) == []
+        assert _pfa(params, ctx, {"image": "debian:latest", "cpu": 2}, allowed=lambda _: False) == [
+            "--image",
+            "--cpu",
+        ]
+        assert _pfa(params, ctx, {"image": None, "cpu": None}, allowed=lambda _: False) == []
+
+
+def test_parse_experimental_options():
+    assert _parse_experimental_options(["sparkle_mode=true", "waffle_fs=false", "foo=bar"]) == {
+        "sparkle_mode": "true",
+        "waffle_fs": "false",
+        "foo": "bar",
+    }
+
+
+@pytest.mark.parametrize("option", ["sparkle_mode", "=true"])
+def test_parse_experimental_options_rejects_invalid_values(option):
+    with pytest.raises(click.BadParameter):
+        _parse_experimental_options([option])
+
+
+def test_shell_params_have_concrete_defaults():
+    """Regression guard for `_passed_forbidden_args`.
+
+    The helper compares `passed_args[name]` against `process_value(get_default(ctx))`.
+    This only works when every param's default is a concrete value click hands to
+    the callback (None, False, a tuple, a string, etc.) — not an internal sentinel
+    like `click.core.UNSET`. Scalar Options declared without an explicit `default=`
+    produce UNSET in click 8.3+; that would cause the helper to spuriously flag
+    the option as passed even when the user didn't set it.
+
+    If a new `--foo` is added without `default=`, this test fails and points at
+    the fix: declare an explicit default.
+    """
+    with click.Context(shell) as ctx:
+        missing = []
+        for p in shell.params:
+            default = p.process_value(ctx, p.get_default(ctx))
+            # click's internal "no default declared" marker; match by type name
+            # because it's not a public import in click 8.2.
+            if type(default).__name__ == "Sentinel":
+                missing.append(p.name)
+    assert not missing, (
+        f"shell params missing explicit default=: {missing}. "
+        "_passed_forbidden_args relies on a concrete default; add `default=...` to the @click.option(...) decorator."
+    )
+
+
+@pytest.mark.parametrize(
+    "ref,expected_sandbox_id,expected_container_name",
+    [
+        ("sb-abc123", "sb-abc123", None),
+        ("sb-abc123:redis", "sb-abc123", "redis"),
+        ("sb-abc123:my-container", "sb-abc123", "my-container"),
+        ("ta-abc123", "ta-abc123", None),
+        ("im-abc123", "im-abc123", None),
+        ("app.py::my_func", "app.py::my_func", None),
+    ],
+)
+def test_parse_sandbox_container_ref(ref, expected_sandbox_id, expected_container_name):
+    sandbox_id, container_name = _parse_sandbox_container_ref(ref)
+    assert sandbox_id == expected_sandbox_id
+    assert container_name == expected_container_name
+
+
+@pytest.fixture
+def mock_shell_routing(monkeypatch):
+    mocks = {}
+
+    mocks["start_running_container"] = Mock()
+    mocks["start_from_function_spec"] = Mock()
+    mocks["start_from_image"] = Mock()
+
+    monkeypatch.setattr("modal.cli.shell._start_shell_in_running_container", mocks["start_running_container"])
+    monkeypatch.setattr("modal.cli.shell._start_shell_from_function_spec", mocks["start_from_function_spec"])
+    monkeypatch.setattr("modal.cli.shell._start_shell_from_image", mocks["start_from_image"])
+
+    monkeypatch.setattr("modal.cli.shell._function_spec_from_ref", Mock(return_value=Mock()))
+    monkeypatch.setattr("modal.image.Image.from_id", Mock(return_value=Mock()))
+    monkeypatch.setattr("modal.image.Image.from_registry", Mock(return_value=Mock()))
+
+    return mocks
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "sb-abc123",
+        "ta-abc123",
+        "sb-abc123:mycontainer",
+    ],
+)
+def test_shell_sb_ta_ref_routes_to_running_container(servicer, set_env_client, mock_shell_routing, ref):
+    run_cli_command(["shell", ref])
+
+    mock_shell_routing["start_running_container"].assert_called_once()
+    mock_shell_routing["start_from_function_spec"].assert_not_called()
+    mock_shell_routing["start_from_image"].assert_not_called()
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["im-abc123"],
+        ["--image", "alpine"],
+        [],
+    ],
+)
+def test_shell_im_ref_or_param_and_default_routes_to_image_id(servicer, set_env_client, mock_shell_routing, args):
+    run_cli_command(["shell"] + args)
+
+    mock_shell_routing["start_running_container"].assert_not_called()
+    mock_shell_routing["start_from_function_spec"].assert_not_called()
+    mock_shell_routing["start_from_image"].assert_called_once()
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["app.py::my_func"],
+        ["my_module.py::foo"],
+        ["some/path/script.py::bar"],
+        ["-m", "mymodule::my_func"],
+    ],
+)
+def test_shell_function_ref_routes_to_function_spec(servicer, set_env_client, mock_shell_routing, args):
+    run_cli_command(["shell"] + args)
+
+    mock_shell_routing["start_running_container"].assert_not_called()
+    mock_shell_routing["start_from_function_spec"].assert_called_once()
+    mock_shell_routing["start_from_image"].assert_not_called()
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_experimental_options_with_function_ref(servicer, set_env_client, mock_shell_routing):
+    run_cli_command(
+        [
+            "shell",
+            "--experimental-option",
+            "sparkle_mode=true",
+            "--experimental-option",
+            "waffle_fs=false",
+            "app.py::my_func",
+        ]
+    )
+
+    call = mock_shell_routing["start_from_function_spec"].call_args
+    assert call.args[-3] == {"sparkle_mode": "true", "waffle_fs": "false"}
+    assert call.args[-2] is False
+    assert call.args[-1] is None
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_experimental_options_with_image(servicer, set_env_client, mock_shell_routing):
+    run_cli_command(["shell", "--experimental-option", "sparkle_mode=true"])
+
+    call = mock_shell_routing["start_from_image"].call_args
+    assert call.args[-3] == {"sparkle_mode": "true"}
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "python -c \"print('hello world')\"",
+        "python -c 'print(\"hello world\")'",
+    ],
+)
+def test_shell_cmd_with_quotes_passed_verbatim_to_bash(servicer, set_env_client, mock_shell_routing, cmd):
+    run_cli_command(["shell", "--cmd", cmd])
+
+    call = mock_shell_routing["start_from_image"].call_args
+    assert call.args[1] == ["/bin/bash", "-c", cmd]
+
+
+@pytest.fixture(params=["flag", "environment", "default"])
+def v2_shell_args(request, monkeypatch):
+    if request.param == "flag":
+        monkeypatch.setenv("MODAL_SANDBOX_V2", "0")
+        return ["--experimental-v2"]
+    elif request.param == "environment":
+        monkeypatch.setenv("MODAL_SANDBOX_V2", "1")
+    else:
+        monkeypatch.delenv("MODAL_SANDBOX_V2", raising=False)
+        monkeypatch.setitem(
+            config_module._SETTINGS, "sandbox_v2", config_module._SETTINGS["sandbox_v2"]._replace(default=True)
+        )
+    return []
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_v2_creates_sandbox_with_sandbox_create_v2(servicer, set_env_client, mock_shell_pty, v2_shell_args):
+    fake_stdin, captured_out = mock_shell_pty
+    fake_stdin.clear()
+    fake_stdin.extend([b'echo "Hello World"\n', b"exit\n"])
+
+    with servicer.intercept() as ctx:
+        run_cli_command(["shell", *v2_shell_args, "--cpu", "8", "--memory", "16384"])
+
+    (create_req,) = ctx.get_requests("SandboxCreateV2")
+    assert ctx.get_requests("SandboxCreate") == []
+    assert create_req.definition.resources.milli_cpu == 8000
+    assert create_req.definition.resources.memory_mb == 16384
+    captured_out.clear()
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_v2_passes_experimental_options(servicer, set_env_client, mock_shell_pty, v2_shell_args):
+    fake_stdin, captured_out = mock_shell_pty
+    fake_stdin.clear()
+    fake_stdin.extend([b"exit\n"])
+
+    with servicer.intercept() as ctx:
+        run_cli_command(["shell", *v2_shell_args, "--experimental-option", "sparkle_mode=true"])
+
+    (create_req,) = ctx.get_requests("SandboxCreateV2")
+    assert dict(create_req.definition.experimental_options_v2) == {"sparkle_mode": "true"}
+    captured_out.clear()
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize("runtime", ["vm", "gvisor"])
+def test_shell_runtime(servicer, set_env_client, mock_shell_pty, monkeypatch, runtime):
+    monkeypatch.setenv("MODAL_SANDBOX_V2", "0")
+    with servicer.intercept() as ctx:
+        run_cli_command(["shell", "--runtime", runtime])
+
+    (create_req,) = ctx.get_requests("SandboxCreate")
+    assert create_req.definition.runtime == runtime
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_runtime_with_function_ref(servicer, set_env_client, test_dir, mock_shell_pty, monkeypatch):
+    monkeypatch.setenv("MODAL_SANDBOX_V2", "0")
+    app_file = test_dir / "supports" / "app_run_tests" / "default_app.py"
+    with servicer.intercept() as ctx:
+        run_cli_command(["shell", "--runtime", "vm", app_file.as_posix() + "::foo"])
+
+    (create_req,) = ctx.get_requests("SandboxCreate")
+    assert create_req.definition.runtime == "vm"
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_runtime_rejects_unknown(servicer, set_env_client, mock_shell_pty):
+    run_cli_command(["shell", "--runtime", "docker"], expected_exit_code=2, expected_stderr=None)
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_v2_runtime(servicer, set_env_client, mock_shell_pty, v2_shell_args):
+    fake_stdin, captured_out = mock_shell_pty
+    fake_stdin.clear()
+    fake_stdin.extend([b"exit\n"])
+
+    with servicer.intercept() as ctx:
+        run_cli_command(["shell", *v2_shell_args, "--runtime", "vm"])
+
+    (create_req,) = ctx.get_requests("SandboxCreateV2")
+    assert create_req.definition.runtime == "vm"
+    captured_out.clear()
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_v2_rejects_gpu(servicer, set_env_client, mock_shell_pty):
+    run_cli_command(
+        ["shell", "--experimental-v2", "--gpu", "a10g"],
+        expected_exit_code=1,
+        expected_error="`gpu` is not supported for V2 sandboxes",
+    )
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_v2_add_local(servicer, set_env_client, mock_shell_pty, tmp_path, v2_shell_args):
+    local_file = tmp_path / "file.txt"
+    local_file.write_text("hello")
+    with servicer.intercept() as ctx:
+        run_cli_command(["shell", *v2_shell_args, "--add-local", str(local_file)])
+
+    (create_req,) = ctx.get_requests("SandboxCreateV2")
+    assert ctx.get_requests("SandboxCreate") == []
+    (mount_id,) = create_req.definition.mount_ids
+    sha = servicer.mount_contents[mount_id]["/mnt/file.txt"]
+    assert servicer.files_sha2data[sha]["data"] == b"hello"
+
+
+@skip_windows("modal shell not supported on Windows.")
+def test_shell_v2_function_mounts(servicer, set_env_client, mock_shell_pty, tmp_path, v2_shell_args):
+    image_file = tmp_path / "image-data.txt"
+    image_file.write_text("image mount")
+    app_file = tmp_path / "mounted_app.py"
+    app_file.write_text(
+        "import modal\n"
+        f"image = modal.Image.debian_slim().add_local_file({str(image_file)!r}, '/my-img-data.txt')\n"
+        "app = modal.App(image=image)\n"
+        "@app.function()\n"
+        "def f():\n"
+        "    pass\n"
+    )
+
+    with servicer.intercept() as ctx:
+        run_cli_command(["shell", *v2_shell_args, f"{app_file}::f"])
+
+    (create_req,) = ctx.get_requests("SandboxCreateV2")
+    assert ctx.get_requests("SandboxCreate") == []
+    assert len(create_req.definition.mount_ids) == 3  # Client, Function source, and Image files.
+    mounted_files = {
+        k: v for mount_id in create_req.definition.mount_ids for k, v in servicer.mount_contents[mount_id].items()
+    }
+    source_sha = mounted_files["/root/mounted_app.py"]
+    assert servicer.files_sha2data[source_sha]["data"] == app_file.read_bytes()
+    image_sha = mounted_files["/my-img-data.txt"]
+    assert servicer.files_sha2data[image_sha]["data"] == b"image mount"
+
+
+@skip_windows("modal shell not supported on Windows.")
+def test_shell_v2_timeout_checks_v2_status(servicer, set_env_client, monkeypatch, v2_shell_args):
+    monkeypatch.setattr(
+        "modal.sandbox._sandbox._Sandbox._exec", AsyncMock(side_effect=InteractiveTimeoutError("exec timed out"))
+    )
+
+    with servicer.intercept() as ctx:
+        run_cli_command(["shell", *v2_shell_args, "--no-pty"], expected_exit_code=1, expected_error="exec timed out")
+
+    assert len(ctx.get_requests("SandboxWaitV2")) == 1
+    assert ctx.get_requests("SandboxWait") == []
+
+
+@skip_windows("modal shell is not supported on Windows.")
+@pytest.mark.parametrize("sandbox_v2,gpu", [("0", None), ("1", "a10g")])
+def test_shell_v1_selection(servicer, set_env_client, mock_shell_pty, monkeypatch, sandbox_v2, gpu):
+    monkeypatch.setenv("MODAL_SANDBOX_V2", sandbox_v2)
+    args = ["shell"] if not gpu else ["shell", "--gpu", gpu]
+    with servicer.intercept() as ctx:
+        run_cli_command(args)
+
+    assert ctx.get_requests("SandboxCreateV2") == []
+    assert len(ctx.get_requests("SandboxCreate")) == 1
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_v2_forbidden_with_container_id():
+    run_cli_command(
+        ["shell", "sb-abc123", "--experimental-v2"],
+        expected_exit_code=1,
+        expected_stderr="Cannot specify container configuration arguments",
+    )
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_shell_no_status_output_after_sandbox_exec(servicer, set_env_client, mock_shell_pty):
+    """Test that modal shell doesn't print status/progress output after starting the sandbox exec.
+
+    The _run_app context manager normally prints status messages like "Initialized. View run at..."
+    and "App completed". These should be suppressed during interactive shell sessions because
+    they interfere with the terminal UI.
+
+    Note: Image build logs ("build starting", "build finished") SHOULD still be shown during
+    sandbox creation - only the progress/status output from _run_app should be suppressed.
+    """
+    fake_stdin, captured_out = mock_shell_pty
+    fake_stdin.clear()
+    fake_stdin.extend([b"exit\n"])
+
+    res = run_cli_command(["shell"])
+
+    # The shell should work - PTY data should be captured
+    shell_prompt = servicer.shell_prompt
+    assert (1, shell_prompt) in captured_out
+
+    # Status/progress output from _run_app should NOT appear in stdout.
+    # These are the messages that come from runner.py's _run_app function
+    # when output_mgr.is_enabled is True - they should be suppressed for shell.
+    unwanted_patterns = [
+        # From _run_app initialization
+        r"Initialized\.",
+        r"View run at",
+        # From object creation
+        r"Created objects",
+        # From app completion
+        r"App completed",
+        # Status spinner messages
+        r"containers? initializing",
+    ]
+
+    for pattern in unwanted_patterns:
+        assert not re.search(pattern, res.stdout, re.IGNORECASE)
+
+    # Image build logs ARE expected and should be allowed
+    # (e.g., "build starting", "build finished" from the sandbox image build)

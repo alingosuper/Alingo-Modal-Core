@@ -1,0 +1,3133 @@
+package modal
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"iter"
+	"log/slog"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	pb "github.com/modal-labs/Alingo-Modal-Core/go/proto/modal_proto"
+	"github.com/onsi/gomega"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+const (
+	testV1SandboxID = "sb-nGEijt9WbBMlGrsPH9FOaC"
+	testV2SandboxID = "sb-01ARZ3NDEKTSV4RRFFQ69G5FAV"
+)
+
+func TestSandboxCreateRequestProto_WithoutPTY(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	definition := req.GetDefinition()
+	ptyInfo := definition.GetPtyInfo()
+	g.Expect(ptyInfo).Should(gomega.BeNil())
+}
+
+func TestV2SandboxOutputReadAfterDetach(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	sb := newSandbox(&Client{}, testV2SandboxID)
+	g.Expect(sb.Detach()).To(gomega.Succeed())
+	for _, output := range []io.ReadCloser{sb.Stdout, sb.Stderr} {
+		_, err := output.Read(make([]byte, 1))
+		var clientClosedErr ClientClosedError
+		g.Expect(errors.As(err, &clientClosedErr)).To(gomega.BeTrue())
+	}
+}
+
+// countingClientStub counts the control plane RPCs a detached Sandbox could
+// reach for on its way to the command router.
+type countingClientStub struct {
+	pb.ModalClientClient
+	calls atomic.Int32
+}
+
+//nolint:staticcheck // name must match the generated ModalClientClient interface method.
+func (s *countingClientStub) SandboxGetTaskIdV2(context.Context, *pb.SandboxGetTaskIdRequest, ...grpc.CallOption) (*pb.SandboxGetTaskIdResponse, error) {
+	s.calls.Add(1)
+	taskID := "ta-1"
+	return pb.SandboxGetTaskIdResponse_builder{TaskId: &taskID}.Build(), nil
+}
+
+func (s *countingClientStub) SandboxGetCommandRouterAccess(context.Context, *pb.SandboxGetCommandRouterAccessRequest, ...grpc.CallOption) (*pb.SandboxGetCommandRouterAccessResponse, error) {
+	s.calls.Add(1)
+	return pb.SandboxGetCommandRouterAccessResponse_builder{Jwt: mockJWT(time.Now().Unix() + 3600), Url: "https://unused.invalid"}.Build(), nil
+}
+
+func TestV2SandboxStdinWriteAfterDetachFailsWithoutRPC(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	stub := &countingClientStub{}
+	sb := newSandbox(&Client{cpClient: &clientWithConn{ModalClientClient: stub}, logger: slog.New(slog.DiscardHandler)}, testV2SandboxID)
+	stdin := sb.Stdin
+	g.Expect(sb.Detach()).To(gomega.Succeed())
+
+	_, err := stdin.Write([]byte("hello"))
+	var clientClosedErr ClientClosedError
+	g.Expect(errors.As(err, &clientClosedErr)).To(gomega.BeTrue())
+	g.Expect(errors.As(stdin.Close(), &clientClosedErr)).To(gomega.BeTrue())
+	g.Expect(stub.calls.Load()).To(gomega.BeZero())
+}
+
+type pendingRouterAccessStub struct {
+	pb.ModalClientClient
+	started chan struct{}
+	finish  chan struct{}
+}
+
+func (s *pendingRouterAccessStub) SandboxGetCommandRouterAccess(ctx context.Context, _ *pb.SandboxGetCommandRouterAccessRequest, _ ...grpc.CallOption) (*pb.SandboxGetCommandRouterAccessResponse, error) {
+	close(s.started)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.finish:
+		return pb.SandboxGetCommandRouterAccessResponse_builder{Jwt: mockJWT(time.Now().Unix() + 3600), Url: "https://unused.invalid"}.Build(), nil
+	}
+}
+
+func TestDetachDoesNotWaitForOutputInitialization(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	stub := &pendingRouterAccessStub{started: make(chan struct{}), finish: make(chan struct{})}
+	sb := newSandbox(&Client{cpClient: &clientWithConn{ModalClientClient: stub}, logger: slog.New(slog.DiscardHandler)}, testV2SandboxID)
+	sb.task().taskID = "ta-1"
+	result := make(chan error, 1)
+	go func() { _, err := sb.Stderr.Read(make([]byte, 1)); result <- err }()
+	g.Eventually(stub.started).Should(gomega.BeClosed())
+	defer close(stub.finish)
+	detached := make(chan error, 1)
+	go func() { detached <- sb.Detach() }()
+	g.Eventually(detached).Should(gomega.Receive(gomega.BeNil()))
+	later := make(chan error, 1)
+	go func() { _, err := sb.Stdout.Read(make([]byte, 1)); later <- err }()
+	g.Eventually(later).Should(gomega.Receive(gomega.HaveOccurred()))
+	// Finish initialization after detach; it must dispose of its new client.
+	t.Cleanup(func() {
+		g.Eventually(result).Should(gomega.Receive(gomega.HaveOccurred()))
+		sb.task().commandRouter.mu.Lock()
+		g.Expect(sb.task().commandRouter.client).To(gomega.BeNil())
+		sb.task().commandRouter.mu.Unlock()
+	})
+}
+
+func TestSandboxCreateV2RequestProto(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateV2RequestProto("app-123", "img-456", SandboxCreateParams{
+		Command: []string{"sleep", "60"},
+		Timeout: 10 * time.Minute,
+	}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetAppId()).To(gomega.Equal("app-123"))
+	g.Expect(req.GetDefinition().GetImageId()).To(gomega.Equal("img-456"))
+	g.Expect(req.GetDefinition().GetEntrypointArgs()).To(gomega.Equal([]string{"sleep", "60"}))
+	g.Expect(req.GetDefinition().GetTimeoutSecs()).To(gomega.Equal(uint32(600)))
+}
+
+func TestSandboxCreateV2RequestProto_WithTags(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateV2RequestProto("app-123", "img-456", SandboxCreateParams{
+		Tags: map[string]string{"env": "prod", "team": "infra"},
+	}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	got := map[string]string{}
+	for _, tag := range req.GetTags() {
+		got[tag.GetTagName()] = tag.GetTagValue()
+	}
+	g.Expect(got).To(gomega.Equal(map[string]string{"env": "prod", "team": "infra"}))
+}
+
+func TestSandboxCreateV2RequestProto_WithProxy(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateV2RequestProto("app-123", "img-456", SandboxCreateParams{
+		Proxy: &Proxy{ProxyID: "pr-123"},
+	}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetDefinition().GetProxyId()).To(gomega.Equal("pr-123"))
+}
+
+func TestSandboxCreateRejectsNilCloudBucketMount(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	_, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		CloudBucketMounts: map[string]*CloudBucketMount{"/mnt/s3": nil},
+	})
+	var invalidErr InvalidError
+	g.Expect(errors.As(err, &invalidErr)).To(gomega.BeTrue())
+	g.Expect(err.Error()).To(gomega.ContainSubstring(`"/mnt/s3"`))
+}
+
+func TestSandboxExperimentalOptionsAcceptsStringValues(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		ExperimentalOptions: map[string]any{"proxy_traffic_via_sidecar": "mitm"},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetDefinition().GetExperimentalOptionsV2()).To(gomega.Equal(
+		map[string]string{"proxy_traffic_via_sidecar": "mitm"},
+	))
+}
+
+func TestSandboxExperimentalOptionsAcceptsBoolValues(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		ExperimentalOptions: map[string]any{"enable_docker": true},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetDefinition().GetExperimentalOptionsV2()).To(gomega.Equal(
+		map[string]string{"enable_docker": "true"},
+	))
+}
+
+func TestSandboxExperimentalOptionsAcceptsMixedStringAndBoolValues(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		ExperimentalOptions: map[string]any{"enable_docker": true, "proxy_traffic_via_sidecar": "mitm"},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetDefinition().GetExperimentalOptionsV2()).To(gomega.Equal(
+		map[string]string{"enable_docker": "true", "proxy_traffic_via_sidecar": "mitm"},
+	))
+}
+
+func TestSandboxCreateV2RequestProto_UnsupportedOptions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		params  SandboxCreateParams
+		wantErr string
+	}{
+		{
+			name:    "gpu",
+			params:  SandboxCreateParams{GPU: "A10G"},
+			wantErr: "GPUs are not supported",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+
+			_, err := buildSandboxCreateV2RequestProto("app-123", "img-456", tt.params, nil)
+			g.Expect(err).Should(gomega.HaveOccurred())
+			g.Expect(err.Error()).To(gomega.ContainSubstring(tt.wantErr))
+		})
+	}
+}
+
+func TestSandboxCreateV2RequestProto_CustomDomain(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateV2RequestProto("app-123", "img-456", SandboxCreateParams{
+		CustomDomain: "sandboxes.example.com",
+	}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetDefinition().GetCustomDomain()).To(gomega.Equal("sandboxes.example.com"))
+}
+
+func TestSandboxCreateV2RequestProto_VolumesAndCloudBucketMounts(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateV2RequestProto("app-123", "img-456", SandboxCreateParams{
+		Volumes:           map[string]*Volume{"/mnt/vol": {VolumeID: "vo-123"}},
+		CloudBucketMounts: map[string]*CloudBucketMount{"/mnt/s3": {BucketName: "my-bucket"}},
+	}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	volumeMounts := req.GetDefinition().GetVolumeMounts()
+	g.Expect(volumeMounts).To(gomega.HaveLen(1))
+	g.Expect(volumeMounts[0].GetMountPath()).To(gomega.Equal("/mnt/vol"))
+	g.Expect(volumeMounts[0].GetVolumeId()).To(gomega.Equal("vo-123"))
+
+	cloudBucketMounts := req.GetDefinition().GetCloudBucketMounts()
+	g.Expect(cloudBucketMounts).To(gomega.HaveLen(1))
+	g.Expect(cloudBucketMounts[0].GetMountPath()).To(gomega.Equal("/mnt/s3"))
+	g.Expect(cloudBucketMounts[0].GetBucketName()).To(gomega.Equal("my-bucket"))
+}
+
+func TestSandboxCreateV2RequestProto_OidcIdentityToken(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	role := "arn:aws:iam::123:role/r"
+	req, err := buildSandboxCreateV2RequestProto("app-123", "img-456", SandboxCreateParams{
+		IncludeOidcIdentityToken: true,
+		CloudBucketMounts:        map[string]*CloudBucketMount{"/mnt/s3": {BucketName: "my-bucket", OidcAuthRoleArn: &role}},
+	}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetDefinition().GetIncludeOidcIdentityToken()).To(gomega.BeTrue())
+
+	cloudBucketMounts := req.GetDefinition().GetCloudBucketMounts()
+	g.Expect(cloudBucketMounts).To(gomega.HaveLen(1))
+	g.Expect(cloudBucketMounts[0].GetOidcAuthRoleArn()).To(gomega.Equal(role))
+}
+
+func TestGetSandboxVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		sandboxID string
+		want      sandboxVersion
+	}{
+		{name: "v1", sandboxID: testV1SandboxID, want: sandboxVersionV1},
+		{name: "v2", sandboxID: testV2SandboxID, want: sandboxVersionV2},
+		// IDs that match neither known shape are assumed to be V2, so that
+		// future ID formats route to the newer backend instead of erroring.
+		{name: "short suffix", sandboxID: "sb-123", want: sandboxVersionV2},
+		{name: "invalid v1 char", sandboxID: "sb-nGEijt9WbBMlGrsPH9FOa_", want: sandboxVersionV2},
+		{name: "ulid timestamp overflow", sandboxID: "sb-81ARZ3NDEKTSV4RRFFQ69G5FAV", want: sandboxVersionV2},
+		{name: "lowercase ulid", sandboxID: "sb-01arz3ndektsv4rrffq69g5fav", want: sandboxVersionV2},
+		{name: "longer suffix", sandboxID: "sb-01ARZ3NDEKTSV4RRFFQ69G5FAVXY", want: sandboxVersionV2},
+		{name: "other prefix", sandboxID: "fu-01ARZ3NDEKTSV4RRFFQ69G5FAV", want: sandboxVersionV2},
+		{name: "extra separator", sandboxID: "sb-foo-bar", want: sandboxVersionV2},
+		{name: "no sb prefix", sandboxID: "not-a-sandbox-id", want: sandboxVersionV2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+
+			g.Expect(getSandboxVersion(tt.sandboxID)).To(gomega.Equal(tt.want))
+		})
+	}
+}
+
+func TestNewSandboxDeducesVersionFromIDShape(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	v1 := newSandbox(&Client{}, testV1SandboxID)
+	g.Expect(v1.impl).To(gomega.BeAssignableToTypeOf(&sandboxImplV1{}))
+
+	v2 := newSandbox(&Client{}, testV2SandboxID)
+	g.Expect(v2.impl).To(gomega.BeAssignableToTypeOf(&sandboxImplV2{}))
+}
+
+func TestSandboxV2FilesystemSupported(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	sb := newSandbox(&Client{}, testV2SandboxID)
+	sb.task().taskID = "ta-v2-123"
+
+	g.Expect(sb.Filesystem).ShouldNot(gomega.BeNil())
+
+	_, err := sb.Filesystem.ReadText(ctx, "relative/path", nil)
+	g.Expect(err).To(gomega.HaveOccurred())
+	g.Expect(err.Error()).NotTo(gomega.ContainSubstring("not supported for V2 sandboxes"))
+	g.Expect(err.Error()).To(gomega.ContainSubstring("absolute"))
+}
+
+// mockWaitUntilReadyStub embeds pb.TaskCommandRouterClient so unused methods
+// inherit nil stubs (calling them would panic). Only SandboxWaitUntilReady is
+// overridden.
+type mockWaitUntilReadyStub struct {
+	pb.TaskCommandRouterClient
+	fn func(ctx context.Context, in *pb.SandboxWaitUntilReadyTcrRequest, opts ...grpc.CallOption) (*pb.SandboxWaitUntilReadyTcrResponse, error)
+}
+
+func (m *mockWaitUntilReadyStub) SandboxWaitUntilReady(
+	ctx context.Context,
+	in *pb.SandboxWaitUntilReadyTcrRequest,
+	opts ...grpc.CallOption,
+) (*pb.SandboxWaitUntilReadyTcrResponse, error) {
+	return m.fn(ctx, in, opts...)
+}
+
+func newReadinessSandbox(t *testing.T, version sandboxVersion, stub pb.TaskCommandRouterClient) *Sandbox {
+	client := &Client{logger: slog.New(slog.DiscardHandler)}
+	sandboxID := testV1SandboxID
+	if version == sandboxVersionV2 {
+		sandboxID = testV2SandboxID
+	}
+	sb := newSandbox(client, sandboxID)
+	sb.task().taskID = "ta-wait-123"
+	sb.task().commandRouter.client = newStubClient(t, stub)
+	return sb
+}
+
+func TestSandboxWaitUntilReady(t *testing.T) {
+	t.Parallel()
+
+	versions := []struct {
+		name    string
+		version sandboxVersion
+	}{
+		{"v1", sandboxVersionV1},
+		{"v2", sandboxVersionV2},
+	}
+	for _, tc := range versions {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+			ctx := t.Context()
+
+			var seenReq *pb.SandboxWaitUntilReadyTcrRequest
+			stub := &mockWaitUntilReadyStub{
+				fn: func(_ context.Context, in *pb.SandboxWaitUntilReadyTcrRequest, _ ...grpc.CallOption) (*pb.SandboxWaitUntilReadyTcrResponse, error) {
+					seenReq = in
+					return pb.SandboxWaitUntilReadyTcrResponse_builder{ReadyAt: 123.456}.Build(), nil
+				},
+			}
+			sb := newReadinessSandbox(t, tc.version, stub)
+
+			err := sb.WaitUntilReady(ctx, 5*time.Second, nil)
+			g.Expect(err).ShouldNot(gomega.HaveOccurred())
+			g.Expect(seenReq).ShouldNot(gomega.BeNil())
+			g.Expect(seenReq.GetTaskId()).To(gomega.Equal("ta-wait-123"))
+			g.Expect(seenReq.GetTimeout()).To(gomega.BeNumerically(">", 0))
+			g.Expect(seenReq.GetTimeout()).To(gomega.BeNumerically("<=", 5))
+		})
+	}
+}
+
+func TestSidecarSnapshotFilesystemTargetsContainer(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	var captured *pb.TaskSnapshotFilesystemRequest
+	stub := &mockSnapshotFsStub{
+		fn: func(_ context.Context, request *pb.TaskSnapshotFilesystemRequest, _ ...grpc.CallOption) (*pb.TaskSnapshotFilesystemResponse, error) {
+			captured = request
+			return pb.TaskSnapshotFilesystemResponse_builder{ImageId: "im-sidecar-snapshot"}.Build(), nil
+		},
+	}
+	sb := newReadinessSandbox(t, sandboxVersionV2, stub)
+	sidecar := newSidecarContainer(sb, "sb-test-ctr-SIDECAR123", "worker", nil)
+
+	image, err := sidecar.SnapshotFilesystem(t.Context(), &SidecarSnapshotFilesystemParams{TTL: NoExpiryTTL})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(image.ImageID).To(gomega.Equal("im-sidecar-snapshot"))
+	g.Expect(captured.GetTaskId()).To(gomega.Equal("ta-wait-123"))
+	g.Expect(captured.GetContainerId()).To(gomega.Equal(sidecar.ContainerID))
+	g.Expect(captured.GetTtlSeconds()).To(gomega.Equal(int64(-1)))
+}
+
+func TestSandboxWaitUntilReadyTimesOut(t *testing.T) {
+	t.Parallel()
+
+	versions := []struct {
+		name    string
+		version sandboxVersion
+	}{
+		{"v1", sandboxVersionV1},
+		{"v2", sandboxVersionV2},
+	}
+	for _, tc := range versions {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+			ctx := t.Context()
+
+			calls := 0
+			stub := &mockWaitUntilReadyStub{
+				fn: func(_ context.Context, _ *pb.SandboxWaitUntilReadyTcrRequest, _ ...grpc.CallOption) (*pb.SandboxWaitUntilReadyTcrResponse, error) {
+					calls++
+					// The worker signals that the sandbox did not become ready in time.
+					return nil, status.Error(codes.DeadlineExceeded, "deadline exceeded")
+				},
+			}
+			sb := newReadinessSandbox(t, tc.version, stub)
+
+			err := sb.WaitUntilReady(ctx, 100*time.Millisecond, nil)
+			var timeoutErr TimeoutError
+			g.Expect(errors.As(err, &timeoutErr)).To(gomega.BeTrue(),
+				"expected TimeoutError, got %T: %v", err, err)
+		})
+	}
+}
+
+func TestSandboxV2StdioStreamsViaCommandRouter(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	fake := &fakeStdioRouterServer{
+		stdoutData: []byte("hello stdout\n"),
+		stderrData: []byte("oops stderr\n"),
+	}
+	crClient := newStdioTestClient(t, fake)
+
+	sb := newSandbox(&Client{logger: slog.New(slog.DiscardHandler)}, testV2SandboxID)
+	sb.task().taskID = "ta-v2-stdio"
+	sb.task().commandRouter.client = crClient
+
+	stdout, err := io.ReadAll(sb.Stdout)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(string(stdout)).To(gomega.Equal("hello stdout\n"))
+
+	stderr, err := io.ReadAll(sb.Stderr)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(string(stderr)).To(gomega.Equal("oops stderr\n"))
+
+	_, err = sb.Stdin.Write([]byte("some input"))
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	err = sb.Stdin.Close()
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	received, closed := fake.stdinSnapshot()
+	g.Expect(string(received)).To(gomega.Equal("some input"))
+	g.Expect(closed).To(gomega.BeTrue())
+}
+
+type mockGetTaskIDStub struct {
+	pb.ModalClientClient
+	fn func(ctx context.Context, in *pb.SandboxGetTaskIdRequest, opts ...grpc.CallOption) (*pb.SandboxGetTaskIdResponse, error)
+}
+
+//nolint:staticcheck // name must match the generated ModalClientClient interface method.
+func (m *mockGetTaskIDStub) SandboxGetTaskIdV2(
+	ctx context.Context,
+	in *pb.SandboxGetTaskIdRequest,
+	opts ...grpc.CallOption,
+) (*pb.SandboxGetTaskIdResponse, error) {
+	return m.fn(ctx, in, opts...)
+}
+
+func TestClosingV2StdioUnblocksAPendingTaskLookup(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	asked := make(chan struct{}, 1)
+	stub := &mockGetTaskIDStub{
+		fn: func(ctx context.Context, _ *pb.SandboxGetTaskIdRequest, _ ...grpc.CallOption) (*pb.SandboxGetTaskIdResponse, error) {
+			select {
+			case asked <- struct{}{}:
+			default:
+			}
+			return pb.SandboxGetTaskIdResponse_builder{}.Build(), nil
+		},
+	}
+	sb := newSandbox(&Client{
+		logger:   slog.New(slog.DiscardHandler),
+		cpClient: &clientWithConn{ModalClientClient: stub},
+	}, testV2SandboxID)
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := sb.Stdout.Read(make([]byte, 1))
+		readErr <- err
+	}()
+
+	g.Eventually(asked, 5*time.Second).Should(gomega.Receive())
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- sb.Stdout.Close() }()
+
+	g.Eventually(closeErr, 5*time.Second).Should(gomega.Receive(gomega.BeNil()),
+		"Close must not wait out the task lookup it is cancelling")
+	g.Eventually(readErr, 5*time.Second).Should(gomega.Receive(gomega.HaveOccurred()),
+		"the waiting read should end once the lookup is cancelled")
+}
+
+func TestEnsureTaskIDReturnsTaskIDForFinishedSandbox(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	taskID := "ta-finished"
+	stub := &mockGetTaskIDStub{
+		fn: func(_ context.Context, _ *pb.SandboxGetTaskIdRequest, _ ...grpc.CallOption) (*pb.SandboxGetTaskIdResponse, error) {
+			return pb.SandboxGetTaskIdResponse_builder{
+				TaskId: &taskID,
+				TaskResult: pb.GenericResult_builder{
+					Status: pb.GenericResult_GENERIC_STATUS_SUCCESS,
+				}.Build(),
+			}.Build(), nil
+		},
+	}
+	sb := newSandbox(&Client{cpClient: &clientWithConn{ModalClientClient: stub}}, testV2SandboxID)
+
+	gotTaskID, err := sb.impl.(taskIDWaiter).ensureTaskID(ctx)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(gotTaskID).To(gomega.Equal("ta-finished"))
+	g.Expect(sb.task().taskID).To(gomega.Equal("ta-finished"))
+}
+
+func TestSandboxV2StdioConcurrentReadsResolveTaskID(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	fake := &fakeStdioRouterServer{
+		stdoutData: []byte("hello stdout\n"),
+		stderrData: []byte("oops stderr\n"),
+	}
+	crClient := newStdioTestClient(t, fake)
+
+	taskID := "ta-v2-stdio"
+	stub := &mockGetTaskIDStub{
+		fn: func(_ context.Context, _ *pb.SandboxGetTaskIdRequest, _ ...grpc.CallOption) (*pb.SandboxGetTaskIdResponse, error) {
+			time.Sleep(5 * time.Millisecond)
+			return pb.SandboxGetTaskIdResponse_builder{TaskId: &taskID}.Build(), nil
+		},
+	}
+	sb := newSandbox(&Client{
+		logger:   slog.New(slog.DiscardHandler),
+		cpClient: &clientWithConn{ModalClientClient: stub},
+	}, testV2SandboxID)
+	sb.task().commandRouter.client = crClient
+
+	var wg sync.WaitGroup
+	var stdout, stderr []byte
+	wg.Add(2)
+	go func() { defer wg.Done(); stdout, _ = io.ReadAll(sb.Stdout) }()
+	go func() { defer wg.Done(); stderr, _ = io.ReadAll(sb.Stderr) }()
+	wg.Wait()
+
+	g.Expect(string(stdout)).To(gomega.Equal("hello stdout\n"))
+	g.Expect(string(stderr)).To(gomega.Equal("oops stderr\n"))
+}
+
+func TestSandboxCreateRequestProto_WithPTY(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		PTY: true,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	definition := req.GetDefinition()
+	ptyInfo := definition.GetPtyInfo()
+	g.Expect(ptyInfo.GetEnabled()).To(gomega.BeTrue())
+	g.Expect(ptyInfo.GetWinszRows()).To(gomega.Equal(uint32(24)))
+	g.Expect(ptyInfo.GetWinszCols()).To(gomega.Equal(uint32(80)))
+	g.Expect(ptyInfo.GetEnvTerm()).To(gomega.Equal("xterm-256color"))
+	g.Expect(ptyInfo.GetEnvColorterm()).To(gomega.Equal("truecolor"))
+	g.Expect(ptyInfo.GetPtyType()).To(gomega.Equal(pb.PTYInfo_PTY_TYPE_SHELL))
+}
+
+func TestProbeWithTCPBadValues(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	_, err := NewTCPProbe(0, nil)
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("expects port in [1, 65535]"))
+
+	_, err = NewTCPProbe(8080, &TCPProbeParams{Interval: -1 * time.Millisecond})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("expects interval > 0"))
+
+	_, err = NewTCPProbe(8080, &TCPProbeParams{Interval: 1500 * time.Microsecond})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("whole number of milliseconds"))
+}
+
+func TestProbeWithExecBadValues(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	_, err := NewExecProbe(nil, nil)
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("requires at least one argument"))
+
+	_, err = NewExecProbe([]string{"echo"}, &ExecProbeParams{Interval: -1 * time.Millisecond})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("expects interval > 0"))
+}
+
+func TestSandboxCreateRequestProto_WithReadinessProbeTCP(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	probe, err := NewTCPProbe(8080, &TCPProbeParams{Interval: 250 * time.Millisecond})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		ReadinessProbe: probe,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	readinessProbe := req.GetDefinition().GetReadinessProbe()
+	g.Expect(readinessProbe).ShouldNot(gomega.BeNil())
+	g.Expect(readinessProbe.GetTcpPort()).To(gomega.Equal(uint32(8080)))
+	g.Expect(readinessProbe.GetIntervalMs()).To(gomega.Equal(uint32(250)))
+}
+
+func TestSandboxCreateRequestProto_WithReadinessProbeExec(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	probe, err := NewExecProbe([]string{"sh", "-c", "echo ok"}, &ExecProbeParams{Interval: 300 * time.Millisecond})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		ReadinessProbe: probe,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	readinessProbe := req.GetDefinition().GetReadinessProbe()
+	g.Expect(readinessProbe).ShouldNot(gomega.BeNil())
+	g.Expect(readinessProbe.GetExecCommand().GetArgv()).To(gomega.Equal([]string{"sh", "-c", "echo ok"}))
+	g.Expect(readinessProbe.GetIntervalMs()).To(gomega.Equal(uint32(300)))
+}
+
+func TestTaskExecStartProto_WithoutPTY(t *testing.T) {
+	g := gomega.NewWithT(t)
+	req, err := buildTaskExecStartRequestProto("task-123", "exec-456", []string{"bash"}, SandboxExecParams{}, "")
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	ptyInfo := req.GetPtyInfo()
+	g.Expect(ptyInfo).Should(gomega.BeNil())
+}
+
+func TestTaskExecStartProto_WithPTY(t *testing.T) {
+	g := gomega.NewWithT(t)
+	req, err := buildTaskExecStartRequestProto("task-123", "exec-456", []string{"bash"}, SandboxExecParams{
+		PTY: true,
+	}, "")
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	ptyInfo := req.GetPtyInfo()
+	g.Expect(ptyInfo).ShouldNot(gomega.BeNil())
+	g.Expect(ptyInfo.GetEnabled()).To(gomega.BeTrue())
+	g.Expect(ptyInfo.GetWinszRows()).To(gomega.Equal(uint32(24)))
+	g.Expect(ptyInfo.GetWinszCols()).To(gomega.Equal(uint32(80)))
+	g.Expect(ptyInfo.GetEnvTerm()).To(gomega.Equal("xterm-256color"))
+	g.Expect(ptyInfo.GetEnvColorterm()).To(gomega.Equal("truecolor"))
+	g.Expect(ptyInfo.GetPtyType()).To(gomega.Equal(pb.PTYInfo_PTY_TYPE_SHELL))
+	g.Expect(ptyInfo.GetNoTerminateOnIdleStdin()).To(gomega.BeTrue())
+}
+
+func TestTaskExecStartRequestProto_DefaultValues(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	req, err := buildTaskExecStartRequestProto("task-123", "exec-456", []string{"bash"}, SandboxExecParams{}, "")
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	g.Expect(req.GetWorkdir()).To(gomega.BeEmpty())
+	g.Expect(req.HasTimeoutSecs()).To(gomega.BeFalse())
+	g.Expect(req.GetSecretIds()).To(gomega.BeEmpty())
+	g.Expect(req.GetEnv()).To(gomega.BeEmpty())
+	g.Expect(req.GetSecretSources()).To(gomega.BeEmpty())
+	g.Expect(req.GetPtyInfo()).To(gomega.BeNil())
+	g.Expect(req.GetStdoutConfig()).To(gomega.Equal(pb.TaskExecStdoutConfig_TASK_EXEC_STDOUT_CONFIG_PIPE))
+	g.Expect(req.GetStderrConfig()).To(gomega.Equal(pb.TaskExecStderrConfig_TASK_EXEC_STDERR_CONFIG_PIPE))
+}
+
+func TestTaskExecStartRequestProto_WithStdoutIgnore(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	req, err := buildTaskExecStartRequestProto("task-123", "exec-456", []string{"bash"}, SandboxExecParams{
+		Stdout: Ignore,
+	}, "")
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	g.Expect(req.GetStdoutConfig()).To(gomega.Equal(pb.TaskExecStdoutConfig_TASK_EXEC_STDOUT_CONFIG_DEVNULL))
+	g.Expect(req.GetStderrConfig()).To(gomega.Equal(pb.TaskExecStderrConfig_TASK_EXEC_STDERR_CONFIG_PIPE))
+}
+
+func TestTaskExecStartRequestProto_WithStderrIgnore(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	req, err := buildTaskExecStartRequestProto("task-123", "exec-456", []string{"bash"}, SandboxExecParams{
+		Stderr: Ignore,
+	}, "")
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	g.Expect(req.GetStdoutConfig()).To(gomega.Equal(pb.TaskExecStdoutConfig_TASK_EXEC_STDOUT_CONFIG_PIPE))
+	g.Expect(req.GetStderrConfig()).To(gomega.Equal(pb.TaskExecStderrConfig_TASK_EXEC_STDERR_CONFIG_DEVNULL))
+}
+
+func TestTaskExecStartRequestProto_WithWorkdir(t *testing.T) {
+	tests := []struct {
+		name        string
+		workdir     string
+		expected    string
+		expectedErr string
+	}{
+		{
+			name:     "absolute",
+			workdir:  "/tmp",
+			expected: "/tmp",
+		},
+		{
+			name:        "relative",
+			workdir:     "tmp",
+			expectedErr: "workdir must be an absolute path",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+
+			req, err := buildTaskExecStartRequestProto("task-123", "exec-456", []string{"pwd"}, SandboxExecParams{
+				Workdir: tt.workdir,
+			}, "")
+			if tt.expectedErr != "" {
+				g.Expect(err).To(gomega.HaveOccurred())
+				g.Expect(err.Error()).To(gomega.ContainSubstring(tt.expectedErr))
+				return
+			}
+
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			g.Expect(req.GetWorkdir()).To(gomega.Equal(tt.expected))
+		})
+	}
+}
+
+func TestTaskExecStartRequestProto_WithTimeout(t *testing.T) {
+	g := gomega.NewWithT(t)
+	timeout := 30 * time.Second
+
+	req, err := buildTaskExecStartRequestProto("task-123", "exec-456", []string{"sleep", "10"}, SandboxExecParams{
+		Timeout: timeout,
+	}, "")
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	g.Expect(req.HasTimeoutSecs()).To(gomega.BeTrue())
+	g.Expect(req.GetTimeoutSecs()).To(gomega.Equal(uint32(30)))
+}
+
+func TestTaskExecStartRequestProto_WithEnv(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	req, err := buildTaskExecStartRequestProto("task-123", "exec-456", []string{"env"}, SandboxExecParams{
+		Env: map[string]string{"FOO": "bar"},
+	}, "")
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	g.Expect(req.GetEnv()).To(gomega.BeEmpty())
+	g.Expect(secretSourceValues(req.GetSecretSources())).To(gomega.Equal([]any{map[string]string{"FOO": "bar"}}))
+}
+
+func TestTaskExecStartRequestProto_SecretSourcesKeepOrder(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	local := &Secret{hydrator: &secretFromMapHydrator{envDict: map[string]string{"K": "local", "LOCAL_ONLY": "yes"}}}
+	named := &Secret{SecretID: "st-named"}
+	req, err := buildTaskExecStartRequestProto("task-123", "exec-456", []string{"env"}, SandboxExecParams{
+		Secrets: []*Secret{local, named},
+		Env:     map[string]string{"K": "env"},
+	}, "")
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	g.Expect(req.GetSecretIds()).To(gomega.BeEmpty())
+	g.Expect(req.GetEnv()).To(gomega.BeEmpty())
+	g.Expect(secretSourceValues(req.GetSecretSources())).To(gomega.Equal([]any{
+		map[string]string{"K": "local", "LOCAL_ONLY": "yes"},
+		"st-named",
+		map[string]string{"K": "env"},
+	}))
+}
+
+func TestTaskExecStartRequestProto_InvalidTimeoutNegative(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	_, err := buildTaskExecStartRequestProto("task-123", "exec-456", []string{"echo", "hi"}, SandboxExecParams{
+		Timeout: -1 * time.Second,
+	}, "")
+	g.Expect(err).To(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("must be non-negative"))
+}
+
+func TestTaskExecStartRequestProto_InvalidTimeoutNotWholeSeconds(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	_, err := buildTaskExecStartRequestProto("task-123", "exec-456", []string{"echo", "hi"}, SandboxExecParams{
+		Timeout: 1500 * time.Millisecond,
+	}, "")
+	g.Expect(err).To(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("whole number of seconds"))
+}
+
+func TestValidateExecArgsWithArgsWithinLimit(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	err := validateExecArgs([]string{"echo", "hello"})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+}
+
+func TestValidateExecArgsWithArgsExceedingArgMax(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	largeArg := bytes.Repeat([]byte{'a'}, 1<<16+1)
+
+	err := validateExecArgs([]string{string(largeArg)})
+	g.Expect(err).To(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("Total length of CMD arguments must be less than"))
+}
+
+func TestValidateExperimentalEncryptionKey(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	key := bytes.Repeat([]byte{7}, 16)
+	validatedKey, err := validateExperimentalEncryptionKey(key)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(validatedKey).To(gomega.Equal(key))
+
+	validatedKey, err = validateExperimentalEncryptionKey(nil)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(validatedKey).To(gomega.BeNil())
+
+	for _, keyLength := range []int{0, 15, 513} {
+		_, err = validateExperimentalEncryptionKey(bytes.Repeat([]byte{1}, keyLength))
+		g.Expect(err).To(gomega.HaveOccurred())
+		g.Expect(err.Error()).To(gomega.ContainSubstring("between 16 and 512 bytes"))
+		var invalidErr InvalidError
+		g.Expect(errors.As(err, &invalidErr)).To(gomega.BeTrue())
+	}
+}
+
+func TestResolveMountImageID(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	imageID, err := resolveMountImageID(nil)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(imageID).To(gomega.BeEmpty())
+
+	imageID, err = resolveMountImageID(&Image{ImageID: "im-123"})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(imageID).To(gomega.Equal("im-123"))
+
+	_, err = resolveMountImageID(&Image{})
+	g.Expect(err).To(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("Image must be built before mounting"))
+	var invalidErr InvalidError
+	g.Expect(errors.As(err, &invalidErr)).To(gomega.BeTrue())
+}
+
+func TestTaskMountDirectoryRequestProtoWithExperimentalEncryptionKey(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	key := bytes.Repeat([]byte{1}, 16)
+
+	req, err := buildTaskMountDirectoryRequestProto("ta-123", "/mnt/data", "im-123", "sb-test-ctr-SIDECAR123", &SandboxMountImageParams{
+		ExperimentalEncryptionKey: key,
+	})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(req.GetTaskId()).To(gomega.Equal("ta-123"))
+	g.Expect(req.GetPath()).To(gomega.Equal([]byte("/mnt/data")))
+	g.Expect(req.GetImageId()).To(gomega.Equal("im-123"))
+	g.Expect(req.GetCustomerSuppliedEncryptionKey()).To(gomega.Equal(key))
+	g.Expect(req.HasCustomerSuppliedEncryptionKey()).To(gomega.BeTrue())
+	g.Expect(req.GetContainerId()).To(gomega.Equal("sb-test-ctr-SIDECAR123"))
+
+	req, err = buildTaskMountDirectoryRequestProto("ta-123", "/mnt/data", "im-123", "", nil)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(req.HasCustomerSuppliedEncryptionKey()).To(gomega.BeFalse())
+	g.Expect(req.GetContainerId()).To(gomega.BeEmpty())
+}
+
+func TestTaskSnapshotDirectoryRequestProtoWithExperimentalEncryptionKey(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	key := bytes.Repeat([]byte{2}, 32)
+
+	req, err := buildTaskSnapshotDirectoryRequestProto("ta-123", "/mnt/data", "snapshot-123", "sb-test-ctr-SIDECAR123", 3600, &SandboxSnapshotDirectoryParams{
+		ExperimentalEncryptionKey: key,
+	})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(req.GetTaskId()).To(gomega.Equal("ta-123"))
+	g.Expect(req.GetPath()).To(gomega.Equal([]byte("/mnt/data")))
+	g.Expect(req.GetSnapshotId()).To(gomega.Equal("snapshot-123"))
+	g.Expect(req.GetTtlSeconds()).To(gomega.Equal(int64(3600)))
+	g.Expect(req.GetCustomerSuppliedEncryptionKey()).To(gomega.Equal(key))
+	g.Expect(req.HasCustomerSuppliedEncryptionKey()).To(gomega.BeTrue())
+	g.Expect(req.GetContainerId()).To(gomega.Equal("sb-test-ctr-SIDECAR123"))
+
+	req, err = buildTaskSnapshotDirectoryRequestProto("ta-123", "/mnt/data", "snapshot-123", "", 3600, nil)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(req.HasCustomerSuppliedEncryptionKey()).To(gomega.BeFalse())
+	g.Expect(req.GetContainerId()).To(gomega.BeEmpty())
+}
+
+func TestSandboxCreateRequestProto_WithCPUAndCPULimit(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		CPU:      2.0,
+		CPULimit: 4.5,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	resources := req.GetDefinition().GetResources()
+	g.Expect(resources.GetMilliCpu()).To(gomega.Equal(uint32(2000)))
+	g.Expect(resources.GetMilliCpuMax()).To(gomega.Equal(uint32(4500)))
+}
+
+func TestSandboxCreateRequestProto_CPULimitLowerThanCPU(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	_, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		CPU:      4.0,
+		CPULimit: 2.0,
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("the CPU request (4.000000) cannot be higher than CPULimit (2.000000)"))
+}
+
+func TestSandboxCreateRequestProto_CPULimitWithoutCPU(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	_, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		CPULimit: 4.0,
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("must also specify non-zero CPU request when CPULimit is specified"))
+}
+
+func TestSandboxCreateRequestProto_Runtime(t *testing.T) {
+	t.Parallel()
+
+	cases := map[SandboxRuntime]string{
+		"":                   "",
+		SandboxRuntimeGVisor: "gvisor",
+		SandboxRuntimeVM:     "vm",
+	}
+	for runtime, want := range cases {
+		t.Run(string(runtime), func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+
+			req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{Runtime: runtime})
+			g.Expect(err).ShouldNot(gomega.HaveOccurred())
+			g.Expect(req.GetDefinition().GetRuntime()).To(gomega.Equal(want))
+
+			v2Req, err := buildSandboxCreateV2RequestProto("app-123", "img-456", SandboxCreateParams{Runtime: runtime}, nil)
+			g.Expect(err).ShouldNot(gomega.HaveOccurred())
+			g.Expect(v2Req.GetDefinition().GetRuntime()).To(gomega.Equal(want))
+		})
+	}
+}
+
+func TestSandboxCreateRequestProto_InvalidRuntime(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	_, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		Runtime: "runc",
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.Equal(`invalid Runtime "runc": must be "gvisor" or "vm"`))
+}
+
+func TestSandboxCreateRequestProto_InvalidName(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	_, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		Name: strings.Repeat("a", 65),
+	})
+	g.Expect(err).To(gomega.BeAssignableToTypeOf(InvalidError{}))
+}
+
+func TestSandboxCreateRequestProto_WithMemoryAndMemoryLimit(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		MemoryMiB:      1024,
+		MemoryLimitMiB: 2048,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	resources := req.GetDefinition().GetResources()
+	g.Expect(resources.GetMemoryMb()).To(gomega.Equal(uint32(1024)))
+	g.Expect(resources.GetMemoryMbMax()).To(gomega.Equal(uint32(2048)))
+}
+
+func TestSandboxCreateRequestProto_MemoryLimitLowerThanMemory(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	_, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		MemoryMiB:      2048,
+		MemoryLimitMiB: 1024,
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("the MemoryMiB request (2048) cannot be higher than MemoryLimitMiB (1024)"))
+}
+
+func TestSandboxCreateRequestProto_MemoryLimitWithoutMemory(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	_, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		MemoryLimitMiB: 2048,
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("must also specify non-zero MemoryMiB request when MemoryLimitMiB is specified"))
+}
+
+func TestSandboxCreateRequestProto_NegativeCPU(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	_, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		CPU: -1.0,
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("must be a positive number"))
+}
+
+func TestSandboxCreateRequestProto_NegativeMemory(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	_, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		MemoryMiB: -100,
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("must be a positive number"))
+}
+
+func TestSandboxCreateRequestProto_DefaultValues(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	def := req.GetDefinition()
+	g.Expect(def.GetTimeoutSecs()).To(gomega.Equal(uint32(300)))
+	g.Expect(def.GetEntrypointArgs()).To(gomega.BeEmpty())
+	g.Expect(def.GetNetworkAccess().GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_OPEN))
+	g.Expect(def.GetNetworkAccess().GetAllowedCidrs()).To(gomega.BeEmpty())
+	g.Expect(def.GetVerbose()).To(gomega.BeFalse())
+	g.Expect(def.GetCloudProviderStr()).To(gomega.BeEmpty())
+	g.Expect(def.GetResources().GetMilliCpu()).To(gomega.Equal(uint32(0)))
+	g.Expect(def.GetResources().GetMemoryMb()).To(gomega.Equal(uint32(0)))
+	g.Expect(def.GetPtyInfo()).To(gomega.BeNil())
+	g.Expect(def.HasIdleTimeoutSecs()).To(gomega.BeFalse())
+	g.Expect(def.GetWorkdir()).To(gomega.BeEmpty())
+	g.Expect(def.GetSchedulerPlacement()).To(gomega.BeNil())
+	g.Expect(def.GetProxyId()).To(gomega.BeEmpty())
+	g.Expect(def.GetVolumeMounts()).To(gomega.BeEmpty())
+	g.Expect(def.GetCloudBucketMounts()).To(gomega.BeEmpty())
+	g.Expect(def.GetSecretIds()).To(gomega.BeEmpty())
+	g.Expect(def.GetOpenPorts().GetPorts()).To(gomega.BeEmpty())
+	g.Expect(def.GetName()).To(gomega.Equal(""))
+	g.Expect(def.GetIncludeOidcIdentityToken()).To(gomega.BeFalse())
+	g.Expect(req.GetTags()).To(gomega.BeEmpty())
+}
+
+func TestSandboxCreateRequestProto_CustomDomain(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		CustomDomain: "example.com",
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	def := req.GetDefinition()
+	g.Expect(def.GetCustomDomain()).To(gomega.Equal("example.com"))
+}
+
+func TestSandboxCreateRequestProto_IncludeOidcIdentityToken(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		IncludeOidcIdentityToken: true,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	def := req.GetDefinition()
+	g.Expect(def.GetIncludeOidcIdentityToken()).To(gomega.BeTrue())
+}
+
+func TestSandboxCreateRequestProto_OutboundCIDRAllowlist(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	// CIDRs are reflected in the network access proto.
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		OutboundCIDRAllowlist: &Allowlist{Entries: []string{"10.0.0.0/8", "192.168.0.0/16"}},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	def := req.GetDefinition()
+	g.Expect(def.GetNetworkAccess().GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_ALLOWLIST))
+	g.Expect(def.GetNetworkAccess().GetAllowedCidrs()).To(gomega.Equal([]string{"10.0.0.0/8", "192.168.0.0/16"}))
+
+	// An empty Allowlist blocks all public egress while leaving i6pn intact.
+	req, err = buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		OutboundCIDRAllowlist: &Allowlist{},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	def = req.GetDefinition()
+	g.Expect(def.GetNetworkAccess().GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_ALLOWLIST))
+	g.Expect(def.GetNetworkAccess().GetAllowedCidrs()).To(gomega.BeNil())
+	g.Expect(def.GetNetworkAccess().GetAllowedDomains()).To(gomega.BeNil())
+
+	// A nil OutboundCIDRAllowlist leaves egress open.
+	req, err = buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetDefinition().GetNetworkAccess().GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_OPEN))
+
+	// Cannot be combined with BlockNetwork.
+	_, err = buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		BlockNetwork:          true,
+		OutboundCIDRAllowlist: &Allowlist{Entries: []string{"10.0.0.0/8"}},
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("OutboundCIDRAllowlist cannot be used when BlockNetwork is enabled"))
+}
+
+func TestSandboxCreateRequestProto_OutboundDomainAllowlist(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	// Domain-only allowlist.
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		OutboundDomainAllowlist: &Allowlist{Entries: []string{"example.com", "*.github.com"}},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	def := req.GetDefinition()
+	g.Expect(def.GetNetworkAccess().GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_ALLOWLIST))
+	g.Expect(def.GetNetworkAccess().GetAllowedDomains()).To(gomega.Equal([]string{"example.com", "*.github.com"}))
+	g.Expect(def.GetNetworkAccess().GetAllowedCidrs()).To(gomega.BeNil())
+
+	// Domain + CIDR combined.
+	req, err = buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		OutboundDomainAllowlist: &Allowlist{Entries: []string{"api.example.com"}},
+		OutboundCIDRAllowlist:   &Allowlist{Entries: []string{"10.0.0.0/8"}},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	def = req.GetDefinition()
+	g.Expect(def.GetNetworkAccess().GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_ALLOWLIST))
+	g.Expect(def.GetNetworkAccess().GetAllowedDomains()).To(gomega.Equal([]string{"api.example.com"}))
+	g.Expect(def.GetNetworkAccess().GetAllowedCidrs()).To(gomega.Equal([]string{"10.0.0.0/8"}))
+
+	// Cannot be combined with BlockNetwork.
+	_, err = buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		BlockNetwork:            true,
+		OutboundDomainAllowlist: &Allowlist{Entries: []string{"example.com"}},
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("OutboundDomainAllowlist cannot be used when BlockNetwork is enabled"))
+}
+
+func TestUpdateNetworkPolicyProto(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	// Both dimensions set.
+	req := buildUpdateNetworkPolicyProto("ta-123", SandboxUpdateNetworkPolicyParams{
+		OutboundCIDRAllowlist:   &Allowlist{Entries: []string{"8.8.8.8/32"}},
+		OutboundDomainAllowlist: &Allowlist{Entries: []string{"example.com"}},
+	})
+	g.Expect(req.GetTaskId()).To(gomega.Equal("ta-123"))
+	g.Expect(req.GetNetworkAccess().GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_ALLOWLIST))
+	g.Expect(req.GetNetworkAccess().GetAllowedCidrs()).To(gomega.Equal([]string{"8.8.8.8/32"}))
+	g.Expect(req.GetNetworkAccess().GetAllowedDomains()).To(gomega.Equal([]string{"example.com"}))
+
+	// Empty Entries blocks that dimension.
+	req = buildUpdateNetworkPolicyProto("ta-123", SandboxUpdateNetworkPolicyParams{
+		OutboundCIDRAllowlist:   &Allowlist{},
+		OutboundDomainAllowlist: &Allowlist{},
+	})
+	g.Expect(req.GetNetworkAccess().GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_ALLOWLIST))
+	g.Expect(req.GetNetworkAccess().GetAllowedCidrs()).To(gomega.BeEmpty())
+	g.Expect(req.GetNetworkAccess().GetAllowedDomains()).To(gomega.BeEmpty())
+}
+
+// mockSetNetworkAccessStub embeds pb.TaskCommandRouterClient so unused methods
+// inherit nil stubs. Only TaskSetNetworkAccess is overridden, capturing the
+// request it receives.
+type mockSetNetworkAccessStub struct {
+	pb.TaskCommandRouterClient
+	gotRequest *pb.TaskSetNetworkAccessRequest
+	fn         func(ctx context.Context, in *pb.TaskSetNetworkAccessRequest, opts ...grpc.CallOption) (*pb.TaskSetNetworkAccessResponse, error)
+}
+
+func (m *mockSetNetworkAccessStub) TaskSetNetworkAccess(
+	ctx context.Context,
+	in *pb.TaskSetNetworkAccessRequest,
+	opts ...grpc.CallOption,
+) (*pb.TaskSetNetworkAccessResponse, error) {
+	m.gotRequest = in
+	return m.fn(ctx, in, opts...)
+}
+
+func newSetNetworkAccessClient(t *testing.T, stub *mockSetNetworkAccessStub) *taskCommandRouterClient {
+	return newStubClient(t, stub)
+}
+
+func TestUpdateNetworkPolicyMockedCommandRouter(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	stub := &mockSetNetworkAccessStub{
+		fn: func(_ context.Context, _ *pb.TaskSetNetworkAccessRequest, _ ...grpc.CallOption) (*pb.TaskSetNetworkAccessResponse, error) {
+			return &pb.TaskSetNetworkAccessResponse{}, nil
+		},
+	}
+
+	sb := newSandbox(&Client{logger: slog.New(slog.DiscardHandler)}, testV2SandboxID)
+	sb.task().taskID = "ta-123"
+	sb.task().commandRouter.client = newSetNetworkAccessClient(t, stub)
+
+	err := sb.UpdateNetworkPolicy(context.Background(), &SandboxUpdateNetworkPolicyParams{
+		OutboundCIDRAllowlist:   &Allowlist{Entries: []string{"10.0.0.0/8"}},
+		OutboundDomainAllowlist: &Allowlist{Entries: []string{"example.com"}},
+	})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(stub.gotRequest).ToNot(gomega.BeNil())
+	g.Expect(stub.gotRequest.GetTaskId()).To(gomega.Equal("ta-123"))
+	g.Expect(stub.gotRequest.GetNetworkAccess().GetAllowedCidrs()).To(gomega.Equal([]string{"10.0.0.0/8"}))
+	g.Expect(stub.gotRequest.GetNetworkAccess().GetAllowedDomains()).To(gomega.Equal([]string{"example.com"}))
+}
+
+type mockSetOutboundPolicyClient struct {
+	pb.ModalClientClient
+	gotRPC     string
+	gotRequest *pb.SandboxSetOutboundPolicyRequest
+	// errs are returned by the calls in turn, before the calls succeed.
+	errs  []error
+	calls int
+}
+
+func (m *mockSetOutboundPolicyClient) SandboxSetOutboundPolicy(
+	_ context.Context,
+	in *pb.SandboxSetOutboundPolicyRequest,
+	_ ...grpc.CallOption,
+) (*pb.SandboxSetOutboundPolicyResponse, error) {
+	m.gotRPC, m.gotRequest = "SandboxSetOutboundPolicy", in
+	return &pb.SandboxSetOutboundPolicyResponse{}, nil
+}
+
+func (m *mockSetOutboundPolicyClient) SandboxSetOutboundPolicyV2(
+	_ context.Context,
+	in *pb.SandboxSetOutboundPolicyRequest,
+	_ ...grpc.CallOption,
+) (*pb.SandboxSetOutboundPolicyResponse, error) {
+	m.gotRPC, m.gotRequest = "SandboxSetOutboundPolicyV2", in
+	m.calls++
+	if len(m.errs) > 0 {
+		err := m.errs[0]
+		m.errs = m.errs[1:]
+		return nil, err
+	}
+	return &pb.SandboxSetOutboundPolicyResponse{}, nil
+}
+
+func newSetOutboundPolicySandbox(mock *mockSetOutboundPolicyClient, isV2 bool) *Sandbox {
+	sandboxID := testV1SandboxID
+	if isV2 {
+		sandboxID = testV2SandboxID
+	}
+	return newSandbox(&Client{cpClient: &clientWithConn{ModalClientClient: mock}}, sandboxID)
+}
+
+func TestSetOutboundPolicyWaitsForAStartingSandbox(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	mock := &mockSetOutboundPolicyClient{
+		errs: []error{status.Error(codes.Unavailable, "the Sandbox is still starting")},
+	}
+	sb := newSetOutboundPolicySandbox(mock, true)
+	err := sb.SetOutboundPolicy(context.Background(), &OutboundPolicy{
+		Routes: []OutboundRoute{OutboundRouteAny{Redirect: OutboundBlock{}}},
+	})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(mock.calls).To(gomega.Equal(2))
+}
+
+func TestSetOutboundPolicySurfacesAFailureOnARunningSandbox(t *testing.T) {
+	t.Parallel()
+
+	for _, code := range []codes.Code{codes.Internal, codes.Unknown, codes.DeadlineExceeded} {
+		t.Run(code.String(), func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+
+			mock := &mockSetOutboundPolicyClient{errs: []error{status.Error(code, "failed")}}
+			sb := newSetOutboundPolicySandbox(mock, true)
+			err := sb.SetOutboundPolicy(context.Background(), &OutboundPolicy{
+				Routes: []OutboundRoute{OutboundRouteAny{}},
+			})
+			g.Expect(status.Code(err)).To(gomega.Equal(code))
+			g.Expect(mock.calls).To(gomega.Equal(1))
+		})
+	}
+}
+
+func TestSetOutboundPolicy(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		isV2 bool
+		rpc  string
+	}{
+		{isV2: false, rpc: "SandboxSetOutboundPolicy"},
+		{isV2: true, rpc: "SandboxSetOutboundPolicyV2"},
+	} {
+		t.Run(tc.rpc, func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+
+			mock := &mockSetOutboundPolicyClient{}
+			sb := newSetOutboundPolicySandbox(mock, tc.isV2)
+			err := sb.SetOutboundPolicy(context.Background(), &OutboundPolicy{
+				AllowTLSDecryption: true,
+				Routes: []OutboundRoute{
+					OutboundRouteHTTPS{
+						Domains: []string{"api.example.com"},
+						HeaderReplacements: []OutboundHeaderReplacement{
+							{Secret: &Secret{SecretID: "st-1"}, Headers: map[string]string{"Authorization": "Bearer $API_KEY"}},
+						},
+					},
+					OutboundRouteIP{CIDRs: []string{"203.0.113.0/24"}},
+					OutboundRouteAny{Redirect: &OutboundBlock{}},
+				},
+			})
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			g.Expect(mock.gotRPC).To(gomega.Equal(tc.rpc))
+			g.Expect(mock.gotRequest.GetSandboxId()).To(gomega.Equal(sb.SandboxID))
+			policy := mock.gotRequest.GetOutboundPolicy()
+			g.Expect(policy.GetTlsDecryption().GetAllowed()).To(gomega.BeTrue())
+			routes := policy.GetRoutes()
+			g.Expect(routes).To(gomega.HaveLen(3))
+			g.Expect(routes[0].GetHttps().GetDomains()).To(gomega.Equal([]string{"api.example.com"}))
+			replacements := routes[0].GetHttps().GetHeaderReplacements()
+			g.Expect(replacements).To(gomega.HaveLen(1))
+			g.Expect(replacements[0].GetSecretId()).To(gomega.Equal("st-1"))
+			g.Expect(replacements[0].GetHeaders()).To(gomega.Equal(map[string]string{"Authorization": "Bearer $API_KEY"}))
+			g.Expect(routes[1].GetIp().GetCidrs()).To(gomega.Equal([]string{"203.0.113.0/24"}))
+			g.Expect(routes[2].GetAny().GetRedirect().HasBlock()).To(gomega.BeTrue())
+		})
+	}
+}
+
+func TestSetOutboundPolicyValidation(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	mock := &mockSetOutboundPolicyClient{}
+	sb := newSetOutboundPolicySandbox(mock, true)
+
+	err := sb.SetOutboundPolicy(context.Background(), nil)
+	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("requires an OutboundPolicy")))
+
+	err = sb.SetOutboundPolicy(context.Background(), &OutboundPolicy{
+		Routes: []OutboundRoute{
+			OutboundRouteHTTPS{Domains: []string{"example.com"}},
+			OutboundRouteAny{},
+		},
+	})
+	g.Expect(err).To(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("AllowTLSDecryption"))
+	g.Expect(mock.gotRequest).To(gomega.BeNil())
+}
+
+func TestUpdateNetworkPolicyValidation(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	sb := newSandbox(&Client{}, testV2SandboxID)
+
+	// Missing a dimension is an error (partial updates not yet supported).
+	err := sb.UpdateNetworkPolicy(context.Background(), &SandboxUpdateNetworkPolicyParams{
+		OutboundDomainAllowlist: &Allowlist{Entries: []string{"example.com"}},
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("both OutboundCIDRAllowlist and OutboundDomainAllowlist"))
+
+	// Neither dimension set is also an error.
+	err = sb.UpdateNetworkPolicy(context.Background(), &SandboxUpdateNetworkPolicyParams{})
+	g.Expect(err).Should(gomega.HaveOccurred())
+
+	// Nil params is also an error.
+	err = sb.UpdateNetworkPolicy(context.Background(), nil)
+	g.Expect(err).Should(gomega.HaveOccurred())
+}
+
+func TestBuildOutboundNetworkAccess_SidecarRules(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	// No allowlist (the sidecar default) maps to open access, independent of the
+	// main container. Sidecars never pass blockNetwork=true.
+	open, err := buildOutboundNetworkAccess(false, nil, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(open.GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_OPEN))
+
+	// CIDR allowlist.
+	cidr, err := buildOutboundNetworkAccess(false, &Allowlist{Entries: []string{"10.0.0.0/8"}}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(cidr.GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_ALLOWLIST))
+	g.Expect(cidr.GetAllowedCidrs()).To(gomega.Equal([]string{"10.0.0.0/8"}))
+
+	// Domain allowlist.
+	domain, err := buildOutboundNetworkAccess(false, nil, &Allowlist{Entries: []string{"*.example.com"}})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(domain.GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_ALLOWLIST))
+	g.Expect(domain.GetAllowedDomains()).To(gomega.Equal([]string{"*.example.com"}))
+
+	// An empty allowlist blocks external egress while keeping main-container
+	// connectivity; it must remain ALLOWLIST, not BLOCKED.
+	empty, err := buildOutboundNetworkAccess(false, &Allowlist{}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(empty.GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_ALLOWLIST))
+	g.Expect(empty.GetAllowedCidrs()).To(gomega.BeEmpty())
+	g.Expect(empty.GetAllowedDomains()).To(gomega.BeEmpty())
+}
+
+func TestSandboxCreateRequestProto_InboundCIDRAllowlist(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	// InboundCIDRAllowlist is set on the definition.
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		InboundCIDRAllowlist: []string{"10.0.0.0/8", "192.168.0.0/16"},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetDefinition().GetInboundCidrAllowlist()).To(gomega.Equal([]string{"10.0.0.0/8", "192.168.0.0/16"}))
+
+	// Empty by default.
+	req, err = buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetDefinition().GetInboundCidrAllowlist()).To(gomega.BeEmpty())
+
+	// Cannot be combined with BlockNetwork.
+	_, err = buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		BlockNetwork:         true,
+		InboundCIDRAllowlist: []string{"10.0.0.0/8"},
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("InboundCIDRAllowlist cannot be used when BlockNetwork is enabled"))
+}
+
+func TestSandboxCreateRequestProto_I6PN(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		I6PN: true,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetDefinition().GetI6PnEnabled()).To(gomega.BeTrue())
+
+	req, err = buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(req.GetDefinition().GetI6PnEnabled()).To(gomega.BeFalse())
+
+	_, err = buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		BlockNetwork: true,
+		I6PN:         true,
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("BlockNetwork disables all networking, including i6pn"))
+}
+
+func TestSandboxCreateRequestProto_WithTags(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	req, err := buildSandboxCreateRequestProto("app-123", "img-456", SandboxCreateParams{
+		Tags: map[string]string{"env": "prod", "team": "infra"},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	got := map[string]string{}
+	for _, tag := range req.GetTags() {
+		got[tag.GetTagName()] = tag.GetTagValue()
+	}
+	g.Expect(got).To(gomega.Equal(map[string]string{"env": "prod", "team": "infra"}))
+}
+
+type mockSandboxListClient struct {
+	pb.ModalClientClient
+	gotReq *pb.SandboxListRequest
+}
+
+func (m *mockSandboxListClient) SandboxListV2(
+	_ context.Context,
+	req *pb.SandboxListRequest,
+	_ ...grpc.CallOption,
+) (*pb.SandboxListResponse, error) {
+	m.gotReq = req
+	// Empty response ends the pagination loop after one call.
+	return pb.SandboxListResponse_builder{}.Build(), nil
+}
+
+func TestExperimentalListForwardsTags(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := &mockSandboxListClient{}
+	svc := &sandboxServiceImpl{client: &Client{cpClient: &clientWithConn{ModalClientClient: mock}}}
+
+	seq, err := svc.ExperimentalList(ctx, &SandboxExperimentalListParams{
+		AppID: "ap-1234",
+		Tags:  map[string]string{"env": "prod"},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	for _, iterErr := range seq {
+		g.Expect(iterErr).ShouldNot(gomega.HaveOccurred())
+	}
+
+	g.Expect(mock.gotReq).ShouldNot(gomega.BeNil())
+	g.Expect(mock.gotReq.GetAppId()).To(gomega.Equal("ap-1234"))
+	tags := mock.gotReq.GetTags()
+	g.Expect(tags).To(gomega.HaveLen(1))
+	g.Expect(tags[0].GetTagName()).To(gomega.Equal("env"))
+	g.Expect(tags[0].GetTagValue()).To(gomega.Equal("prod"))
+}
+
+type mockSandboxCreateV2Client struct {
+	pb.ModalClientClient
+	access *pb.CommandRouterAccess
+}
+
+func (m *mockSandboxCreateV2Client) SandboxCreateV2(
+	_ context.Context,
+	_ *pb.SandboxCreateV2Request,
+	_ ...grpc.CallOption,
+) (*pb.SandboxCreateV2Response, error) {
+	return pb.SandboxCreateV2Response_builder{
+		SandboxId:           testV2SandboxID,
+		TaskId:              "ta-v2-123",
+		CommandRouterAccess: m.access,
+	}.Build(), nil
+}
+
+func TestExperimentalCreateSeedsCommandRouterAccess(t *testing.T) {
+	newService := func(access *pb.CommandRouterAccess) *sandboxServiceImpl {
+		return &sandboxServiceImpl{client: &Client{
+			cpClient: &clientWithConn{ModalClientClient: &mockSandboxCreateV2Client{access: access}},
+			logger:   slog.New(slog.DiscardHandler),
+		}}
+	}
+
+	t.Run("seeds the access the create response carried", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		sb, err := newService(pb.CommandRouterAccess_builder{
+			Jwt: "seeded-jwt", Url: "https://task-abc123.modal.test",
+		}.Build()).ExperimentalCreate(t.Context(), &App{AppID: "ap-1234"}, &Image{ImageID: "im-123"}, nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(sb.task().initCommandRouterAccess).ShouldNot(gomega.BeNil())
+		g.Expect(sb.task().initCommandRouterAccess.jwt).To(gomega.Equal("seeded-jwt"))
+		g.Expect(sb.task().initCommandRouterAccess.url).To(gomega.Equal("https://task-abc123.modal.test"))
+	})
+
+	// Guards against wrapping an absent field into empty credentials: the getters
+	// are nil-safe, so a missing nil check yields a non-nil access of empty strings
+	// that fails at connect instead of falling back to the RPC.
+	t.Run("leaves the access unset when the create response omits it", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		sb, err := newService(nil).ExperimentalCreate(
+			t.Context(), &App{AppID: "ap-1234"}, &Image{ImageID: "im-123"}, nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(sb.task().initCommandRouterAccess).Should(gomega.BeNil())
+	})
+}
+
+type mockSandboxRestoreV2Client struct {
+	pb.ModalClientClient
+	access *pb.CommandRouterAccess
+}
+
+func (m *mockSandboxRestoreV2Client) SandboxRestoreV2(
+	_ context.Context,
+	_ *pb.SandboxRestoreV2Request,
+	_ ...grpc.CallOption,
+) (*pb.SandboxRestoreV2Response, error) {
+	return pb.SandboxRestoreV2Response_builder{
+		SandboxId:           testV2SandboxID,
+		TaskId:              "ta-restored-v2-123",
+		CommandRouterAccess: m.access,
+	}.Build(), nil
+}
+
+func TestExperimentalFromSnapshotSeedsCommandRouterAccess(t *testing.T) {
+	isV2 := true
+	restoreV2 := func(access *pb.CommandRouterAccess) (*Sandbox, error) {
+		svc := &sandboxServiceImpl{client: &Client{
+			cpClient: &clientWithConn{ModalClientClient: &mockSandboxRestoreV2Client{access: access}},
+			logger:   slog.New(slog.DiscardHandler),
+		}}
+		return svc.ExperimentalFromSnapshot(
+			context.Background(),
+			&SandboxSnapshot{SnapshotID: "sn-123", isV2: &isV2, client: svc.client},
+			nil,
+		)
+	}
+
+	t.Run("seeds the access the restore response carried", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		sb, err := restoreV2(pb.CommandRouterAccess_builder{
+			Jwt: "seeded-jwt", Url: "https://task-abc123.modal.test",
+		}.Build())
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(sb.task().initCommandRouterAccess).ShouldNot(gomega.BeNil())
+		g.Expect(sb.task().initCommandRouterAccess.jwt).To(gomega.Equal("seeded-jwt"))
+		g.Expect(sb.task().initCommandRouterAccess.url).To(gomega.Equal("https://task-abc123.modal.test"))
+	})
+
+	t.Run("leaves the access unset when the restore response omits it", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		sb, err := restoreV2(nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(sb.task().initCommandRouterAccess).Should(gomega.BeNil())
+	})
+}
+
+// failOnAccessLookupClient fails the test if command-router access is looked up
+// over gRPC, which a caller passing seeded access must never do.
+type failOnAccessLookupClient struct {
+	pb.ModalClientClient
+	t *testing.T
+}
+
+func (m *failOnAccessLookupClient) SandboxGetCommandRouterAccess(
+	_ context.Context,
+	_ *pb.SandboxGetCommandRouterAccessRequest,
+	_ ...grpc.CallOption,
+) (*pb.SandboxGetCommandRouterAccessResponse, error) {
+	m.t.Fatal("SandboxGetCommandRouterAccess called despite seeded access")
+	return nil, nil
+}
+
+func TestInitTaskCommandRouterClientUsesSeededAccess(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	// Mock JWT: "x" header, base64 of {"exp":9999999999}, "x" signature.
+	const mockJWT = "x.eyJleHAiOjk5OTk5OTk5OTl9.x"
+
+	client, err := initTaskCommandRouterClient(
+		context.Background(),
+		&failOnAccessLookupClient{t: t},
+		"ta-v2-123",
+		testV2SandboxID,
+		true,
+		&commandRouterAccess{jwt: mockJWT, url: "https://task-abc123.modal.test"},
+		slog.New(slog.DiscardHandler),
+		nil,
+		Profile{},
+	)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(client).ShouldNot(gomega.BeNil())
+	t.Cleanup(func() { _ = client.Close() })
+
+	g.Expect(client.serverURL).To(gomega.Equal("https://task-abc123.modal.test"))
+	g.Expect(*client.jwt.Load()).To(gomega.Equal(mockJWT))
+	g.Expect(*client.jwtExp.Load()).To(gomega.Equal(int64(9999999999)))
+}
+
+// blockingLogsStub embeds pb.ModalClientClient so unused methods inherit nil
+// stubs. SandboxGetLogs opens a stream that never delivers a batch, standing in
+// for a Sandbox that has printed nothing yet.
+type blockingLogsStub struct {
+	pb.ModalClientClient
+	opened    chan struct{}
+	batches   chan *pb.TaskLogsBatch
+	receiving chan context.Context
+}
+
+func (m *blockingLogsStub) SandboxGetLogs(
+	ctx context.Context,
+	in *pb.SandboxGetLogsRequest,
+	opts ...grpc.CallOption,
+) (grpc.ServerStreamingClient[pb.TaskLogsBatch], error) {
+	select {
+	case m.opened <- struct{}{}:
+	default:
+	}
+	return &blockingLogsStream{ctx: ctx, batches: m.batches, receiving: m.receiving}, nil
+}
+
+// blockingLogsStream blocks in Recv until its context ends, as a real stream
+// does while waiting for the next batch.
+type blockingLogsStream struct {
+	grpc.ServerStreamingClient[pb.TaskLogsBatch]
+	ctx       context.Context
+	batches   chan *pb.TaskLogsBatch
+	receiving chan context.Context
+}
+
+func (s *blockingLogsStream) Recv() (*pb.TaskLogsBatch, error) {
+	select {
+	case s.receiving <- s.ctx:
+	default:
+	}
+	select {
+	case <-s.ctx.Done():
+		return nil, s.ctx.Err()
+	case batch := <-s.batches:
+		return batch, nil
+	}
+}
+
+func (s *blockingLogsStream) Context() context.Context { return s.ctx }
+
+// Close has to reach a Read that is already blocked on the stream, since that
+// is how a caller stops one: SandboxFilesystem.Watch closes stdout from a
+// context.AfterFunc precisely to unblock a read.
+func TestClosingALogStreamUnblocksAWaitingRead(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	stub := &blockingLogsStub{opened: make(chan struct{}, 1)}
+	reader := outputStreamSb(stub, testV1SandboxID, pb.FileDescriptor_FILE_DESCRIPTOR_STDOUT, time.Hour).(*logStreamReader)
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := reader.Read(make([]byte, 1))
+		readErr <- err
+	}()
+
+	// Close must land while the read is blocked, not before it starts.
+	g.Eventually(stub.opened, 5*time.Second).Should(gomega.Receive())
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- reader.Close() }()
+
+	g.Eventually(closeErr, 5*time.Second).Should(gomega.Receive(gomega.BeNil()),
+		"Close must not wait for the read it is cancelling")
+	g.Eventually(readErr, 5*time.Second).Should(gomega.Receive(gomega.HaveOccurred()),
+		"the blocked read should end once the stream is cancelled")
+
+	reader.idleMu.Lock()
+	idleTimer := reader.idle.timer
+	reader.idleMu.Unlock()
+	g.Expect(idleTimer).To(gomega.BeNil(), "the cancelled read must not rearm the timer after Close")
+}
+
+// A zero-length read asks for nothing, so it must not go looking for output.
+func TestZeroLengthReadDoesNotWaitForOutput(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	stub := &blockingLogsStub{opened: make(chan struct{}, 1)}
+	reader := outputStreamSb(stub, testV1SandboxID, pb.FileDescriptor_FILE_DESCRIPTOR_STDOUT, time.Hour)
+	t.Cleanup(func() { _ = reader.Close() })
+
+	type result struct {
+		n   int
+		err error
+	}
+	res := make(chan result, 1)
+	go func() {
+		n, err := reader.Read([]byte{})
+		res <- result{n: n, err: err}
+	}()
+
+	var got result
+	g.Eventually(res, 5*time.Second).Should(gomega.Receive(&got),
+		"a zero-length read should return without waiting for output")
+	g.Expect(got.n).To(gomega.Equal(0))
+	g.Expect(got.err).ToNot(gomega.HaveOccurred())
+	g.Expect(stub.opened).ToNot(gomega.Receive(),
+		"and it should not have opened the stream")
+}
+
+func TestOverlappingLogReadsProtectEachActiveFetch(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	stub := &blockingLogsStub{
+		opened:    make(chan struct{}, 1),
+		batches:   make(chan *pb.TaskLogsBatch),
+		receiving: make(chan context.Context, 2),
+	}
+	reader := outputStreamSb(stub, testV1SandboxID, pb.FileDescriptor_FILE_DESCRIPTOR_STDOUT, 20*time.Millisecond).(*logStreamReader)
+	t.Cleanup(func() { _ = reader.Close() })
+	results := make(chan error, 2)
+	for range 2 {
+		go func() { _, err := reader.Read(make([]byte, 1)); results <- err }()
+	}
+	g.Eventually(stub.receiving).Should(gomega.Receive())
+	stub.batches <- pb.TaskLogsBatch_builder{Items: []*pb.TaskLogs{pb.TaskLogs_builder{Data: "a"}.Build()}}.Build()
+	g.Eventually(results).Should(gomega.Receive(gomega.BeNil()))
+	var receivingCtx context.Context
+	g.Eventually(stub.receiving).Should(gomega.Receive(&receivingCtx))
+	g.Consistently(receivingCtx.Err, 80*time.Millisecond).Should(gomega.Succeed(),
+		"the next fetch must stop the preceding fetch's idle countdown")
+	g.Expect(results).ToNot(gomega.Receive())
+	stub.batches <- pb.TaskLogsBatch_builder{Items: []*pb.TaskLogs{pb.TaskLogs_builder{Data: "b"}.Build()}}.Build()
+	g.Eventually(results).Should(gomega.Receive(gomega.BeNil()))
+	g.Eventually(func() bool { reader.idleMu.Lock(); defer reader.idleMu.Unlock(); return reader.released }).Should(gomega.BeTrue())
+	g.Expect(reader.ctx.Err()).ToNot(gomega.HaveOccurred())
+}
+
+type transientLogsStub struct {
+	pb.ModalClientClient
+	calls      atomic.Int32
+	failOnOpen bool
+}
+
+func (m *transientLogsStub) SandboxGetLogs(
+	context.Context,
+	*pb.SandboxGetLogsRequest,
+	...grpc.CallOption,
+) (grpc.ServerStreamingClient[pb.TaskLogsBatch], error) {
+	if m.calls.Add(1) == 1 {
+		if m.failOnOpen {
+			return nil, status.Error(codes.Unavailable, "connection lost")
+		}
+		return &singleLogsResultStream{err: status.Error(codes.Unavailable, "connection lost")}, nil
+	}
+	return &singleLogsResultStream{batch: pb.TaskLogsBatch_builder{
+		EntryId: "1-0",
+		Items:   []*pb.TaskLogs{pb.TaskLogs_builder{Data: "reconnected"}.Build()},
+	}.Build()}, nil
+}
+
+type singleLogsResultStream struct {
+	grpc.ServerStreamingClient[pb.TaskLogsBatch]
+	batch *pb.TaskLogsBatch
+	err   error
+}
+
+func (s *singleLogsResultStream) Recv() (*pb.TaskLogsBatch, error) {
+	if s.batch != nil {
+		batch := s.batch
+		s.batch = nil
+		return batch, nil
+	}
+	if s.err != nil {
+		err := s.err
+		s.err = nil
+		return nil, err
+	}
+	return nil, io.EOF
+}
+
+func TestV1SandboxOutputReconnectsAfterTransientFailure(t *testing.T) {
+	t.Parallel()
+	for _, failOnOpen := range []bool{false, true} {
+		name := "receive"
+		if failOnOpen {
+			name = "open"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+			stub := &transientLogsStub{failOnOpen: failOnOpen}
+			reader := outputStreamSb(stub, testV1SandboxID, pb.FileDescriptor_FILE_DESCRIPTOR_STDOUT, 0).(*logStreamReader)
+			t.Cleanup(func() { _ = reader.Close() })
+			reader.retryDelay = 50 * time.Millisecond
+
+			start := time.Now()
+			buf := make([]byte, len("reconnected"))
+			n, err := reader.Read(buf)
+
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			g.Expect(string(buf[:n])).To(gomega.Equal("reconnected"))
+			g.Expect(stub.calls.Load()).To(gomega.Equal(int32(2)))
+			g.Expect(time.Since(start)).To(gomega.BeNumerically(">=", 40*time.Millisecond))
+			g.Expect(reader.retriesRemaining).To(gomega.Equal(sbLogsMaxRetries))
+			g.Expect(reader.retryDelay).To(gomega.Equal(sbLogsRetryInitialDelay))
+		})
+	}
+}
+
+func TestClosingLogStreamInterruptsRetryBackoff(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	stub := &transientLogsStub{}
+	reader := outputStreamSb(stub, testV1SandboxID, pb.FileDescriptor_FILE_DESCRIPTOR_STDOUT, 0).(*logStreamReader)
+	t.Cleanup(func() { _ = reader.Close() })
+	reader.retryDelay = time.Hour
+
+	readErr := make(chan error, 1)
+	go func() { _, err := reader.Read(make([]byte, 1)); readErr <- err }()
+	g.Eventually(stub.calls.Load).Should(gomega.Equal(int32(1)))
+	g.Consistently(readErr, 50*time.Millisecond).ShouldNot(gomega.Receive())
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- reader.Close() }()
+	g.Eventually(closeErr).Should(gomega.Receive(gomega.BeNil()))
+	g.Eventually(readErr).Should(gomega.Receive(gomega.MatchError(context.Canceled)))
+	g.Expect(stub.calls.Load()).To(gomega.Equal(int32(1)))
+}
+
+type sandboxV2RoutingStub struct {
+	pb.ModalClientClient
+	v1Creates, v2Creates int
+	v1Lookups, v2Lookups int
+	v1Lists, v2Lists     int
+	v1TaskLookups        int
+	fromNameV2Err        error // returned by SandboxGetFromNameV2 when set
+	listV2Req            *pb.SandboxListRequest
+	fromNameV1Req        *pb.SandboxGetFromNameRequest
+	fromNameV2Req        *pb.SandboxGetFromNameRequest
+}
+
+func (m *sandboxV2RoutingStub) SandboxCreate(
+	_ context.Context, _ *pb.SandboxCreateRequest, _ ...grpc.CallOption,
+) (*pb.SandboxCreateResponse, error) {
+	m.v1Creates++
+	return pb.SandboxCreateResponse_builder{SandboxId: testV1SandboxID}.Build(), nil
+}
+
+//nolint:staticcheck // name must match the generated ModalClientClient interface method.
+func (m *sandboxV2RoutingStub) SandboxGetTaskId(
+	_ context.Context, _ *pb.SandboxGetTaskIdRequest, _ ...grpc.CallOption,
+) (*pb.SandboxGetTaskIdResponse, error) {
+	m.v1TaskLookups++
+	taskID := "ta-v1-123"
+	return pb.SandboxGetTaskIdResponse_builder{TaskId: &taskID}.Build(), nil
+}
+
+func (m *sandboxV2RoutingStub) SandboxCreateV2(
+	_ context.Context, _ *pb.SandboxCreateV2Request, _ ...grpc.CallOption,
+) (*pb.SandboxCreateV2Response, error) {
+	m.v2Creates++
+	return pb.SandboxCreateV2Response_builder{SandboxId: testV2SandboxID}.Build(), nil
+}
+
+func (m *sandboxV2RoutingStub) SandboxGetFromName(
+	_ context.Context, req *pb.SandboxGetFromNameRequest, _ ...grpc.CallOption,
+) (*pb.SandboxGetFromNameResponse, error) {
+	m.v1Lookups++
+	m.fromNameV1Req = req
+	return pb.SandboxGetFromNameResponse_builder{SandboxId: testV1SandboxID}.Build(), nil
+}
+
+func (m *sandboxV2RoutingStub) SandboxGetFromNameV2(
+	_ context.Context, req *pb.SandboxGetFromNameRequest, _ ...grpc.CallOption,
+) (*pb.SandboxGetFromNameResponse, error) {
+	m.v2Lookups++
+	m.fromNameV2Req = req
+	if m.fromNameV2Err != nil {
+		return nil, m.fromNameV2Err
+	}
+	return pb.SandboxGetFromNameResponse_builder{SandboxId: testV2SandboxID}.Build(), nil
+}
+
+func (m *sandboxV2RoutingStub) SandboxList(
+	_ context.Context, _ *pb.SandboxListRequest, _ ...grpc.CallOption,
+) (*pb.SandboxListResponse, error) {
+	m.v1Lists++
+	return pb.SandboxListResponse_builder{}.Build(), nil
+}
+
+func (m *sandboxV2RoutingStub) SandboxListV2(
+	_ context.Context, req *pb.SandboxListRequest, _ ...grpc.CallOption,
+) (*pb.SandboxListResponse, error) {
+	m.v2Lists++
+	m.listV2Req = req
+	return pb.SandboxListResponse_builder{}.Build(), nil
+}
+
+func newSandboxV2RoutingService(stub *sandboxV2RoutingStub, sandboxV2 bool) *sandboxServiceImpl {
+	return &sandboxServiceImpl{client: &Client{
+		cpClient: &clientWithConn{ModalClientClient: stub},
+		profile:  Profile{SandboxV2: sandboxV2},
+		logger:   slog.New(slog.DiscardHandler),
+	}}
+}
+
+func TestSandboxV2FlagRoutesCreate(t *testing.T) {
+	t.Parallel()
+
+	app := &App{AppID: "ap-1234"}
+	image := &Image{ImageID: "im-123"}
+
+	t.Run("routes to the V2 backend when the flag is set", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{}
+		sb, err := newSandboxV2RoutingService(stub, true).Create(t.Context(), app, image, nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(sb.SandboxID).To(gomega.Equal(testV2SandboxID))
+		g.Expect(stub.v2Creates).To(gomega.Equal(1))
+		g.Expect(stub.v1Creates).To(gomega.Equal(0))
+	})
+
+	t.Run("stays on V1 when a GPU is requested", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{}
+		sb, err := newSandboxV2RoutingService(stub, true).Create(
+			t.Context(), app, image, &SandboxCreateParams{GPU: "T4"})
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(sb.SandboxID).To(gomega.Equal(testV1SandboxID))
+		g.Expect(sb.task().taskID).To(gomega.Equal("ta-v1-123"))
+		g.Expect(stub.v1Creates).To(gomega.Equal(1))
+		g.Expect(stub.v2Creates).To(gomega.Equal(0))
+	})
+
+	t.Run("stays on V1 when the flag is disabled", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{}
+		sb, err := newSandboxV2RoutingService(stub, false).Create(t.Context(), app, image, nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(sb.SandboxID).To(gomega.Equal(testV1SandboxID))
+		g.Expect(sb.task().taskID).To(gomega.Equal("ta-v1-123"))
+		g.Expect(stub.v1Creates).To(gomega.Equal(1))
+		g.Expect(stub.v2Creates).To(gomega.Equal(0))
+	})
+}
+
+type mockSandboxV1CreateStub struct {
+	pb.ModalClientClient
+	getTaskID  func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error)
+	terminates atomic.Int32
+	// terminateCtxErr records ctx.Err() as seen by the last SandboxTerminate call.
+	terminateCtxErr atomic.Pointer[error]
+}
+
+func (m *mockSandboxV1CreateStub) SandboxCreate(
+	_ context.Context, _ *pb.SandboxCreateRequest, _ ...grpc.CallOption,
+) (*pb.SandboxCreateResponse, error) {
+	return pb.SandboxCreateResponse_builder{SandboxId: testV1SandboxID}.Build(), nil
+}
+
+//nolint:staticcheck // name must match the generated ModalClientClient interface method.
+func (m *mockSandboxV1CreateStub) SandboxGetTaskId(
+	_ context.Context, req *pb.SandboxGetTaskIdRequest, _ ...grpc.CallOption,
+) (*pb.SandboxGetTaskIdResponse, error) {
+	return m.getTaskID(req)
+}
+
+func (m *mockSandboxV1CreateStub) SandboxTerminate(
+	ctx context.Context, _ *pb.SandboxTerminateRequest, _ ...grpc.CallOption,
+) (*pb.SandboxTerminateResponse, error) {
+	m.terminates.Add(1)
+	ctxErr := ctx.Err()
+	m.terminateCtxErr.Store(&ctxErr)
+	return pb.SandboxTerminateResponse_builder{}.Build(), nil
+}
+
+func newSandboxV1CreateService(stub *mockSandboxV1CreateStub) *sandboxServiceImpl {
+	return &sandboxServiceImpl{client: &Client{
+		cpClient: &clientWithConn{ModalClientClient: stub},
+		profile:  Profile{SandboxV2: false},
+		logger:   slog.New(slog.DiscardHandler),
+	}}
+}
+
+func TestSandboxCreateV1WaitsForTaskID(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	var lookups atomic.Int32
+	stub := &mockSandboxV1CreateStub{
+		getTaskID: func(req *pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+			g.Expect(req.GetSandboxId()).To(gomega.Equal(testV1SandboxID))
+			if lookups.Add(1) == 1 {
+				return pb.SandboxGetTaskIdResponse_builder{}.Build(), nil
+			}
+			taskID := "ta-scheduled"
+			return pb.SandboxGetTaskIdResponse_builder{TaskId: &taskID}.Build(), nil
+		},
+	}
+
+	sb, err := newSandboxV1CreateService(stub).Create(
+		t.Context(), &App{AppID: "ap-1234"}, &Image{ImageID: "im-123"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(sb.task().taskID).To(gomega.Equal("ta-scheduled"))
+	g.Expect(lookups.Load()).To(gomega.Equal(int32(2)))
+	g.Expect(stub.terminates.Load()).To(gomega.Equal(int32(0)))
+}
+
+func TestSandboxCreateV1SchedulingTimeout(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	stub := &mockSandboxV1CreateStub{
+		getTaskID: func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+			return pb.SandboxGetTaskIdResponse_builder{}.Build(), nil
+		},
+	}
+	sb := newSandbox(newSandboxV1CreateService(stub).client, testV1SandboxID)
+
+	err := sb.waitForScheduling(t.Context(), 0)
+	var exhausted ResourceExhaustedError
+	g.Expect(errors.As(err, &exhausted)).To(gomega.BeTrue(), "got %v", err)
+	g.Expect(exhausted.Exception).To(gomega.ContainSubstring("Insufficient capacity"))
+	g.Expect(stub.terminates.Load()).To(gomega.Equal(int32(1)))
+}
+
+func TestSandboxCreateV1TaskIDLookupError(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	stub := &mockSandboxV1CreateStub{
+		getTaskID: func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+			return nil, status.Error(codes.InvalidArgument, "lookup failed")
+		},
+	}
+
+	_, err := newSandboxV1CreateService(stub).Create(
+		t.Context(), &App{AppID: "ap-1234"}, &Image{ImageID: "im-123"}, nil)
+	g.Expect(status.Code(err)).To(gomega.Equal(codes.InvalidArgument))
+	g.Expect(err.Error()).To(gomega.ContainSubstring("lookup failed"))
+	g.Expect(stub.terminates.Load()).To(gomega.Equal(int32(1)))
+}
+
+func TestSandboxCreateV1TaskIDTransientErrorThenScheduled(t *testing.T) {
+	t.Parallel()
+
+	for _, code := range []codes.Code{codes.Unavailable, codes.Internal} {
+		t.Run(code.String(), func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+
+			var lookups atomic.Int32
+			stub := &mockSandboxV1CreateStub{
+				getTaskID: func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+					if lookups.Add(1) <= 2 {
+						return nil, status.Error(code, "server hiccup")
+					}
+					taskID := "ta-scheduled"
+					return pb.SandboxGetTaskIdResponse_builder{TaskId: &taskID}.Build(), nil
+				},
+			}
+
+			sb, err := newSandboxV1CreateService(stub).Create(
+				t.Context(), &App{AppID: "ap-1234"}, &Image{ImageID: "im-123"}, nil)
+			g.Expect(err).ShouldNot(gomega.HaveOccurred())
+			g.Expect(sb.task().taskID).To(gomega.Equal("ta-scheduled"))
+			g.Expect(lookups.Load()).To(gomega.Equal(int32(3)))
+			g.Expect(stub.terminates.Load()).To(gomega.Equal(int32(0)))
+		})
+	}
+}
+
+func TestSandboxCreateV1TaskIDUnavailableUntilDeadline(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	var lookups atomic.Int32
+	stub := &mockSandboxV1CreateStub{
+		getTaskID: func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+			lookups.Add(1)
+			return nil, status.Error(codes.Unavailable, "server hiccup")
+		},
+	}
+	sb := newSandbox(newSandboxV1CreateService(stub).client, testV1SandboxID)
+
+	err := sb.waitForScheduling(t.Context(), 1200*time.Millisecond)
+	var exhausted ResourceExhaustedError
+	g.Expect(errors.As(err, &exhausted)).To(gomega.BeTrue(), "got %v", err)
+	g.Expect(exhausted.Exception).To(gomega.ContainSubstring("Insufficient capacity"))
+	g.Expect(lookups.Load()).To(gomega.BeNumerically(">=", 2))
+	g.Expect(stub.terminates.Load()).To(gomega.Equal(int32(1)))
+}
+
+func TestSandboxCreateV1TaskIDInternalUntilDeadline(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	stub := &mockSandboxV1CreateStub{
+		getTaskID: func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+			return nil, status.Error(codes.Internal, "server bug")
+		},
+	}
+	sb := newSandbox(newSandboxV1CreateService(stub).client, testV1SandboxID)
+
+	err := sb.waitForScheduling(t.Context(), 1200*time.Millisecond)
+	g.Expect(status.Code(err)).To(gomega.Equal(codes.Internal), "got %v", err)
+	g.Expect(err.Error()).To(gomega.ContainSubstring("server bug"))
+	g.Expect(stub.terminates.Load()).To(gomega.Equal(int32(1)))
+}
+
+func TestSandboxCreateV1NonRetryableErrorAtDeadlinePropagates(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	stub := &mockSandboxV1CreateStub{
+		getTaskID: func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+			return nil, status.Error(codes.InvalidArgument, "lookup failed")
+		},
+	}
+	sb := newSandbox(newSandboxV1CreateService(stub).client, testV1SandboxID)
+
+	// A zero timeout means the deadline has passed by the time the lookup fails.
+	err := sb.waitForScheduling(t.Context(), 0)
+	g.Expect(status.Code(err)).To(gomega.Equal(codes.InvalidArgument), "got %v", err)
+	g.Expect(err.Error()).To(gomega.ContainSubstring("lookup failed"))
+	g.Expect(stub.terminates.Load()).To(gomega.Equal(int32(1)))
+}
+
+func TestSandboxCreateV1TaskIDUnknownErrorIsNotRetried(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	var lookups atomic.Int32
+	stub := &mockSandboxV1CreateStub{
+		getTaskID: func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+			lookups.Add(1)
+			return nil, status.Error(codes.Unknown, "unexpected")
+		},
+	}
+
+	_, err := newSandboxV1CreateService(stub).Create(
+		t.Context(), &App{AppID: "ap-1234"}, &Image{ImageID: "im-123"}, nil)
+	g.Expect(status.Code(err)).To(gomega.Equal(codes.Unknown))
+	g.Expect(lookups.Load()).To(gomega.Equal(int32(1)))
+	g.Expect(stub.terminates.Load()).To(gomega.Equal(int32(1)))
+}
+
+func TestEnsureTaskIDDoesNotRetryTransientErrors(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	var lookups atomic.Int32
+	stub := &mockSandboxV1CreateStub{
+		getTaskID: func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+			lookups.Add(1)
+			return nil, status.Error(codes.Unavailable, "server hiccup")
+		},
+	}
+	sb := newSandbox(newSandboxV1CreateService(stub).client, testV1SandboxID)
+
+	_, err := sb.impl.(taskIDWaiter).ensureTaskID(t.Context())
+	g.Expect(status.Code(err)).To(gomega.Equal(codes.Unavailable))
+	g.Expect(lookups.Load()).To(gomega.Equal(int32(1)))
+}
+
+func TestSandboxCreateV1TerminatedBeforeScheduled(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	stub := &mockSandboxV1CreateStub{
+		getTaskID: func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+			return pb.SandboxGetTaskIdResponse_builder{
+				TaskResult: pb.GenericResult_builder{
+					Status:    pb.GenericResult_GENERIC_STATUS_TERMINATED,
+					Exception: "Sandbox was cancelled by user",
+				}.Build(),
+			}.Build(), nil
+		},
+	}
+
+	_, err := newSandboxV1CreateService(stub).Create(
+		t.Context(), &App{AppID: "ap-1234"}, &Image{ImageID: "im-123"}, nil)
+	var conflict ConflictError
+	g.Expect(errors.As(err, &conflict)).To(gomega.BeTrue(), "got %v", err)
+	g.Expect(conflict.Exception).To(gomega.Equal("Sandbox was cancelled by user"))
+	g.Expect(stub.terminates.Load()).To(gomega.Equal(int32(0)))
+}
+
+func TestSandboxCreateV1CancelledWhileScheduling(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	stub := &mockSandboxV1CreateStub{
+		getTaskID: func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+			cancel()
+			return pb.SandboxGetTaskIdResponse_builder{}.Build(), nil
+		},
+	}
+	sb := newSandbox(newSandboxV1CreateService(stub).client, testV1SandboxID)
+
+	err := sb.waitForScheduling(ctx, time.Minute)
+	g.Expect(err).To(gomega.MatchError(context.Canceled))
+	g.Expect(stub.terminates.Load()).To(gomega.Equal(int32(1)))
+	g.Expect(*stub.terminateCtxErr.Load()).ShouldNot(gomega.HaveOccurred(),
+		"terminate must run on a context that outlives the cancelled caller")
+}
+
+func TestWaitForTaskIDRespectsCallerCancellation(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	stub := &mockSandboxV1CreateStub{
+		getTaskID: func(*pb.SandboxGetTaskIdRequest) (*pb.SandboxGetTaskIdResponse, error) {
+			cancel()
+			return pb.SandboxGetTaskIdResponse_builder{}.Build(), nil
+		},
+	}
+	sb := newSandbox(newSandboxV1CreateService(stub).client, testV1SandboxID)
+
+	_, err := sb.impl.(taskIDWaiter).waitForTaskID(ctx, time.Minute, true)
+	g.Expect(err).To(gomega.MatchError(context.Canceled))
+	g.Expect(stub.terminates.Load()).To(gomega.Equal(int32(0)))
+}
+
+func TestSandboxV2FlagRoutesFromName(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns the V2 Sandbox when one matches", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{}
+		sb, err := newSandboxV2RoutingService(stub, true).FromName(t.Context(), "my-app", "my-sandbox", nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(sb.SandboxID).To(gomega.Equal(testV2SandboxID))
+		g.Expect(stub.v2Lookups).To(gomega.Equal(1))
+		g.Expect(stub.v1Lookups).To(gomega.Equal(0))
+	})
+
+	t.Run("falls back to V1 when V2 has no match", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{fromNameV2Err: status.Error(codes.NotFound, "no such sandbox")}
+		sb, err := newSandboxV2RoutingService(stub, true).FromName(t.Context(), "my-app", "my-sandbox", nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(sb.SandboxID).To(gomega.Equal(testV1SandboxID))
+		g.Expect(stub.v2Lookups).To(gomega.Equal(1))
+		g.Expect(stub.v1Lookups).To(gomega.Equal(1))
+	})
+
+	t.Run("propagates V2 errors other than not-found", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{fromNameV2Err: status.Error(codes.Internal, "boom")}
+		_, err := newSandboxV2RoutingService(stub, true).FromName(t.Context(), "my-app", "my-sandbox", nil)
+		g.Expect(err).Should(gomega.HaveOccurred())
+		g.Expect(stub.v1Lookups).To(gomega.Equal(0))
+	})
+
+	t.Run("stays on V1 when the flag is disabled", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{}
+		sb, err := newSandboxV2RoutingService(stub, false).FromName(t.Context(), "my-app", "my-sandbox", nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(sb.SandboxID).To(gomega.Equal(testV1SandboxID))
+		g.Expect(stub.v1Lookups).To(gomega.Equal(1))
+		g.Expect(stub.v2Lookups).To(gomega.Equal(0))
+	})
+}
+
+func TestSandboxFromNameIncludeTerminated(t *testing.T) {
+	t.Parallel()
+
+	t.Run("defaults to false", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{}
+		_, err := newSandboxV2RoutingService(stub, false).FromName(t.Context(), "my-app", "my-sandbox", nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(stub.fromNameV1Req.GetIncludeTerminated()).To(gomega.BeFalse())
+	})
+
+	t.Run("routes to the V2 lookup even when the flag is off", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{}
+		_, err := newSandboxV2RoutingService(stub, false).FromName(t.Context(), "my-app", "my-sandbox", &SandboxFromNameParams{
+			IncludeTerminated: true,
+		})
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(stub.v2Lookups).To(gomega.Equal(1))
+		g.Expect(stub.v1Lookups).To(gomega.Equal(0))
+		g.Expect(stub.fromNameV2Req.GetIncludeTerminated()).To(gomega.BeTrue())
+	})
+
+	t.Run("does not fall back to the V1 lookup on NotFound", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{fromNameV2Err: status.Error(codes.NotFound, "no such sandbox")}
+		_, err := newSandboxV2RoutingService(stub, true).FromName(t.Context(), "my-app", "my-sandbox", &SandboxFromNameParams{
+			IncludeTerminated: true,
+		})
+		g.Expect(err).To(gomega.BeAssignableToTypeOf(NotFoundError{}))
+		g.Expect(stub.v2Lookups).To(gomega.Equal(1))
+		g.Expect(stub.v1Lookups).To(gomega.Equal(0))
+	})
+}
+
+func TestSandboxV2FlagRoutesList(t *testing.T) {
+	t.Parallel()
+
+	drain := func(g gomega.Gomega, seq iter.Seq2[*Sandbox, error]) {
+		for _, err := range seq {
+			g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		}
+	}
+
+	t.Run("lists through the V2 backend when the flag is set", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{}
+		seq, err := newSandboxV2RoutingService(stub, true).List(t.Context(), &SandboxListParams{
+			AppID: "ap-1234",
+			Tags:  map[string]string{"env": "prod"},
+		})
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		drain(g, seq)
+
+		g.Expect(stub.v2Lists).To(gomega.Equal(1))
+		g.Expect(stub.v1Lists).To(gomega.Equal(0))
+		g.Expect(stub.listV2Req.GetAppId()).To(gomega.Equal("ap-1234"), "params must be forwarded")
+		g.Expect(stub.listV2Req.GetTags()).To(gomega.HaveLen(1))
+	})
+
+	t.Run("stays on V1 when the flag is disabled", func(t *testing.T) {
+		t.Parallel()
+		g := gomega.NewWithT(t)
+
+		stub := &sandboxV2RoutingStub{}
+		seq, err := newSandboxV2RoutingService(stub, false).List(t.Context(), nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		drain(g, seq)
+
+		g.Expect(stub.v1Lists).To(gomega.Equal(1))
+		g.Expect(stub.v2Lists).To(gomega.Equal(0))
+	})
+}
+
+type mockSandboxContainerCreateV2Client struct {
+	pb.ModalClientClient
+	gotReq *pb.SandboxContainerCreateV2Request
+	resp   *pb.SandboxContainerCreateV2Response
+	err    error
+}
+
+func (m *mockSandboxContainerCreateV2Client) SandboxContainerCreateV2(
+	_ context.Context,
+	req *pb.SandboxContainerCreateV2Request,
+	_ ...grpc.CallOption,
+) (*pb.SandboxContainerCreateV2Response, error) {
+	m.gotReq = req
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.resp, nil
+}
+
+func newSidecarCreateSandbox(mock *mockSandboxContainerCreateV2Client) *Sandbox {
+	return newSidecarCreateSandboxWithID(mock, testV2SandboxID)
+}
+
+// errNoTaskIDInTest is what creating over the Sandbox connection fails with here.
+var errNoTaskIDInTest = errors.New("task ID lookup not stubbed in this test")
+
+// Creating over the Sandbox connection resolves the Sandbox's task ID first. Stub
+// both the V1 and V2 lookups so that path fails deterministically; the embedded
+// ModalClientClient is nil, so without these it panics instead.
+//
+//nolint:staticcheck // name must match the generated ModalClientClient interface method.
+func (m *mockSandboxContainerCreateV2Client) SandboxGetTaskIdV2(
+	_ context.Context,
+	_ *pb.SandboxGetTaskIdRequest,
+	_ ...grpc.CallOption,
+) (*pb.SandboxGetTaskIdResponse, error) {
+	return nil, errNoTaskIDInTest
+}
+
+//nolint:staticcheck // name must match the generated ModalClientClient interface method.
+func (m *mockSandboxContainerCreateV2Client) SandboxGetTaskId(
+	_ context.Context,
+	_ *pb.SandboxGetTaskIdRequest,
+	_ ...grpc.CallOption,
+) (*pb.SandboxGetTaskIdResponse, error) {
+	return nil, errNoTaskIDInTest
+}
+
+func newSidecarCreateSandboxWithID(mock *mockSandboxContainerCreateV2Client, sandboxID string) *Sandbox {
+	return newSandbox(&Client{
+		cpClient: &clientWithConn{ModalClientClient: mock},
+		logger:   slog.New(slog.DiscardHandler),
+	}, sandboxID)
+}
+
+// useDefaultSidecarCreatePath clears an opt-out inherited from the developer's
+// environment so the test exercises the default create path. t.Setenv restores
+// the original value on cleanup, but an empty value still counts as an opt-out,
+// so the variable is removed outright.
+func useDefaultSidecarCreatePath(t *testing.T) {
+	t.Helper()
+	t.Setenv(controlPlaneSidecarCreateEnvVar, "")
+	if err := os.Unsetenv(controlPlaneSidecarCreateEnvVar); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSidecarCreateBuildsControlPlaneRequest(t *testing.T) {
+	useDefaultSidecarCreatePath(t)
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{
+		resp: pb.SandboxContainerCreateV2Response_builder{
+			ContainerId:   "sb-test-ctr-SIDECAR123",
+			ContainerName: "worker",
+		}.Build(),
+	}
+	sb := newSidecarCreateSandbox(mock)
+
+	localSecret := &Secret{hydrator: &secretFromMapHydrator{
+		envDict: map[string]string{"API_KEY": "local", "FROM_MAP": "yes"},
+	}}
+	container, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		Command:               []string{"sleep", "100"},
+		Env:                   map[string]string{"API_KEY": "override"},
+		Secrets:               []*Secret{localSecret, {SecretID: "st-named"}},
+		Workdir:               "/work",
+		OutboundCIDRAllowlist: &Allowlist{Entries: []string{"10.0.0.0/8"}},
+		PTY:                   true,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(container.ContainerID).To(gomega.Equal("sb-test-ctr-SIDECAR123"))
+	g.Expect(container.ContainerName).To(gomega.Equal("worker"))
+
+	req := mock.gotReq
+	g.Expect(req).ShouldNot(gomega.BeNil())
+	g.Expect(req.GetSandboxId()).To(gomega.Equal(testV2SandboxID))
+	g.Expect(req.GetContainerName()).To(gomega.Equal("worker"))
+
+	// Secrets and Env travel as ordered secret sources rather than in the
+	// definition, with Env applied last.
+	g.Expect(req.GetEphemeralSecrets()).To(gomega.BeNil())
+	g.Expect(secretSourceValues(req.GetSecretSources())).To(gomega.Equal([]any{
+		map[string]string{"API_KEY": "local", "FROM_MAP": "yes"},
+		"st-named",
+		map[string]string{"API_KEY": "override"},
+	}))
+
+	definition := req.GetDefinition()
+	g.Expect(definition.GetImageId()).To(gomega.Equal("im-123"))
+	g.Expect(definition.GetEntrypointArgs()).To(gomega.Equal([]string{"sleep", "100"}))
+	g.Expect(definition.GetWorkdir()).To(gomega.Equal("/work"))
+	g.Expect(definition.GetSecretIds()).To(gomega.Equal([]string{"st-named"}))
+	g.Expect(definition.GetEnvironmentVariables()).To(gomega.BeNil())
+	g.Expect(definition.GetPtyInfo()).ShouldNot(gomega.BeNil())
+	g.Expect(definition.GetNetworkAccess().GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_ALLOWLIST))
+	g.Expect(definition.GetNetworkAccess().GetAllowedCidrs()).To(gomega.Equal([]string{"10.0.0.0/8"}))
+}
+
+func TestSidecarCreateForwardsVolumesAndCloudBucketMounts(t *testing.T) {
+	useDefaultSidecarCreatePath(t)
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{
+		resp: pb.SandboxContainerCreateV2Response_builder{ContainerId: "sb-test-ctr-SIDECAR123"}.Build(),
+	}
+	sb := newSidecarCreateSandbox(mock)
+
+	bucketMount, err := newTestMount("my-bucket", &CloudBucketMountParams{
+		Secret:   &Secret{SecretID: "st-bucket"},
+		ReadOnly: true,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	_, err = sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		Volumes:           map[string]*Volume{"/mnt/vol": {VolumeID: "vo-123"}},
+		CloudBucketMounts: map[string]*CloudBucketMount{"/mnt/s3": bucketMount},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	definition := mock.gotReq.GetDefinition()
+	volumeMounts := definition.GetVolumeMounts()
+	g.Expect(volumeMounts).To(gomega.HaveLen(1))
+	g.Expect(volumeMounts[0].GetMountPath()).To(gomega.Equal("/mnt/vol"))
+	g.Expect(volumeMounts[0].GetVolumeId()).To(gomega.Equal("vo-123"))
+
+	cloudBucketMounts := definition.GetCloudBucketMounts()
+	g.Expect(cloudBucketMounts).To(gomega.HaveLen(1))
+	g.Expect(cloudBucketMounts[0].GetMountPath()).To(gomega.Equal("/mnt/s3"))
+	g.Expect(cloudBucketMounts[0].GetBucketName()).To(gomega.Equal("my-bucket"))
+	g.Expect(cloudBucketMounts[0].GetReadOnly()).To(gomega.BeTrue())
+	g.Expect(cloudBucketMounts[0].GetCredentialsSecretId()).To(gomega.Equal("st-bucket"))
+}
+
+func TestSidecarCreateRejectsCloudBucketMountsOnV1Sandbox(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{}
+	sb := newSidecarCreateSandboxWithID(mock, testV1SandboxID)
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		CloudBucketMounts: map[string]*CloudBucketMount{"/mnt/s3": {BucketName: "my-bucket"}},
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("V1 Sandboxes"))
+	g.Expect(mock.gotReq).To(gomega.BeNil())
+}
+
+func TestSidecarCreateRejectsCloudBucketMountsWhenOptedOut(t *testing.T) {
+	t.Setenv(controlPlaneSidecarCreateEnvVar, "0")
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{}
+	sb := newSidecarCreateSandbox(mock)
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		CloudBucketMounts: map[string]*CloudBucketMount{"/mnt/s3": {BucketName: "my-bucket"}},
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("=0"))
+	g.Expect(mock.gotReq).To(gomega.BeNil())
+}
+
+func TestSidecarCreateRejectsNilCloudBucketMount(t *testing.T) {
+	useDefaultSidecarCreatePath(t)
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{}
+	sb := newSidecarCreateSandbox(mock)
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		CloudBucketMounts: map[string]*CloudBucketMount{"/mnt/s3": nil},
+	})
+	var invalidErr InvalidError
+	g.Expect(errors.As(err, &invalidErr)).To(gomega.BeTrue())
+	g.Expect(err.Error()).To(gomega.ContainSubstring(`"/mnt/s3"`))
+	g.Expect(mock.gotReq).To(gomega.BeNil())
+}
+
+func TestSidecarCreateOmitsEmptyOptionalFields(t *testing.T) {
+	useDefaultSidecarCreatePath(t)
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{
+		resp: pb.SandboxContainerCreateV2Response_builder{ContainerId: "sb-test-ctr-SIDECAR123"}.Build(),
+	}
+	sb := newSidecarCreateSandbox(mock)
+
+	container, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	// An empty name in the response falls back to the requested name.
+	g.Expect(container.ContainerName).To(gomega.Equal("worker"))
+
+	definition := mock.gotReq.GetDefinition()
+	g.Expect(mock.gotReq.GetEphemeralSecrets()).To(gomega.BeNil())
+	g.Expect(mock.gotReq.GetSecretSources()).To(gomega.BeEmpty())
+	g.Expect(definition.HasWorkdir()).To(gomega.BeFalse())
+	g.Expect(definition.GetPtyInfo()).To(gomega.BeNil())
+	g.Expect(definition.GetVolumeMounts()).To(gomega.BeEmpty())
+	g.Expect(definition.GetNetworkAccess().GetNetworkAccessType()).To(gomega.Equal(pb.NetworkAccess_OPEN))
+}
+
+// Indexed by mount path because the Volumes map iterates in random order.
+func volumeMountsByPath(mounts []*pb.VolumeMount) map[string]*pb.VolumeMount {
+	byPath := make(map[string]*pb.VolumeMount, len(mounts))
+	for _, mount := range mounts {
+		byPath[mount.GetMountPath()] = mount
+	}
+	return byPath
+}
+
+func TestSidecarCreateForwardsVolumeMountsToControlPlane(t *testing.T) {
+	useDefaultSidecarCreatePath(t)
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{
+		resp: pb.SandboxContainerCreateV2Response_builder{ContainerId: "sb-test-ctr-SIDECAR123"}.Build(),
+	}
+	sb := newSidecarCreateSandbox(mock)
+
+	readOnly := true
+	subPath := "/scoped"
+	scopedVolume := (&Volume{VolumeID: "vo-scoped", Name: "scoped"}).WithMountOptions(&VolumeMountOptionsParams{
+		ReadOnly: &readOnly,
+		SubPath:  &subPath,
+	})
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		Volumes: map[string]*Volume{
+			"/mnt/data":   {VolumeID: "vo-data", Name: "data"},
+			"/mnt/scoped": scopedVolume,
+		},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	mounts := volumeMountsByPath(mock.gotReq.GetDefinition().GetVolumeMounts())
+	g.Expect(mounts).To(gomega.HaveLen(2))
+
+	dataMount := mounts["/mnt/data"]
+	g.Expect(dataMount).ShouldNot(gomega.BeNil())
+	g.Expect(dataMount.GetVolumeId()).To(gomega.Equal("vo-data"))
+	g.Expect(dataMount.GetAllowBackgroundCommits()).To(gomega.BeTrue())
+	g.Expect(dataMount.GetReadOnly()).To(gomega.BeFalse())
+	g.Expect(dataMount.HasSubPath()).To(gomega.BeFalse())
+
+	scopedMount := mounts["/mnt/scoped"]
+	g.Expect(scopedMount).ShouldNot(gomega.BeNil())
+	g.Expect(scopedMount.GetVolumeId()).To(gomega.Equal("vo-scoped"))
+	g.Expect(scopedMount.GetAllowBackgroundCommits()).To(gomega.BeTrue())
+	g.Expect(scopedMount.GetReadOnly()).To(gomega.BeTrue())
+	g.Expect(scopedMount.GetSubPath()).To(gomega.Equal("/scoped"))
+}
+
+type mockContainerCreateStub struct {
+	pb.TaskCommandRouterClient
+	gotReq *pb.TaskContainerCreateRequest
+}
+
+func (m *mockContainerCreateStub) TaskContainerCreate(
+	_ context.Context,
+	in *pb.TaskContainerCreateRequest,
+	_ ...grpc.CallOption,
+) (*pb.TaskContainerCreateResponse, error) {
+	m.gotReq = in
+	return pb.TaskContainerCreateResponse_builder{
+		ContainerId:   "sb-test-ctr-SIDECAR123",
+		ContainerName: "worker",
+	}.Build(), nil
+}
+
+func TestSidecarCreateForwardsVolumeMountsOverCommandRouter(t *testing.T) {
+	t.Setenv(controlPlaneSidecarCreateEnvVar, "0")
+	g := gomega.NewWithT(t)
+
+	stub := &mockContainerCreateStub{}
+	sb := newReadinessSandbox(t, sandboxVersionV2, stub)
+
+	readOnly := true
+	readOnlyVolume := (&Volume{VolumeID: "vo-data", Name: "data"}).WithMountOptions(&VolumeMountOptionsParams{
+		ReadOnly: &readOnly,
+	})
+
+	container, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		Volumes: map[string]*Volume{"/mnt/data": readOnlyVolume},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(container.ContainerName).To(gomega.Equal("worker"))
+
+	g.Expect(stub.gotReq).ShouldNot(gomega.BeNil())
+	g.Expect(stub.gotReq.GetTaskId()).To(gomega.Equal("ta-wait-123"))
+	mounts := stub.gotReq.GetVolumeMounts()
+	g.Expect(mounts).To(gomega.HaveLen(1))
+	g.Expect(mounts[0].GetVolumeId()).To(gomega.Equal("vo-data"))
+	g.Expect(mounts[0].GetMountPath()).To(gomega.Equal("/mnt/data"))
+	g.Expect(mounts[0].GetAllowBackgroundCommits()).To(gomega.BeTrue())
+	g.Expect(mounts[0].GetReadOnly()).To(gomega.BeTrue())
+	g.Expect(mounts[0].HasSubPath()).To(gomega.BeFalse())
+}
+
+func TestSidecarCreateRejectsInvalidVolumes(t *testing.T) {
+	readOnly := true
+	sharedVolume := &Volume{VolumeID: "vo-shared", Name: "shared"}
+	cases := []struct {
+		name          string
+		volumes       map[string]*Volume
+		wantSubstring string
+	}{
+		{
+			name:          "nil entry",
+			volumes:       map[string]*Volume{"/mnt/data": nil},
+			wantSubstring: `"/mnt/data"`,
+		},
+		{
+			name: "same Volume at two paths",
+			volumes: map[string]*Volume{
+				"/mnt/b": sharedVolume,
+				"/mnt/a": sharedVolume.WithMountOptions(&VolumeMountOptionsParams{ReadOnly: &readOnly}),
+			},
+			wantSubstring: "/mnt/a, /mnt/b",
+		},
+	}
+	createPaths := []struct {
+		name            string
+		useControlPlane string
+	}{
+		{"control plane", "1"},
+		{"command router", "0"},
+	}
+	for _, tc := range cases {
+		for _, createPath := range createPaths {
+			t.Run(tc.name+" via "+createPath.name, func(t *testing.T) {
+				t.Setenv(controlPlaneSidecarCreateEnvVar, createPath.useControlPlane)
+				g := gomega.NewWithT(t)
+
+				mock := &mockSandboxContainerCreateV2Client{}
+				sb := newSidecarCreateSandbox(mock)
+
+				_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+					Volumes: tc.volumes,
+				})
+				g.Expect(err).To(gomega.HaveOccurred())
+				g.Expect(err.Error()).To(gomega.ContainSubstring(tc.wantSubstring))
+				var invalidErr InvalidError
+				g.Expect(errors.As(err, &invalidErr)).To(gomega.BeTrue())
+				g.Expect(mock.gotReq).To(gomega.BeNil())
+			})
+		}
+	}
+}
+
+func TestSidecarCreateMapsGRPCErrors(t *testing.T) {
+	useDefaultSidecarCreatePath(t)
+
+	cases := []struct {
+		name    string
+		code    codes.Code
+		matches func(error) bool
+	}{
+		{"already exists", codes.AlreadyExists, func(err error) bool {
+			var target AlreadyExistsError
+			return errors.As(err, &target)
+		}},
+		{"invalid argument", codes.InvalidArgument, func(err error) bool {
+			var target InvalidError
+			return errors.As(err, &target)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+
+			mock := &mockSandboxContainerCreateV2Client{err: status.Error(tc.code, "boom")}
+			sb := newSidecarCreateSandbox(mock)
+
+			_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, nil)
+			g.Expect(err).Should(gomega.HaveOccurred())
+			g.Expect(tc.matches(err)).To(gomega.BeTrue(), "unexpected error type %T: %v", err, err)
+			g.Expect(err).Should(gomega.MatchError(gomega.ContainSubstring("boom")))
+		})
+	}
+}
+
+func TestSidecarCreateUsesControlPlaneByDefault(t *testing.T) {
+	useDefaultSidecarCreatePath(t)
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{
+		resp: pb.SandboxContainerCreateV2Response_builder{ContainerId: "sb-test-ctr-SIDECAR123"}.Build(),
+	}
+	sb := newSidecarCreateSandbox(mock)
+
+	// The Sandbox connection is not stubbed here, so the create can only succeed
+	// by reaching the Modal server.
+	container, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(container.ContainerID).To(gomega.Equal("sb-test-ctr-SIDECAR123"))
+	g.Expect(mock.gotReq).ShouldNot(gomega.BeNil(), "it should have called the Modal server")
+}
+
+func TestSidecarCreateSkipsControlPlaneWhenOptedOut(t *testing.T) {
+	for _, optOut := range []string{"0", "false"} {
+		t.Run(optOut, func(t *testing.T) {
+			t.Setenv(controlPlaneSidecarCreateEnvVar, optOut)
+			g := gomega.NewWithT(t)
+
+			mock := &mockSandboxContainerCreateV2Client{}
+			sb := newSidecarCreateSandbox(mock)
+
+			// Opted out, the call goes over the Sandbox connection, which fails on the
+			// stubbed task ID lookup; what matters is that nothing reached the Modal server.
+			_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, nil)
+			g.Expect(err).To(gomega.MatchError(errNoTaskIDInTest), "it should have gone over the Sandbox connection")
+			g.Expect(mock.gotReq).To(gomega.BeNil(), "and it should not have called the Modal server")
+		})
+	}
+}
+
+func TestSidecarCreateSkipsControlPlaneForV1Sandbox(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{}
+	sb := newSidecarCreateSandboxWithID(mock, testV1SandboxID)
+
+	// Only V2 Sandboxes create sidecars through the Modal server; a V1 Sandbox
+	// always creates them over the Sandbox connection.
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, nil)
+	g.Expect(err).To(gomega.MatchError(errNoTaskIDInTest), "it should have gone over the Sandbox connection")
+	g.Expect(mock.gotReq).To(gomega.BeNil(), "and it should not have called the Modal server")
+}
+
+func TestSidecarCreateRejectsDetachedSandbox(t *testing.T) {
+	useDefaultSidecarCreatePath(t)
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{}
+	sb := newSidecarCreateSandbox(mock)
+	g.Expect(sb.Detach()).ShouldNot(gomega.HaveOccurred())
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, nil)
+	var clientClosed ClientClosedError
+	g.Expect(errors.As(err, &clientClosed)).To(gomega.BeTrue(), "unexpected error type %T: %v", err, err)
+	g.Expect(mock.gotReq).To(gomega.BeNil())
+}
+
+func TestSidecarCreateForwardsIncludeOidcIdentityToken(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{
+		resp: pb.SandboxContainerCreateV2Response_builder{ContainerId: "sb-test-ctr-SIDECAR123"}.Build(),
+	}
+	sb := newSidecarCreateSandbox(mock)
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		IncludeOidcIdentityToken: true,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(mock.gotReq.GetDefinition().GetIncludeOidcIdentityToken()).To(gomega.BeTrue())
+}
+
+func TestSidecarCreateLeavesIncludeOidcIdentityTokenUnsetByDefault(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{
+		resp: pb.SandboxContainerCreateV2Response_builder{ContainerId: "sb-test-ctr-SIDECAR123"}.Build(),
+	}
+	sb := newSidecarCreateSandbox(mock)
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(mock.gotReq.GetDefinition().GetIncludeOidcIdentityToken()).To(gomega.BeFalse())
+}
+
+func TestSidecarCreateRejectsIncludeOidcIdentityTokenWhenOptedOut(t *testing.T) {
+	t.Setenv(controlPlaneSidecarCreateEnvVar, "0")
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{}
+	sb := newSidecarCreateSandbox(mock)
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		IncludeOidcIdentityToken: true,
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err).To(gomega.BeAssignableToTypeOf(InvalidError{}))
+	g.Expect(err.Error()).To(gomega.ContainSubstring(controlPlaneSidecarCreateEnvVar))
+	g.Expect(mock.gotReq).To(gomega.BeNil())
+}
+
+func TestSidecarCreateRejectsIncludeOidcIdentityTokenOnV1Sandbox(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{}
+	sb := newSidecarCreateSandboxWithID(mock, testV1SandboxID)
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		IncludeOidcIdentityToken: true,
+	})
+	g.Expect(err).To(gomega.BeAssignableToTypeOf(InvalidError{}))
+	g.Expect(err.Error()).To(gomega.ContainSubstring("GPU Sandboxes"))
+	g.Expect(mock.gotReq).To(gomega.BeNil())
+}
+
+func TestSidecarCreateForwardsProxy(t *testing.T) {
+	t.Setenv(controlPlaneSidecarCreateEnvVar, "1")
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{
+		resp: pb.SandboxContainerCreateV2Response_builder{ContainerId: "sb-test-ctr-SIDECAR123"}.Build(),
+	}
+	sb := newSidecarCreateSandbox(mock)
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		Proxy: &Proxy{ProxyID: "pr-123"},
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	definition := mock.gotReq.GetDefinition()
+	g.Expect(definition.HasProxyId()).To(gomega.BeTrue())
+	g.Expect(definition.GetProxyId()).To(gomega.Equal("pr-123"))
+}
+
+func TestSidecarCreateLeavesProxyUnsetByDefault(t *testing.T) {
+	t.Setenv(controlPlaneSidecarCreateEnvVar, "1")
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{
+		resp: pb.SandboxContainerCreateV2Response_builder{ContainerId: "sb-test-ctr-SIDECAR123"}.Build(),
+	}
+	sb := newSidecarCreateSandbox(mock)
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(mock.gotReq.GetDefinition().HasProxyId()).To(gomega.BeFalse())
+}
+
+func TestSidecarCreateRejectsProxyWhenOptedOut(t *testing.T) {
+	t.Setenv(controlPlaneSidecarCreateEnvVar, "0")
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{}
+	sb := newSidecarCreateSandbox(mock)
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		Proxy: &Proxy{ProxyID: "pr-123"},
+	})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err).To(gomega.BeAssignableToTypeOf(InvalidError{}))
+	g.Expect(err.Error()).To(gomega.ContainSubstring(controlPlaneSidecarCreateEnvVar))
+	g.Expect(mock.gotReq).To(gomega.BeNil())
+}
+
+func TestSidecarCreateRejectsProxyOnV1Sandbox(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	mock := &mockSandboxContainerCreateV2Client{}
+	sb := newSidecarCreateSandboxWithID(mock, testV1SandboxID)
+
+	_, err := sb.ExperimentalSidecars.Create(t.Context(), "worker", &Image{ImageID: "im-123"}, &SidecarCreateParams{
+		Proxy: &Proxy{ProxyID: "pr-123"},
+	})
+	g.Expect(err).To(gomega.BeAssignableToTypeOf(InvalidError{}))
+	g.Expect(err.Error()).To(gomega.ContainSubstring("GPU Sandboxes"))
+	g.Expect(mock.gotReq).To(gomega.BeNil())
+}
+
+// taskIDWaiter is the task ID lookup of a task-based backend.
+type taskIDWaiter interface {
+	ensureTaskID(ctx context.Context) (string, error)
+	waitForTaskID(ctx context.Context, timeout time.Duration, retryTransient bool) (string, error)
+}
+
+// Not parallel: which deprecations have been warned about is process-wide.
+func TestWarnDeprecatedNetworkParamsWarnsOncePerParameter(t *testing.T) {
+	g := gomega.NewWithT(t)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	params := &SandboxCreateParams{
+		OutboundCIDRAllowlist:      &Allowlist{},
+		OutboundDomainAllowlist:    &Allowlist{},
+		ExperimentalOutboundPolicy: &ExperimentalOutboundPolicy{},
+	}
+
+	warnDeprecatedNetworkParams(t.Context(), logger, params)
+	warnDeprecatedNetworkParams(t.Context(), logger, params)
+
+	g.Expect(strings.Count(logs.String(), "OutboundCIDRAllowlist is deprecated and will be removed in a future release")).To(gomega.Equal(1))
+	g.Expect(strings.Count(logs.String(), "OutboundDomainAllowlist is deprecated and will be removed in a future release")).To(gomega.Equal(1))
+	g.Expect(strings.Count(logs.String(), "ExperimentalOutboundPolicy is deprecated and will be removed in version 0.12.0")).To(gomega.Equal(1))
+}

@@ -1,0 +1,1634 @@
+# Copyright Modal Labs 2025
+"""
+Unit tests for task command router client.
+"""
+
+import asyncio
+import pytest
+import time
+from unittest.mock import AsyncMock, Mock
+
+import pytest_asyncio
+from grpclib import GRPCError, Status
+from grpclib.exceptions import StreamTerminatedError
+
+from modal._utils.grpc_utils import ModalChannel
+from modal.client import _Client
+from modal.exception import (
+    AuthError,
+    ClientClosed,
+    ExecTimeoutError,
+    ResourceExhaustedError,
+    ServiceError,
+    TimeoutError as ModalTimeoutError,
+)
+from modal.sandbox._task_command_router_client import TaskCommandRouterClient, call_with_retries_on_transient_errors
+from modal_proto import api_pb2, task_command_router_pb2 as sr_pb2
+
+
+async def _unexpected_fetch_access():
+    raise AssertionError("unexpected command router access fetch")
+
+
+def _start_index_for_offset(pieces: list[bytes], offset: int) -> int:
+    """Return the index of the piece that starts at the given byte offset."""
+    total = 0
+    for idx, p in enumerate(pieces):
+        if total == offset:
+            return idx
+        total += len(p)
+    if total == offset:
+        return len(pieces)
+    raise AssertionError(f"Offset {offset} does not align to piece boundary")
+
+
+class _UnaryStreamMethod:
+    def __init__(self, open_fn):
+        self._open_fn = open_fn
+        self._metadata = None
+
+    def open(self, timeout: float | None = None, metadata: dict | None = None):  # match grpclib signature
+        self._metadata = metadata
+        return self._open_fn(timeout)
+
+
+class _Stub:
+    def __init__(self, open_fn):
+        self.TaskExecStdioRead = _UnaryStreamMethod(open_fn)
+
+
+def create_dummy_channel() -> ModalChannel:
+    return ModalChannel("https://router.test", ssl=False)
+
+
+@pytest_asyncio.fixture
+async def make_router_client():
+    clients: list[TaskCommandRouterClient] = []
+
+    def _make_router_client(
+        *,
+        task_id: str = "sb-1",
+        server_url: str = "https://router.test",
+        jwt: str = "t",
+        channel: ModalChannel | None = None,
+        loop: asyncio.AbstractEventLoop | None = None,
+        jwt_refresh_lock: asyncio.Lock | None = None,
+        stream_stdio_retry_delay_secs: float = 0.01,
+        stream_stdio_retry_delay_factor: float = 2,
+        stream_stdio_max_retries: int = 10,
+        fetch_access=_unexpected_fetch_access,
+    ) -> TaskCommandRouterClient:
+        client = TaskCommandRouterClient(
+            task_id,
+            server_url,
+            jwt,
+            channel or create_dummy_channel(),
+            loop or asyncio.get_running_loop(),
+            jwt_refresh_lock or asyncio.Lock(),
+            fetch_access=fetch_access,
+            stream_stdio_retry_delay_secs=stream_stdio_retry_delay_secs,
+            stream_stdio_retry_delay_factor=stream_stdio_retry_delay_factor,
+            stream_stdio_max_retries=stream_stdio_max_retries,
+        )
+        clients.append(client)
+        return client
+
+    yield _make_router_client
+
+    for client in clients:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_refresh_jwt_uses_fetch_access(make_router_client):
+    fetches = 0
+
+    async def fetch_access():
+        nonlocal fetches
+        fetches += 1
+        return api_pb2.CommandRouterAccess(url="https://router.test", jwt="t2")
+
+    client = make_router_client(jwt="t1", fetch_access=fetch_access)
+    await client._refresh_jwt()
+
+    assert fetches == 1
+    assert client._get_metadata()["authorization"] == "Bearer t2"
+
+
+@pytest.mark.asyncio
+async def test_connect_rejects_http_for_non_localhost_server_client():
+    server_client = _Client("https://api.modal.com", api_pb2.CLIENT_TYPE_CLIENT, credentials=None)
+
+    with pytest.raises(ValueError, match="Task router URL must be https"):
+        await TaskCommandRouterClient._connect(
+            server_client, "ta-123", "http://router.example:4321", "jwt", fetch_access=_unexpected_fetch_access
+        )
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_streams_stdout_batches(make_router_client):
+    pieces = [b"hello ", b"world", b"!\n"]
+
+    client = make_router_client()
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+            self._idx = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._idx >= len(pieces):
+                raise StopAsyncIteration
+            data = pieces[self._idx]
+            self._idx += 1
+            return sr_pb2.TaskExecStdioReadResponse(data=data)
+
+    def _open(timeout: float | None = None):
+        return _Stream(timeout)
+
+    fake_stub = _Stub(_open)
+    client._stub = fake_stub  # type: ignore[assignment]
+
+    out: list[bytes] = []
+    async for item in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT):
+        out.append(item.data)
+
+    assert out == pieces
+    assert fake_stub.TaskExecStdioRead._metadata == {"authorization": "Bearer t", "x-throttle-retry-attempt": "0"}
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_auth_retry_resumes_from_correct_offset(make_router_client):
+    # 2 pieces, then disconnect; next attempt fails auth on send once; then resume with remaining pieces.
+    pieces = [b"AA", b"BB", b"CC", b"DD"]
+
+    client = make_router_client()
+
+    num_attempts_made = 0
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+            self._emitted = 0
+            self._last_req: sr_pb2.TaskExecStdioReadRequest | None = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            self._last_req = req
+            if num_attempts_made == 2:
+                raise GRPCError(Status.UNAUTHENTICATED, "auth required")
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            assert self._last_req is not None
+            start_idx = _start_index_for_offset(pieces, int(self._last_req.offset))
+            # On first attempt, fail after 2 items to simulate stream drop. The attempt
+            # after that will fail in send_message with UNAUTHENTICATED.
+            if num_attempts_made == 1 and self._emitted >= 2:
+                raise StreamTerminatedError("stream closed")
+            next_idx = start_idx + self._emitted
+            if next_idx >= len(pieces):
+                raise StopAsyncIteration
+            self._emitted += 1
+            return sr_pb2.TaskExecStdioReadResponse(data=pieces[next_idx])
+
+    def _open(timeout: float | None = None):
+        nonlocal num_attempts_made
+        num_attempts_made += 1
+        return _Stream(timeout)
+
+    fake_stub = _Stub(_open)
+
+    num_refreshes_made = 0
+
+    async def _refresh_jwt():
+        nonlocal num_refreshes_made
+        num_refreshes_made += 1
+        client._jwt = "t2"
+
+    client._refresh_jwt = _refresh_jwt  # type: ignore[assignment]
+    client._stub = fake_stub  # type: ignore[assignment]
+
+    out: list[bytes] = []
+    async for item in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT):
+        out.append(item.data)
+
+    assert out == pieces
+    # We should have refreshed exactly once due to UNAUTHENTICATED on send.
+    assert num_refreshes_made == 1
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_auth_retry_on_receive(make_router_client):
+    # send_message succeeds but the server rejects auth during iteration; we should refresh once and resume.
+    pieces = [b"hello", b"world"]
+
+    client = make_router_client()
+
+    num_attempts_made = 0
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+            self._emitted = 0
+            self._last_req: sr_pb2.TaskExecStdioReadRequest | None = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            self._last_req = req
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            assert self._last_req is not None
+            start_idx = _start_index_for_offset(pieces, int(self._last_req.offset))
+            # On first attempt, fail auth on receive before any items.
+            if num_attempts_made == 1 and self._emitted == 0:
+                raise GRPCError(Status.UNAUTHENTICATED, "auth required")
+            next_idx = start_idx + self._emitted
+            if next_idx >= len(pieces):
+                raise StopAsyncIteration
+            self._emitted += 1
+            return sr_pb2.TaskExecStdioReadResponse(data=pieces[next_idx])
+
+    def _open(timeout: float | None = None):
+        nonlocal num_attempts_made
+        num_attempts_made += 1
+        return _Stream(timeout)
+
+    num_refreshes_made = 0
+
+    async def _refresh_jwt():
+        nonlocal num_refreshes_made
+        num_refreshes_made += 1
+        client._jwt = "t2"
+
+    client._refresh_jwt = _refresh_jwt  # type: ignore[assignment]
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    out: list[bytes] = []
+    async for item in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT):
+        out.append(item.data)
+
+    assert out == pieces
+    assert num_refreshes_made == 1
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_transient_error_retry_resumes_from_correct_offset(make_router_client):
+    # 2 pieces, then transient error; then resume with remaining pieces.
+    pieces = [b"one", b"two", b"three"]
+
+    client = make_router_client()
+
+    num_attempts_made = 0
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+            self._emitted = 0
+            self._last_req: sr_pb2.TaskExecStdioReadRequest | None = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            self._last_req = req
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            assert self._last_req is not None
+            start_idx = _start_index_for_offset(pieces, int(self._last_req.offset))
+            if num_attempts_made == 1 and self._emitted >= 2:
+                raise GRPCError(Status.UNAVAILABLE, "unavailable")
+            next_idx = start_idx + self._emitted
+            if next_idx >= len(pieces):
+                raise StopAsyncIteration
+            self._emitted += 1
+            return sr_pb2.TaskExecStdioReadResponse(data=pieces[next_idx])
+
+    def _open(timeout: float | None = None):
+        nonlocal num_attempts_made
+        num_attempts_made += 1
+        return _Stream(timeout)
+
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    out: list[bytes] = []
+    async for item in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT):
+        out.append(item.data)
+
+    assert out == pieces
+
+
+@pytest.mark.parametrize("sandbox_stdio", [False, True])
+@pytest.mark.asyncio
+async def test_stdio_retry_does_not_reopen_when_client_closes(make_router_client, sandbox_stdio):
+    client = make_router_client(stream_stdio_retry_delay_secs=0.02)
+    read_failed = asyncio.Event()
+    num_attempts_made = 0
+
+    class _Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req, end=True):  # noqa: ANN001, ANN201, ARG002 - test helper
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            read_failed.set()
+            raise GRPCError(Status.UNAVAILABLE, "unavailable")
+
+    def _open(timeout: float | None = None):  # noqa: ARG001
+        nonlocal num_attempts_made
+        num_attempts_made += 1
+        return _Stream()
+
+    class _RetryStub:
+        def __init__(self):
+            self.TaskExecStdioRead = _UnaryStreamMethod(_open)
+            self.SandboxStdioReadV2 = _UnaryStreamMethod(_open)
+
+    client._stub = _RetryStub()  # type: ignore[assignment]
+    if sandbox_stdio:
+        stream = client.sandbox_stdio_read("task-1", api_pb2.FILE_DESCRIPTOR_STDOUT)
+    else:
+        stream = client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT)
+    waiting = asyncio.create_task(anext(stream))
+    await read_failed.wait()
+
+    await client.close()
+
+    with pytest.raises(ClientClosed):
+        await asyncio.wait_for(waiting, timeout=0.5)
+    assert num_attempts_made == 1
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_retry_budget_refills_after_stream_termination(make_router_client):
+    pieces = [b"one", b"two", b"three", b"four"]
+    client = make_router_client(
+        stream_stdio_retry_delay_secs=0,
+        stream_stdio_max_retries=1,
+    )
+
+    num_attempts_made = 0
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+            self._last_req: sr_pb2.TaskExecStdioReadRequest | None = None
+            self._emitted = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            self._last_req = req
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            assert self._last_req is not None
+            start_idx = _start_index_for_offset(pieces, int(self._last_req.offset))
+            if self._emitted:
+                if start_idx + 1 < len(pieces):
+                    raise StreamTerminatedError("stream closed")
+                raise StopAsyncIteration
+
+            self._emitted = True
+            return sr_pb2.TaskExecStdioReadResponse(data=pieces[start_idx])
+
+    def _open(timeout: float | None = None):
+        nonlocal num_attempts_made
+        num_attempts_made += 1
+        return _Stream(timeout)
+
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    out = [item.data async for item in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT)]
+
+    assert out == pieces
+    assert num_attempts_made == len(pieces)
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_retry_budget_refills_after_grpc_errors(make_router_client):
+    pieces = [b"one", b"two", b"three", b"four", b"five", b"six"]
+    client = make_router_client(
+        stream_stdio_retry_delay_secs=0.001,
+        stream_stdio_retry_delay_factor=1.0,
+        stream_stdio_max_retries=2,
+    )
+
+    num_attempts_made = 0
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+            self._emitted = 0
+            self._last_req: sr_pb2.TaskExecStdioReadRequest | None = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            self._last_req = req
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            assert self._last_req is not None
+            start_idx = _start_index_for_offset(pieces, int(self._last_req.offset))
+            if start_idx >= len(pieces):
+                raise StopAsyncIteration
+            if self._emitted >= 1:
+                raise GRPCError(Status.UNAVAILABLE, "unavailable")
+            self._emitted += 1
+            return sr_pb2.TaskExecStdioReadResponse(data=pieces[start_idx])
+
+    def _open(timeout: float | None = None):
+        nonlocal num_attempts_made
+        num_attempts_made += 1
+        return _Stream(timeout)
+
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    out = [item.data async for item in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT)]
+
+    assert out == pieces
+    assert num_attempts_made == len(pieces) + 1
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_auth_fails_twice_raises_auth_error(make_router_client):
+    pieces = [b"x", b"y"]
+
+    client = make_router_client()
+
+    num_attempts_made = 0
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+            self._last_req: sr_pb2.TaskExecStdioReadRequest | None = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            self._last_req = req
+            if num_attempts_made in (1, 2):
+                raise GRPCError(Status.UNAUTHENTICATED, "auth required")
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    def _open(timeout: float | None = None):
+        nonlocal num_attempts_made
+        num_attempts_made += 1
+        return _Stream(timeout)
+
+    num_refreshes_made = 0
+
+    async def _refresh_jwt():
+        nonlocal num_refreshes_made
+        num_refreshes_made += 1
+        client._jwt = f"t{num_refreshes_made}"
+
+    client._refresh_jwt = _refresh_jwt  # type: ignore[assignment]
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    with pytest.raises(AuthError):
+        async for _ in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_unavailable_forever_raises_grpcerror(make_router_client):
+    # Simulate UNAVAILABLE on every attempt immediately upon starting iteration.
+    pieces = [b"irrelevant"]
+
+    client = make_router_client(
+        stream_stdio_retry_delay_secs=0.001,
+        stream_stdio_retry_delay_factor=1.0,
+        stream_stdio_max_retries=5,
+    )
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise GRPCError(Status.UNAVAILABLE, "unavailable")
+
+    def _open(timeout: float | None = None):
+        return _Stream(timeout)
+
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    with pytest.raises(ServiceError):
+        async for _ in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_open_raises_once_then_succeeds(make_router_client):
+    pieces = [b"data"]
+
+    client = make_router_client()
+
+    raised = False
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+            self._emitted = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._emitted:
+                raise StopAsyncIteration
+            self._emitted = True
+            return sr_pb2.TaskExecStdioReadResponse(data=pieces[0])
+
+    def _open(timeout: float | None = None):
+        nonlocal raised
+        if not raised:
+            raised = True
+            raise GRPCError(Status.UNAVAILABLE, "open failed")
+        return _Stream(timeout)
+
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    out: list[bytes] = []
+    async for item in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT):
+        out.append(item.data)
+    assert out == pieces
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_deadline_exceeded_on_send_raises_exec_timeout_error(make_router_client):
+    client = make_router_client()
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            assert self._timeout is not None
+            await asyncio.sleep(self._timeout + 0.05)
+            raise asyncio.TimeoutError()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    def _open(timeout: float | None = None):
+        return _Stream(timeout)
+
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    deadline = time.monotonic() + 0.1
+    with pytest.raises(ExecTimeoutError):
+        async for _ in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT, deadline=deadline):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_deadline_exceeded_on_first_item_raises_exec_timeout_error(make_router_client):
+    client = make_router_client()
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+            self._sent_first = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._sent_first:
+                self._sent_first = True
+                assert self._timeout is not None
+                await asyncio.sleep(self._timeout + 0.05)
+                raise asyncio.TimeoutError()
+            raise StopAsyncIteration
+
+    def _open(timeout: float | None = None):
+        return _Stream(timeout)
+
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    deadline = time.monotonic() + 0.1
+    with pytest.raises(ExecTimeoutError):
+        async for _ in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT, deadline=deadline):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_deadline_respected_on_attribute_error(make_router_client, monkeypatch):
+    # AttributeError("_write_appdata") branch should respect deadline and raise
+    # ExecTimeoutError instead of sleeping past it.
+    client = make_router_client(
+        stream_stdio_retry_delay_secs=0.2,  # longer than remaining time
+    )
+
+    send_message_cnt = 0
+
+    class _Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            nonlocal send_message_cnt
+            send_message_cnt += 1
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise AttributeError("_write_appdata")
+
+    def _open(timeout: float | None = None):
+        return _Stream()
+
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    mock_sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
+    # Set deadline less than retry delay so a retry would exceed it
+    deadline = time.monotonic() + 0.05
+    with pytest.raises(ExecTimeoutError):
+        async for _ in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT, deadline=deadline):
+            pass
+    # The exec_stdio_read call should only send one request before failing due to the deadline being
+    # exceeded. It should not retry because the sleep between retries is set to 0.2 seconds, which
+    # is longer than the deadline.
+    assert send_message_cnt == 1
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_deadline_respected_on_stream_terminated_error(make_router_client, monkeypatch):
+    client = make_router_client(
+        stream_stdio_retry_delay_secs=0.2,
+    )
+
+    send_message_cnt = 0
+
+    class _Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            nonlocal send_message_cnt
+            send_message_cnt += 1
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StreamTerminatedError("closed")
+
+    def _open(timeout: float | None = None):
+        return _Stream()
+
+    mock_sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    deadline = time.monotonic() + 0.05
+    with pytest.raises(ExecTimeoutError):
+        async for _ in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT, deadline=deadline):
+            pass
+    # The exec_stdio_read call should only send one request before failing due to the deadline being
+    # exceeded. It should not retry because the sleep between retries is set to 0.2 seconds, which
+    # is longer than the deadline.
+    assert send_message_cnt == 1
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_deadline_respected_on_oserror(make_router_client, monkeypatch):
+    client = make_router_client(
+        stream_stdio_retry_delay_secs=0.2,
+    )
+
+    send_message_cnt = 0
+
+    class _Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            nonlocal send_message_cnt
+            send_message_cnt += 1
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise OSError("network down")
+
+    def _open(timeout: float | None = None):
+        return _Stream()
+
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    mock_sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
+    deadline = time.monotonic() + 0.05
+    with pytest.raises(ExecTimeoutError):
+        async for _ in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT, deadline=deadline):
+            pass
+    # The exec_stdio_read call should only send one request before failing due to the deadline being
+    # exceeded. It should not retry because the sleep between retries is set to 0.2 seconds, which
+    # is longer than the deadline.
+    assert send_message_cnt == 1
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_exec_stdio_read_deadline_exceeded_on_open_raises_exec_timeout_error(make_router_client):
+    client = make_router_client()
+
+    send_message_cnt = 0
+    aenter_called = 0
+    open_timeout = None
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+
+        async def __aenter__(self):
+            # Simulate grpclib honoring per-RPC timeout during open
+            assert self._timeout is not None
+            nonlocal aenter_called
+            aenter_called += 1
+            await asyncio.sleep(self._timeout + 0.05)
+            raise asyncio.TimeoutError()
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.TaskExecStdioReadRequest, end: bool = True):  # noqa: ARG002
+            nonlocal send_message_cnt
+            send_message_cnt += 1
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    def _open(timeout: float | None = None):
+        nonlocal open_timeout
+        open_timeout = timeout
+        return _Stream(timeout)
+
+    client._stub = _Stub(_open)  # type: ignore[assignment]
+
+    # Set a small deadline; expect prompt ExecTimeoutError.
+    duration = 0.05
+    deadline = time.monotonic() + duration
+    with pytest.raises(ExecTimeoutError):
+        async for _ in client.exec_stdio_read("task-1", "exec-1", api_pb2.FILE_DESCRIPTOR_STDOUT, deadline=deadline):
+            pass
+    assert send_message_cnt == 0
+    assert aenter_called == 1
+    assert open_timeout is not None
+
+
+@pytest.mark.asyncio
+async def test_exec_wait_logs_transient_failures(make_router_client, monkeypatch, caplog):
+    from modal.sandbox import _task_command_router_client as task_command_router_client
+
+    caplog.set_level("DEBUG", logger="Alingo-Modal-Core")
+    client = make_router_client()
+    wait = AsyncMock(
+        side_effect=[
+            StreamTerminatedError("Connection lost"),
+            ConnectionResetError(),
+            sr_pb2.TaskExecWaitResponse(code=23),
+        ]
+    )
+    monkeypatch.setattr(client._stub, "TaskExecWait", wait)
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    monkeypatch.setattr(
+        task_command_router_client,
+        "time",
+        Mock(monotonic=Mock(side_effect=[0, 40, 41, 51.25, 52.25])),
+    )
+
+    response = await client.exec_wait("task-1", "exec-1")
+
+    assert response.code == 23
+    assert caplog.messages == [
+        "TaskExecWait for exec exec-1 attempt 1 failed after 40.000s, retrying in 1s: "
+        "StreamTerminatedError('Connection lost')",
+        "TaskExecWait for exec exec-1 attempt 2 failed after 10.250s, retrying in 1s: ConnectionResetError()",
+    ]
+    assert all(record.levelname == "DEBUG" for record in caplog.records)
+    assert [call.args for call in sleep.await_args_list] == [(1,), (1,)]
+    assert wait.await_count == 3
+    assert all(call.kwargs["timeout"] == 60 for call in wait.await_args_list)
+    assert "Bearer t" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionResetError(),
+        ConnectionRefusedError(),
+        OSError("Network is unreachable"),
+        StreamTerminatedError("Connection lost"),
+        AttributeError("'NoneType' object has no attribute '_write_appdata'"),
+        GRPCError(Status.UNAVAILABLE),
+        GRPCError(Status.INTERNAL),
+        GRPCError(Status.UNKNOWN),
+        GRPCError(Status.CANCELLED),
+    ],
+)
+async def test_exec_wait_warns_once_after_three_failures(make_router_client, monkeypatch, caplog, error):
+    caplog.set_level("WARNING", logger="Alingo-Modal-Core")
+    client = make_router_client()
+    calls = 0
+
+    async def wait(*args, **kwargs):
+        nonlocal calls
+        assert len(caplog.records) == (0 if calls < 3 else 1)
+        calls += 1
+        if calls <= 6:
+            raise error
+        return sr_pb2.TaskExecWaitResponse(code=23)
+
+    monkeypatch.setattr(client._stub, "TaskExecWait", wait)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    response = await client.exec_wait("task-1", "exec-1")
+
+    assert response.code == 23
+    assert calls == 7
+    assert caplog.messages == [
+        "Cannot retrieve the exit status for exec exec-1 due to connection or service errors. "
+        "The command may have already exited. "
+        "Retrying after 3 consecutive failures. Set MODAL_LOGLEVEL=DEBUG for details."
+    ]
+    assert caplog.records[0].levelname == "WARNING"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [asyncio.TimeoutError(), GRPCError(Status.DEADLINE_EXCEEDED)])
+async def test_exec_wait_timeouts_reset_warning_threshold(make_router_client, monkeypatch, caplog, timeout):
+    caplog.set_level("WARNING", logger="Alingo-Modal-Core")
+    client = make_router_client()
+    # Two failures between long-poll timeouts must not accumulate into a warning.
+    outcomes = [timeout] * 4 + [ConnectionResetError(), GRPCError(Status.UNAVAILABLE), timeout] * 3
+    outcomes += [ConnectionResetError(), GRPCError(Status.INTERNAL), StreamTerminatedError("Connection lost")]
+    outcomes += [sr_pb2.TaskExecWaitResponse(code=23)]
+    calls = 0
+
+    async def wait(*args, **kwargs):
+        nonlocal calls
+        assert len(caplog.records) == (1 if calls == len(outcomes) - 1 else 0)
+        outcome = outcomes[calls]
+        calls += 1
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(client._stub, "TaskExecWait", wait)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    response = await client.exec_wait("task-1", "exec-1")
+
+    assert response.code == 23
+    assert len(caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_exec_wait_succeeds_after_auth_retry(make_router_client):
+    client = make_router_client()
+
+    calls: list[tuple[sr_pb2.TaskExecWaitRequest, float | None, dict | None]] = []
+
+    class _WaitMethod:
+        def __init__(self):
+            self._first = True
+
+        async def __call__(
+            self,
+            request: sr_pb2.TaskExecWaitRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            calls.append((request, timeout, metadata))
+            if self._first:
+                self._first = False
+                raise GRPCError(Status.UNAUTHENTICATED, "auth required")
+            # Return a successful response on retry
+            return sr_pb2.TaskExecWaitResponse(code=0)
+
+    class _Stub2:
+        def __init__(self):
+            self.TaskExecWait = _WaitMethod()
+
+    refreshes = 0
+
+    async def _refresh_jwt():
+        nonlocal refreshes
+        client._jwt = "j"
+        refreshes += 1
+
+    client._refresh_jwt = _refresh_jwt  # type: ignore[assignment]
+    client._stub = _Stub2()  # type: ignore[assignment]
+
+    # No explicit deadline -> internal call uses timeout=60 and should preserve it across auth retry
+    resp = await client.exec_wait("task-1", "exec-1")
+    assert isinstance(resp, sr_pb2.TaskExecWaitResponse)
+    assert resp.code == 0
+
+    # Should have attempted twice: once failing with UNAUTHENTICATED, once succeeding.
+    assert len(calls) == 2
+    req1, to1, metadata1 = calls[0]
+    req2, to2, metadata2 = calls[1]
+    assert req1.task_id == "task-1" and req1.exec_id == "exec-1"
+    assert req2.task_id == "task-1" and req2.exec_id == "exec-1"
+    assert metadata1 == {"authorization": "Bearer t", "x-throttle-retry-attempt": "0"}
+    assert metadata2 == {"authorization": "Bearer j", "x-throttle-retry-attempt": "0"}
+    assert to1 == 60 and to2 == 60
+    assert refreshes == 1
+
+
+@pytest.mark.asyncio
+async def test_non_snapshot_cancelled_raises_service_error(make_router_client, monkeypatch):
+    client = make_router_client()
+
+    attempts = 0
+
+    class _ContainerGetMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskContainerGetRequest,
+            *,
+            metadata: dict | None = None,
+        ):
+            nonlocal attempts
+            attempts += 1
+            assert metadata == {"authorization": "Bearer t", "x-throttle-retry-attempt": "0"}
+            raise GRPCError(Status.CANCELLED, "cancelled")
+
+    monkeypatch.setattr(client._stub, "TaskContainerGet", _ContainerGetMethod(), raising=True)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    request = sr_pb2.TaskContainerGetRequest(task_id="task-1", container_name="container-1")
+    with pytest.raises(ServiceError, match="cancelled") as exc_info:
+        await client.container_get(request)
+
+    assert exc_info.value._grpc_status == Status.CANCELLED
+    assert attempts == 11
+
+
+@pytest.mark.asyncio
+async def test_snapshot_filesystem_grpclib_timeout_raises_timeout_error(make_router_client, monkeypatch):
+    client = make_router_client()
+
+    attempts = 0
+
+    class _SnapshotFilesystemMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskSnapshotFilesystemRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            nonlocal attempts
+            attempts += 1
+            # Simulate the per-call deadline elapsing: sleep past the overall
+            # timeout before the (mocked) grpclib timeout fires.
+            await asyncio.sleep(1.0)
+            raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(client._stub, "TaskSnapshotFilesystem", _SnapshotFilesystemMethod(), raising=True)
+
+    request = sr_pb2.TaskSnapshotFilesystemRequest(task_id="task-1", snapshot_id="snapshot-1")
+    with pytest.raises(ModalTimeoutError, match="Timeout expired"):
+        await client.snapshot_filesystem(request, timeout=0.5)
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_filesystem_cancelled_after_deadline_raises_timeout_error(make_router_client, monkeypatch):
+    client = make_router_client()
+
+    attempts = 0
+
+    class _SnapshotFilesystemMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskSnapshotFilesystemRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            nonlocal attempts
+            attempts += 1
+            await asyncio.sleep(1.0)  # well past the 0.5s deadline
+            raise GRPCError(Status.CANCELLED, "cancelled")
+
+    monkeypatch.setattr(client._stub, "TaskSnapshotFilesystem", _SnapshotFilesystemMethod(), raising=True)
+
+    request = sr_pb2.TaskSnapshotFilesystemRequest(task_id="task-1", snapshot_id="snapshot-1")
+    with pytest.raises(ModalTimeoutError, match="Timeout expired"):
+        await client.snapshot_filesystem(request, timeout=0.5)
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_filesystem_deadline_exceeded_after_deadline_raises_timeout_error(
+    make_router_client, monkeypatch
+):
+    client = make_router_client()
+
+    attempts = 0
+
+    class _SnapshotFilesystemMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskSnapshotFilesystemRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            nonlocal attempts
+            attempts += 1
+            await asyncio.sleep(1.0)  # well past the 0.5s deadline
+            raise GRPCError(Status.DEADLINE_EXCEEDED, "deadline exceeded")
+
+    monkeypatch.setattr(client._stub, "TaskSnapshotFilesystem", _SnapshotFilesystemMethod(), raising=True)
+
+    request = sr_pb2.TaskSnapshotFilesystemRequest(task_id="task-1", snapshot_id="snapshot-1")
+    with pytest.raises(ModalTimeoutError, match="Timeout expired"):
+        await client.snapshot_filesystem(request, timeout=0.5)
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_filesystem_cancelled_before_deadline_propagates_original(make_router_client, monkeypatch):
+    from modal.exception import ServiceError
+
+    client = make_router_client()
+
+    attempts = 0
+
+    class _SnapshotFilesystemMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskSnapshotFilesystemRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            nonlocal attempts
+            attempts += 1
+            raise GRPCError(Status.CANCELLED, "cancelled")
+
+    monkeypatch.setattr(client._stub, "TaskSnapshotFilesystem", _SnapshotFilesystemMethod(), raising=True)
+
+    request = sr_pb2.TaskSnapshotFilesystemRequest(task_id="task-1", snapshot_id="snapshot-1")
+    with pytest.raises(ServiceError):
+        await client.snapshot_filesystem(request, timeout=10.0)  # generous timeout
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_filesystem_internal_retries_and_succeeds(make_router_client, monkeypatch):
+    client = make_router_client()
+
+    attempts = 0
+
+    class _SnapshotFilesystemMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskSnapshotFilesystemRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            nonlocal attempts
+            attempts += 1
+            # The per-call timeout is the remaining time on the overall
+            # deadline, so it's at most the originally specified value.
+            assert timeout is not None and timeout <= 0.5
+            if attempts == 1:
+                raise GRPCError(Status.INTERNAL, "transient internal error")
+            return sr_pb2.TaskSnapshotFilesystemResponse(image_id="im-123")
+
+    monkeypatch.setattr(client._stub, "TaskSnapshotFilesystem", _SnapshotFilesystemMethod(), raising=True)
+
+    request = sr_pb2.TaskSnapshotFilesystemRequest(task_id="task-1", snapshot_id="snapshot-1")
+    response = await client.snapshot_filesystem(request, timeout=0.5)
+
+    assert response.image_id == "im-123"
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_snapshot_filesystem_retry_uses_remaining_deadline(make_router_client, monkeypatch):
+    client = make_router_client()
+
+    per_call_timeouts: list[float] = []
+
+    class _SnapshotFilesystemMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskSnapshotFilesystemRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            assert timeout is not None
+            per_call_timeouts.append(timeout)
+            if len(per_call_timeouts) == 1:
+                # Burn ~half the overall budget then return a retryable error.
+                await asyncio.sleep(0.4)
+                raise GRPCError(Status.INTERNAL, "transient internal error")
+            return sr_pb2.TaskSnapshotFilesystemResponse(image_id="im-123")
+
+    monkeypatch.setattr(client._stub, "TaskSnapshotFilesystem", _SnapshotFilesystemMethod(), raising=True)
+
+    request = sr_pb2.TaskSnapshotFilesystemRequest(task_id="task-1", snapshot_id="snapshot-1")
+    response = await client.snapshot_filesystem(request, timeout=1.0)
+    assert response.image_id == "im-123"
+
+    assert len(per_call_timeouts) == 2
+    assert per_call_timeouts[0] <= 1.0
+    # The retry must see strictly less than the original timeout because
+    # ~0.4s of the budget was already consumed by the first attempt.
+    assert per_call_timeouts[1] < 0.7
+
+
+@pytest.mark.asyncio
+async def test_snapshot_filesystem_retries_resource_exhausted_with_server_retry_policy(make_router_client, monkeypatch):
+    client = make_router_client()
+
+    attempt_times: list[float] = []
+    throttle_retry_attempts: list[str] = []
+
+    class _SnapshotFilesystemMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskSnapshotFilesystemRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            attempt_times.append(time.monotonic())
+            throttle_retry_attempts.append((metadata or {})["x-throttle-retry-attempt"])
+            if len(attempt_times) == 1:
+                raise GRPCError(
+                    Status.RESOURCE_EXHAUSTED,
+                    "rate limit exceeded",
+                    details=[api_pb2.RPCRetryPolicy(retry_after_secs=0.2)],
+                )
+            return sr_pb2.TaskSnapshotFilesystemResponse(image_id="im-123")
+
+    monkeypatch.setattr(client._stub, "TaskSnapshotFilesystem", _SnapshotFilesystemMethod(), raising=True)
+
+    request = sr_pb2.TaskSnapshotFilesystemRequest(task_id="task-1", snapshot_id="snapshot-1")
+    response = await client.snapshot_filesystem(request, timeout=5.0)
+    assert response.image_id == "im-123"
+
+    assert len(attempt_times) == 2
+    # asyncio fires timers up to the monotonic clock's resolution early (~16ms on Windows).
+    clock_resolution = time.get_clock_info("monotonic").resolution
+    assert attempt_times[1] - attempt_times[0] >= 0.2 - clock_resolution
+    assert throttle_retry_attempts == ["0", "1"]
+
+
+@pytest.mark.asyncio
+async def test_throttled_retries_do_not_count_toward_max_retries():
+    attempts = 0
+
+    async def func():
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 3:
+            raise GRPCError(
+                Status.RESOURCE_EXHAUSTED,
+                "rate limit exceeded",
+                details=[api_pb2.RPCRetryPolicy(retry_after_secs=0.01)],
+            )
+        return "ok"
+
+    assert await call_with_retries_on_transient_errors(func, max_retries=1) == "ok"
+    assert attempts == 4
+
+
+@pytest.mark.asyncio
+async def test_throttled_retries_stop_at_max_throttle_wait(monkeypatch):
+    monkeypatch.setenv("MODAL_MAX_THROTTLE_WAIT", "0")
+    attempts = 0
+
+    async def func():
+        nonlocal attempts
+        attempts += 1
+        raise GRPCError(
+            Status.RESOURCE_EXHAUSTED,
+            "rate limit exceeded",
+            details=[api_pb2.RPCRetryPolicy(retry_after_secs=0.01)],
+        )
+
+    with pytest.raises(GRPCError) as exc_info:
+        await call_with_retries_on_transient_errors(func)
+    assert exc_info.value.status == Status.RESOURCE_EXHAUSTED
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_filesystem_resource_exhausted_without_retry_policy_is_not_retried(
+    make_router_client, monkeypatch
+):
+    client = make_router_client()
+
+    attempts = 0
+
+    class _SnapshotFilesystemMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskSnapshotFilesystemRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            nonlocal attempts
+            attempts += 1
+            raise GRPCError(Status.RESOURCE_EXHAUSTED, "rate limit exceeded")
+
+    monkeypatch.setattr(client._stub, "TaskSnapshotFilesystem", _SnapshotFilesystemMethod(), raising=True)
+
+    request = sr_pb2.TaskSnapshotFilesystemRequest(task_id="task-1", snapshot_id="snapshot-1")
+    with pytest.raises(ResourceExhaustedError):
+        await client.snapshot_filesystem(request, timeout=5.0)
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_filesystem_server_retry_policy_respects_deadline(make_router_client, monkeypatch):
+    client = make_router_client()
+
+    attempts = 0
+
+    class _SnapshotFilesystemMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskSnapshotFilesystemRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            nonlocal attempts
+            attempts += 1
+            raise GRPCError(
+                Status.RESOURCE_EXHAUSTED,
+                "rate limit exceeded",
+                details=[api_pb2.RPCRetryPolicy(retry_after_secs=10.0)],
+            )
+
+    monkeypatch.setattr(client._stub, "TaskSnapshotFilesystem", _SnapshotFilesystemMethod(), raising=True)
+
+    request = sr_pb2.TaskSnapshotFilesystemRequest(task_id="task-1", snapshot_id="snapshot-1")
+    started_at = time.monotonic()
+    with pytest.raises(ModalTimeoutError, match="Timeout expired"):
+        await client.snapshot_filesystem(request, timeout=0.3)
+
+    assert time.monotonic() - started_at < 0.3
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_filesystem_throttle_disabled_surfaces_resource_exhausted(make_router_client, monkeypatch):
+    monkeypatch.setenv("MODAL_MAX_THROTTLE_WAIT", "0")
+    client = make_router_client()
+
+    attempts = 0
+
+    class _SnapshotFilesystemMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskSnapshotFilesystemRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            nonlocal attempts
+            attempts += 1
+            raise GRPCError(
+                Status.RESOURCE_EXHAUSTED,
+                "rate limit exceeded",
+                details=[api_pb2.RPCRetryPolicy(retry_after_secs=10.0)],
+            )
+
+    monkeypatch.setattr(client._stub, "TaskSnapshotFilesystem", _SnapshotFilesystemMethod(), raising=True)
+
+    request = sr_pb2.TaskSnapshotFilesystemRequest(task_id="task-1", snapshot_id="snapshot-1")
+    with pytest.raises(ResourceExhaustedError):
+        await client.snapshot_filesystem(request, timeout=0.3)
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_filesystem_deadline_aborts_retries(make_router_client, monkeypatch):
+    client = make_router_client()
+
+    attempts = 0
+
+    class _SnapshotFilesystemMethod:
+        async def __call__(
+            self,
+            request: sr_pb2.TaskSnapshotFilesystemRequest,
+            *,
+            timeout: float | None = None,
+            metadata: dict | None = None,
+        ):
+            nonlocal attempts
+            attempts += 1
+            # Burn the full budget on the first call, then return a retryable error.
+            await asyncio.sleep(1.0)
+            raise GRPCError(Status.INTERNAL, "transient internal error")
+
+    monkeypatch.setattr(client._stub, "TaskSnapshotFilesystem", _SnapshotFilesystemMethod(), raising=True)
+
+    request = sr_pb2.TaskSnapshotFilesystemRequest(task_id="task-1", snapshot_id="snapshot-1")
+    with pytest.raises(ModalTimeoutError, match="Timeout expired"):
+        await client.snapshot_filesystem(request, timeout=0.5)
+
+    # Only the first call ran; the retry was aborted because the deadline had
+    # already elapsed by the time we got back to the retry loop.
+    assert attempts == 1
+
+
+class _SandboxStdioReadV2Stub:
+    """Test stub exposing only ``SandboxStdioReadV2`` for the V2 sandbox stdio path."""
+
+    def __init__(self, open_fn):
+        self.SandboxStdioReadV2 = _UnaryStreamMethod(open_fn)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_stdio_read_rebases_offset_on_transient_retry(make_router_client):
+    client = make_router_client()
+
+    num_attempts_made = 0
+    second_request_offset: int | None = None
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+            self._emitted = 0
+            self._last_req: sr_pb2.SandboxStdioReadV2Request | None = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.SandboxStdioReadV2Request, end: bool = True):  # noqa: ARG002
+            nonlocal second_request_offset
+            self._last_req = req
+            if num_attempts_made == 2:
+                second_request_offset = int(req.offset)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if num_attempts_made == 1:
+                if self._emitted == 0:
+                    self._emitted += 1
+                    return sr_pb2.SandboxStdioReadV2Response(data=b"abc", starting_offset=1000)
+                raise StreamTerminatedError("stream closed")
+            if self._emitted == 0:
+                self._emitted += 1
+                return sr_pb2.SandboxStdioReadV2Response(data=b"def", starting_offset=1003)
+            raise StopAsyncIteration
+
+    def _open(timeout: float | None = None):
+        nonlocal num_attempts_made
+        num_attempts_made += 1
+        return _Stream(timeout)
+
+    client._stub = _SandboxStdioReadV2Stub(_open)  # type: ignore[assignment]
+
+    out: list[bytes] = []
+    async for item in client.sandbox_stdio_read("task-1", api_pb2.FILE_DESCRIPTOR_STDOUT):
+        out.append(item.data)
+
+    assert out == [b"abc", b"def"]
+    assert second_request_offset == 1003
+
+
+@pytest.mark.asyncio
+async def test_sandbox_stdio_read_retry_budget_refills_after_progress(make_router_client):
+    # V2 sandbox counterpart of the exec test above: every attempt delivers one
+    # chunk and then fails with a transient error, for more disconnects than the
+    # retry budget allows. Each reopen must also request the byte after the last
+    # chunk, since the offset is rebased off ``starting_offset`` per attempt.
+    pieces = [b"one", b"two", b"three", b"four", b"five", b"six"]
+    piece_offsets = [sum(len(p) for p in pieces[:i]) for i in range(len(pieces) + 1)]
+
+    client = make_router_client(
+        stream_stdio_retry_delay_secs=0.001,
+        stream_stdio_retry_delay_factor=1.0,
+        stream_stdio_max_retries=2,
+    )
+
+    num_attempts_made = 0
+    requested_offsets: list[int] = []
+
+    class _Stream:
+        def __init__(self, timeout: float | None):
+            self._timeout = timeout
+            self._emitted = 0
+            self._last_req: sr_pb2.SandboxStdioReadV2Request | None = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001 - test helper
+            return False
+
+        async def send_message(self, req: sr_pb2.SandboxStdioReadV2Request, end: bool = True):  # noqa: ARG002
+            self._last_req = req
+            requested_offsets.append(int(req.offset))
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            assert self._last_req is not None
+            offset = int(self._last_req.offset)
+            start_idx = _start_index_for_offset(pieces, offset)
+            if start_idx >= len(pieces):
+                raise StopAsyncIteration
+            if self._emitted >= 1:
+                raise GRPCError(Status.UNAVAILABLE, "unavailable")
+            self._emitted += 1
+            return sr_pb2.SandboxStdioReadV2Response(data=pieces[start_idx], starting_offset=offset)
+
+    def _open(timeout: float | None = None):
+        nonlocal num_attempts_made
+        num_attempts_made += 1
+        return _Stream(timeout)
+
+    client._stub = _SandboxStdioReadV2Stub(_open)  # type: ignore[assignment]
+
+    out: list[bytes] = []
+    async for item in client.sandbox_stdio_read("task-1", api_pb2.FILE_DESCRIPTOR_STDOUT):
+        out.append(item.data)
+
+    assert out == pieces
+    # One attempt per chunk plus the final attempt that observes end of stream.
+    assert num_attempts_made == len(pieces) + 1
+    assert requested_offsets == piece_offsets
+
+
+@pytest.mark.asyncio
+async def test_task_command_router_client_closes_and_finalizes(make_router_client, monkeypatch):
+    channel = create_dummy_channel()
+    closed = False
+
+    def _close():
+        nonlocal closed
+        closed = True
+
+    monkeypatch.setattr(channel, "close", _close, raising=True)
+
+    client = make_router_client(
+        channel=channel,
+    )
+
+    await client.close()
+    await asyncio.sleep(0)
+
+    assert closed is True
+    assert not client._channel_finalizer.alive

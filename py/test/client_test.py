@@ -1,0 +1,790 @@
+# Copyright Modal Labs 2022
+import asyncio
+import base64
+import gc
+import hashlib
+import json
+import platform
+import pytest
+import subprocess
+import sys
+import urllib.parse
+import warnings
+import weakref
+
+import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from google.protobuf.empty_pb2 import Empty
+
+import modal._traceback
+import modal._utils.grpc_utils
+from modal import Client
+from modal._utils.async_utils import _shutdown_tasks, synchronizer
+from modal.client import _Client, _OAuthCredentials
+from modal.exception import (
+    AuthError,
+    ClientClosed,
+    ConflictError,
+    ConnectionError,
+    InternalAPIWarning,
+    InternalError,
+    InvalidError,
+    ServerWarning,
+)
+from modal.sandbox._impl_v2 import auth_metadata
+from modal_proto import api_pb2
+
+from .supports.skip import skip_bazel, skip_windows, skip_windows_unix_socket
+
+TEST_TIMEOUT = 4.0  # align this with the container client timeout in client.py
+
+
+def test_close_releases_loops_and_callers(server_url_env, credentials):
+    class Payload:
+        data = bytes(1024 * 1024)
+
+    async def cycle():
+        payload = Payload()
+        client = await _Client.from_credentials(*credentials)
+        refs = [weakref.ref(obj) for obj in (payload, client, asyncio.get_running_loop())]
+        await client.close()
+        return refs
+
+    count = len(_shutdown_tasks)
+    for _ in range(5):
+        refs = asyncio.run(cycle())
+        gc.collect()
+        assert all(ref() is None for ref in refs)
+        assert len(_shutdown_tasks) == count
+
+
+@pytest.mark.parametrize("oauth", [False, True])
+def test_credentials_context_manager(servicer, server_url_env, credentials, oauth):
+    token_id, token_secret = credentials
+    if oauth:
+        private_key_pem, _ = _rsa_private_key_pem()
+        client = Client.from_oauth_credentials(
+            f"{token_id}.{token_secret}", oauth_client_id="oc-client", oauth_jwt_key=private_key_pem
+        )
+    else:
+        client = Client.from_credentials(*credentials)
+    with client as entered:
+        assert entered is client
+        client.hello()
+    assert client.is_closed()
+    client.close()
+    with pytest.raises(ClientClosed):
+        client.hello()
+
+
+@pytest.mark.asyncio
+async def test_public_close_async(servicer, server_url_env, credentials):
+    async with await Client.from_credentials.aio(*credentials) as client:
+        await client.hello.aio()
+    await client.close.aio()
+    with pytest.raises(ClientClosed):
+        await client.hello.aio()
+
+
+def test_close_preserves_env_client(servicer, server_url_env, token_env):
+    env_client = Client.from_env()
+    client = Client.from_credentials("ak-other", "as-other")
+    client.close()
+    assert Client.from_env() is env_client
+    env_client.hello()
+
+
+def test_close_releases_public_client(server_url_env, credentials):
+    client = Client.from_credentials(*credentials)
+    ref = weakref.ref(client)
+    client.close()
+    del client
+    gc.collect()
+    assert ref() is None
+
+
+@pytest.mark.asyncio
+async def test_close_releases_input_plane_stubs(servicer, server_url_env, credentials):
+    client = await _Client.from_credentials(*credentials)
+    stub = await client._get_stub(servicer.client_addr)
+    manager = weakref.ref(client._connection_manager)
+    auth = weakref.ref(client._auth_token_manager)
+    await client.close()
+    assert client._cancellation_context_event_loop is None
+    gc.collect()
+    assert manager() is None
+    assert auth() is None
+    with pytest.raises(ClientClosed):
+        await stub.ClientHello(Empty())
+    with pytest.raises(ClientClosed):
+        await client.get_input_plane_metadata("us-east")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("private_close", [False, True])
+async def test_enter_closed_client(server_url_env, credentials, private_close):
+    client = await _Client.from_credentials(*credentials)
+    if private_close:
+        await client.close()
+    else:
+        await client.close()
+    with pytest.raises(ClientClosed):
+        async with client:
+            pytest.fail("Closed clients must not reopen")
+
+
+@pytest.mark.asyncio
+async def test_snapshot_prep_closed_client(server_url_env, credentials):
+    client = await _Client.from_credentials(*credentials)
+    await client.close()
+    with pytest.raises(ClientClosed):
+        await client._prep_for_snapshot()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_prep_preserves_shutdown_hook(server_url_env, credentials):
+    tasks = _shutdown_tasks.copy()
+    count = len(tasks)
+    client = await _Client.from_credentials(*credentials)
+    (task,) = _shutdown_tasks - tasks
+    auth_manager = client._auth_token_manager
+    stub = client._stub
+    await client._prep_for_snapshot()
+    assert not client.is_closed()
+    assert client._auth_token_manager is auth_manager
+    assert task in _shutdown_tasks
+    assert not task.done()
+    await client.close()
+    assert client.is_closed()
+    assert client._auth_token_manager is None
+    assert client._control_plane_stub is None
+    assert client._connection_manager is None
+    await client.close()
+    with pytest.raises(ClientClosed):
+        await client.hello()
+    with pytest.raises(ClientClosed):
+        await stub.ClientHello(Empty())
+    assert task not in _shutdown_tasks
+    assert len(_shutdown_tasks) == count
+
+
+@pytest.mark.asyncio
+async def test_client_reopens_after_pid_change(servicer, server_url_env, credentials):
+    client = await _Client.from_credentials(*credentials)
+    inherited_unregister = getattr(client, "_shutdown_unregister")
+    tasks = _shutdown_tasks.copy()
+    try:
+        client._connection_manager.close()
+        setattr(client, "_owner_pid", -1)
+        await client.hello()
+        assert getattr(client, "_shutdown_unregister") is not inherited_unregister
+        assert tasks <= _shutdown_tasks
+        (task,) = _shutdown_tasks - tasks
+        assert task.get_loop() is asyncio.get_running_loop()
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert client.is_closed()
+        assert task not in _shutdown_tasks
+    finally:
+        assert inherited_unregister is not None
+        inherited_unregister()
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation", ["control_plane_rpc", "input_plane_metadata", "sandbox_auth_metadata", "input_plane_rpc"]
+)
+async def test_client_usable_after_snapshot_prep(servicer, server_url_env, token_env, operation):
+    """A client retained across a memory snapshot remains usable after restore."""
+    _Client._set_env_client(None)
+    client = await _Client.from_env()
+    try:
+        await client.hello()
+        await client._prep_for_snapshot()
+        assert not client.is_closed()
+        assert _Client._client_from_env is None
+        if operation == "control_plane_rpc":
+            assert await client._stub.ClientHello(Empty()) == api_pb2.ClientHelloResponse()
+        elif operation == "input_plane_metadata":
+            metadata = dict(await client.get_input_plane_metadata("us-east"))
+            assert metadata["x-modal-input-plane-region"] == "us-east"
+            assert metadata["x-modal-auth-token"] == servicer.auth_token
+        elif operation == "sandbox_auth_metadata":
+            assert await auth_metadata(client) == [("x-modal-auth-token", servicer.auth_token)]
+        else:
+            stub = await client._get_stub(servicer.client_addr)
+            assert await stub.ClientHello(Empty()) == api_pb2.ClientHelloResponse()
+    finally:
+        env_client = _Client._client_from_env
+        await client.close()
+        if env_client is not None:
+            await env_client.close()
+        _Client._set_env_client(None)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_client_creates_new_stub(servicer, server_url_env, token_env):
+    _Client._set_env_client(None)
+    client = await _Client.from_env()
+    try:
+        await client._prep_for_snapshot()
+        stub = await client._get_stub(servicer.client_addr + "/")
+        assert await stub.ClientHello(Empty()) == api_pb2.ClientHelloResponse()
+    finally:
+        env_client = _Client._client_from_env
+        await client.close()
+        if env_client is not None:
+            await env_client.close()
+        _Client._set_env_client(None)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_client_fetches_fresh_sandbox_auth_token(servicer, server_url_env, token_env):
+    _Client._set_env_client(None)
+    servicer.auth_token_per_request = True
+    client = await _Client.from_env()
+    try:
+        before = await auth_metadata(client)
+        assert await auth_metadata(client) == before
+        assert servicer.auth_tokens_generated == 1
+        assert jwt.decode(before[0][1], options={"verify_signature": False})["exp"] == 4102444800
+
+        await client._prep_for_snapshot()
+        assert servicer.auth_tokens_generated == 1
+        after = await auth_metadata(client)
+        assert servicer.auth_tokens_generated == 2
+        assert after != before
+    finally:
+        env_client = _Client._client_from_env
+        await client.close()
+        if env_client is not None:
+            await env_client.close()
+        _Client._set_env_client(None)
+
+
+def _rsa_private_key_pem(key_size: int = 2048) -> tuple[str, rsa.RSAPrivateKey]:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
+    private_key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    return private_key_pem, private_key
+
+
+def _rsa_public_key_pem() -> str:
+    _, private_key = _rsa_private_key_pem()
+    return (
+        private_key.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode()
+    )
+
+
+def _encrypted_rsa_private_key_pem() -> str:
+    _, private_key = _rsa_private_key_pem()
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.BestAvailableEncryption(b"passphrase"),
+    ).decode()
+
+
+def _ec_private_key_pem() -> str:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+
+def test_client_type(servicer, client):
+    assert len(servicer.requests) == 0
+    client.hello()
+    assert len(servicer.requests) == 1
+    assert isinstance(servicer.requests[0], Empty)
+    assert servicer.last_metadata["x-Alingo-Modal-Core-type"] == str(api_pb2.CLIENT_TYPE_CLIENT)
+
+
+def test_client_stub_access_warns(servicer, client):
+    with pytest.warns(InternalAPIWarning, match="Client.stub"):
+        client.stub
+
+
+def test_client_get_stub_access_warns(servicer, client):
+    with pytest.warns(InternalAPIWarning, match="Client.get_stub"):
+        client.get_stub(servicer.client_addr)
+
+
+def test_client_stub_access_warns_once(servicer, client):
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("default")
+        for _ in range(3):
+            client.stub
+        client.stub
+    assert len([w for w in record if issubclass(w.category, InternalAPIWarning)]) == 1
+
+
+def test_sdk_rpcs_do_not_warn(servicer, client):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", InternalAPIWarning)
+        client.hello()
+        modal.Dict.from_name("my-dict", create_if_missing=True, client=client).hydrate()
+
+
+CHALLENGING_PLATFORM_NODE = "\0äbc \n"
+
+
+@pytest.fixture
+def _patch_platform_node(monkeypatch):
+    # Platform info is read when the client is created, so have to patch it before the fixture is requested
+    monkeypatch.setattr("modal.client.platform.node", lambda: CHALLENGING_PLATFORM_NODE)
+
+
+def test_client_node_string(servicer, _patch_platform_node, client):
+    client.hello()
+    platform_str = urllib.parse.unquote(servicer.last_metadata["x-modal-node"])
+    assert platform_str == CHALLENGING_PLATFORM_NODE
+
+
+def test_client_platform_string(servicer, client):
+    client.hello()
+    platform_str = urllib.parse.unquote(servicer.last_metadata["x-modal-platform"])
+    system, release, machine = platform_str.split("-")
+    if platform.system() == "Darwin":
+        assert system == "macOS"
+        assert release == platform.mac_ver()[0].replace("-", "_")
+    else:
+        assert system == platform.system().replace("-", "_")
+        assert release == platform.release().replace("-", "_")
+    assert machine == platform.machine().replace("-", "_")
+
+
+@pytest.mark.asyncio
+async def test_container_client_type(servicer, container_client):
+    await container_client.hello.aio()
+    assert len(servicer.requests) == 1
+    assert isinstance(servicer.requests[0], Empty)
+    assert servicer.last_metadata["x-Alingo-Modal-Core-type"] == str(api_pb2.CLIENT_TYPE_CONTAINER)
+
+
+@pytest.mark.asyncio
+async def test_get_stub_is_cached_per_server_url(servicer, client):
+    _client = synchronizer._translate_in(client)
+    stub = await _client._get_stub(servicer.client_addr)
+    assert await _client._get_stub(servicer.client_addr) is stub
+    assert await _client._get_stub(servicer.container_addr) is not stub
+
+    await stub.ClientHello(Empty())
+    assert isinstance(servicer.requests[-1], Empty)
+
+
+@pytest.fixture
+def no_retry_connect_channel(monkeypatch):
+    # Make the error appear faster during test by skipping the connection retry/backoff.
+    org_create_channel = modal._utils.grpc_utils.create_channel_with_fallbacks
+    # __wrapped__ is set by functools.wraps inside @retry, but isn't part of its return type.
+    monkeypatch.setattr(modal._utils.grpc_utils, "create_channel_with_fallbacks", org_create_channel.__wrapped__)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(TEST_TIMEOUT)
+@skip_bazel("DNS resolution for .invalid TLD times out in Bazel sandbox")
+async def test_client_dns_failure(no_retry_connect_channel):
+    with pytest.raises(ConnectionError) as excinfo:
+        async with Client("https://xyz.invalid", api_pb2.CLIENT_TYPE_CONTAINER, None):
+            pass
+    assert excinfo.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(TEST_TIMEOUT)
+@skip_windows("Windows test crashes on connection failure")
+async def test_client_connection_failure(no_retry_connect_channel):
+    with pytest.raises(ConnectionError) as excinfo:
+        async with Client("https://localhost:443", api_pb2.CLIENT_TYPE_CONTAINER, None):
+            pass
+    assert excinfo.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(TEST_TIMEOUT)
+@skip_windows_unix_socket
+async def test_client_connection_failure_unix_socket(no_retry_connect_channel):
+    with pytest.raises(ConnectionError) as excinfo:
+        async with Client("unix:/tmp/xyz.txt", api_pb2.CLIENT_TYPE_CONTAINER, None):
+            pass
+    assert excinfo.value
+
+
+@pytest.mark.asyncio
+async def test_client_old_version(servicer, credentials):
+    async with Client(servicer.client_addr, api_pb2.CLIENT_TYPE_CLIENT, credentials, version="0.0.0") as client:
+        with pytest.raises(ConflictError, match="Old client"):
+            await client.hello.aio()
+
+
+@pytest.mark.asyncio
+async def test_client_deprecated(servicer, credentials):
+    async with Client(servicer.client_addr, api_pb2.CLIENT_TYPE_CLIENT, credentials, version="deprecated") as client:
+        with pytest.warns(ServerWarning):
+            await client.hello.aio()
+
+
+@pytest.fixture
+def fresh_server_warnings():
+    """Clear the process-global state that suppresses repeats of a server warning."""
+    modal._traceback._server_warning_registry.clear()
+
+
+@pytest.mark.asyncio
+async def test_server_warning_header(servicer, credentials, fresh_server_warnings):
+    servicer.client_hello_warnings = ["watch out, `foo` is deprecated", "and 100% of `bar` too"]
+    async with Client(servicer.client_addr, api_pb2.CLIENT_TYPE_CLIENT, credentials) as client:
+        with pytest.warns(ServerWarning) as record:
+            await client.hello.aio()
+        assert [str(w.message) for w in record] == servicer.client_hello_warnings
+
+
+@pytest.mark.asyncio
+async def test_server_warning_header_on_failed_request(servicer, credentials, fresh_server_warnings):
+    servicer.client_hello_warnings = ["something to say about the request that just failed"]
+    servicer.client_hello_error = "everything is on fire"
+    async with Client(servicer.client_addr, api_pb2.CLIENT_TYPE_CLIENT, credentials) as client:
+        with pytest.warns(ServerWarning, match="something to say"):
+            with pytest.raises(InternalError, match="everything is on fire"):
+                await client.hello.aio()
+
+
+@pytest.mark.asyncio
+async def test_client_unauthenticated(servicer):
+    with pytest.raises(AuthError):
+        async with Client(servicer.client_addr, api_pb2.CLIENT_TYPE_CLIENT, None, version="unauthenticated") as client:
+            await client.hello.aio()
+
+
+def client_from_env(client_addr, credentials):
+    token_id, token_secret = credentials
+    _override_config = {
+        "server_url": client_addr,
+        "token_id": token_id,
+        "token_secret": token_secret,
+        "task_id": None,
+        "task_secret": None,
+    }
+    client = Client.from_env(_override_config=_override_config)
+    client.hello()
+    return client
+
+
+def test_client_from_env_client(servicer, credentials):
+    client_1 = client_from_env(servicer.client_addr, credentials)
+    client_2 = client_from_env(servicer.client_addr, credentials)
+    assert isinstance(client_1, Client)
+    assert isinstance(client_2, Client)
+    assert client_1 == client_2
+
+
+def test_client_from_env_oauth_jwt_key(servicer, credentials):
+    token_id, token_secret = credentials
+    servicer.required_creds = {token_id: token_secret}
+    private_key_pem, _ = _rsa_private_key_pem()
+    override_config = {
+        "server_url": servicer.client_addr,
+        "token_id": None,
+        "token_secret": None,
+        "oauth_refresh_token": f"{token_id}.{token_secret}",
+        "oauth_client_id": "oc-client-id",
+        "oauth_jwt_key": private_key_pem.replace("\n", "\\n"),
+    }
+
+    client = Client.from_env(_override_config=override_config)
+    client.hello()
+
+    assert servicer.last_metadata["x-modal-oauth-client-id"] == "oc-client-id"
+    assert servicer.last_metadata["x-modal-oauth-client-assertion"]
+
+
+@pytest.mark.parametrize(
+    "override_config",
+    [
+        {
+            "oauth_refresh_token": "ak-token.as-secret",
+            "oauth_client_id": "oc-client-id",
+        },
+        {
+            "oauth_refresh_token": "ak-token.as-secret",
+            "oauth_client_id": None,
+            "oauth_jwt_key": "private-key",
+        },
+        {
+            "oauth_refresh_token": None,
+            "oauth_client_id": "oc-client-id",
+            "oauth_jwt_key": "private-key",
+        },
+    ],
+)
+def test_client_from_env_rejects_incomplete_oauth_credentials(servicer, override_config):
+    full_config = {
+        "server_url": servicer.client_addr,
+        "token_id": None,
+        "token_secret": None,
+        **override_config,
+    }
+
+    with pytest.raises(InvalidError, match="must be configured"):
+        Client.from_env(_override_config=full_config)
+
+
+def test_client_from_env_rejects_mixed_token_and_oauth_credentials(servicer, credentials):
+    token_id, token_secret = credentials
+    override_config = {
+        "server_url": servicer.client_addr,
+        "token_id": token_id,
+        "token_secret": token_secret,
+        "oauth_refresh_token": f"{token_id}.{token_secret}",
+        "oauth_client_id": "oc-client-id",
+        "oauth_jwt_key": "private-key",
+    }
+
+    with pytest.raises(InvalidError, match="cannot both be configured"):
+        Client.from_env(_override_config=override_config)
+
+
+def test_client_from_env_failing(servicer, credentials, monkeypatch):
+    monkeypatch.setattr(modal._utils.async_utils, "RETRY_N_ATTEMPTS_OVERRIDE", 1)
+    with pytest.raises(ConnectionError):
+        client_from_env("https://foo.invalid", credentials)
+
+
+def test_client_from_env_reset(servicer, credentials):
+    client_1 = client_from_env(servicer.client_addr, credentials)
+    Client._set_env_client(None)
+    client_2 = client_from_env(servicer.client_addr, credentials)
+    assert client_1 != client_2
+
+
+def test_client_token_auth_in_sandbox(servicer, credentials, monkeypatch) -> None:
+    """Ensure that clients can connect with token credentials inside a sandbox.
+
+    This test is needed so that modal.com/playground works, since it relies on
+    running a sandbox with token credentials. Also, `modal shell` uses this to
+    preserve its auth context inside the shell.
+    """
+    monkeypatch.setenv("MODAL_TASK_ID", "ta-123")
+    _client = client_from_env(servicer.client_addr, credentials)
+    assert servicer.last_metadata["x-Alingo-Modal-Core-type"] == str(api_pb2.CLIENT_TYPE_CLIENT)
+
+
+def test_multiple_profile_error(servicer, modal_config):
+    config = """
+    [prof-1]
+    token_id = 'ak-abc'
+    token_secret = 'as_xyz'
+    active = true
+
+    [prof-2]
+    token_id = 'ak-abc'
+    token_secret = 'as_xyz'
+    active = true
+    """
+    with modal_config(config):
+        with pytest.raises(InvalidError, match="More than one Modal profile is active"):
+            Client.from_env()
+
+
+def test_implicit_default_profile_warning(servicer, modal_config, server_url_env):
+    config = """
+    [default]
+    token_id = 'ak-abc'
+    token_secret = 'as_xyz'
+
+    [other]
+    token_id = 'ak-abc'
+    token_secret = 'as_xyz'
+    """
+    with modal_config(config):
+        with pytest.raises(InvalidError, match="No Modal profile is active"):
+            Client.from_env()
+
+    config = """
+    [default]
+    token_id = 'ak-abc'
+    token_secret = 'as_xyz'
+    """
+    with modal_config(config):
+        servicer.required_creds = {"ak-abc": "as_xyz"}
+        # A single profile should be fine, even if not explicitly active and named 'default'
+        Client.from_env()
+
+
+def test_import_modal_from_thread(supports_dir):
+    # this mainly ensures that we don't make any assumptions about which thread *imports* modal
+    # For example, in Python <3.10, creating loop-bound asyncio primitives in global scope would
+    # trigger an exception if there is no event loop in the thread (and it's not the main thread)
+    subprocess.check_call([sys.executable, supports_dir / "import_modal_from_thread.py"])
+
+
+def test_from_env_container(servicer, container_env):
+    servicer.required_creds = {}  # Disallow default client creds
+    client = Client.from_env()
+    client.hello()
+    assert servicer.last_metadata["x-Alingo-Modal-Core-type"] == str(api_pb2.CLIENT_TYPE_CONTAINER)
+
+
+def test_from_env_container_with_tokens(servicer, container_env, token_env):
+    # Even if MODAL_TOKEN_ID and MODAL_TOKEN_SECRET are set, ignore them inside containers.
+    servicer.required_creds = {}  # Disallow default client creds
+    with pytest.warns(match="MODAL_TOKEN_ID, MODAL_TOKEN_SECRET") as warning_records:
+        client = Client.from_env()
+    assert "MODAL_OAUTH" not in str(warning_records[0].message)
+    client.hello()
+    assert servicer.last_metadata["x-Alingo-Modal-Core-type"] == str(api_pb2.CLIENT_TYPE_CONTAINER)
+
+
+@pytest.mark.parametrize(
+    "env_var",
+    ["MODAL_OAUTH_REFRESH_TOKEN", "MODAL_OAUTH_CLIENT_ID", "MODAL_OAUTH_JWT_KEY"],
+)
+def test_from_env_container_with_partial_oauth_credentials(servicer, container_env, monkeypatch, env_var):
+    monkeypatch.setenv(env_var, "oauth-value")
+    servicer.required_creds = {}  # Disallow default client creds
+    with pytest.warns(match=env_var):
+        client = Client.from_env()
+    client.hello()
+    assert servicer.last_metadata["x-Alingo-Modal-Core-type"] == str(api_pb2.CLIENT_TYPE_CONTAINER)
+
+
+def test_from_credentials_client(servicer, set_env_client, server_url_env, token_env):
+    # Note: this explicitly uses a lot of fixtures to make sure those are ignored
+    token_id = "ak-foo-1"
+    token_secret = "as-bar"
+    servicer.required_creds = {token_id: token_secret}
+    client = Client.from_credentials(token_id, token_secret)
+    client.hello()
+    assert servicer.last_metadata["x-Alingo-Modal-Core-type"] == str(api_pb2.CLIENT_TYPE_CLIENT)
+
+
+def test_from_credentials_container(servicer, container_env):
+    token_id = "ak-foo-2"
+    token_secret = "as-bar"
+    servicer.required_creds = {token_id: token_secret}
+    client = Client.from_credentials(token_id, token_secret)
+    client.hello()
+    assert servicer.last_metadata["x-Alingo-Modal-Core-type"] == str(api_pb2.CLIENT_TYPE_CLIENT)
+
+
+def test_from_oauth_credentials_with_jwt_key(servicer, server_url_env, credentials):
+    token_id, token_secret = credentials
+    servicer.required_creds = {token_id: token_secret}
+    private_key_pem, private_key = _rsa_private_key_pem()
+    client = Client.from_oauth_credentials(
+        f"{token_id}.{token_secret}",
+        oauth_client_id="oc-client-id",
+        oauth_jwt_key=private_key_pem,
+    )
+
+    client.hello()
+    first_assertion = servicer.last_metadata["x-modal-oauth-client-assertion"]
+    client.hello()
+    second_assertion = servicer.last_metadata["x-modal-oauth-client-assertion"]
+
+    assert servicer.last_metadata["x-modal-refresh-token"] == f"{token_id}.{token_secret}"
+    assert "x-modal-token-id" not in servicer.last_metadata
+    assert "x-modal-token-secret" not in servicer.last_metadata
+    assert first_assertion != second_assertion
+    for assertion in (first_assertion, second_assertion):
+        claims = jwt.decode(
+            assertion,
+            private_key.public_key(),
+            algorithms=["RS256"],
+            audience="modal-server",
+        )
+        assert claims["iss"] == "oc-client-id"
+        assert claims["sub"] == "oc-client-id"
+        assert claims["exp"] - claims["iat"] == 5 * 60
+        assert claims["jti"]
+
+        public_jwk = jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key(), as_dict=True)
+        thumbprint_jwk = {field: public_jwk[field] for field in ("e", "kty", "n")}
+        canonical_jwk = json.dumps(thumbprint_jwk, sort_keys=True, separators=(",", ":")).encode()
+        expected_kid = base64.urlsafe_b64encode(hashlib.sha256(canonical_jwk).digest()).rstrip(b"=").decode()
+        assert jwt.get_unverified_header(assertion) == {"alg": "RS256", "kid": expected_kid, "typ": "JWT"}
+
+
+def test_oauth_credentials_repr_redacts_secrets():
+    credentials = _OAuthCredentials(
+        refresh_token="refresh-token",
+        client_id="client-id",
+        jwt_key="private-key",
+    )
+
+    assert repr(credentials) == "_OAuthCredentials(client_id='client-id')"
+
+
+@pytest.mark.parametrize(
+    ("refresh_token", "oauth_client_id", "oauth_jwt_key"),
+    [
+        ("", "oc-client-id", "private-key"),
+        ("refresh-token", "", "private-key"),
+        ("refresh-token", "oc-client-id", ""),
+    ],
+)
+def test_from_oauth_credentials_rejects_missing_credentials(monkeypatch, refresh_token, oauth_client_id, oauth_jwt_key):
+    monkeypatch.setenv("MODAL_SERVER_URL", "http://localhost:1234")
+    with pytest.raises(AuthError, match="must be provided"):
+        Client.from_oauth_credentials(
+            refresh_token,
+            oauth_client_id=oauth_client_id,
+            oauth_jwt_key=oauth_jwt_key,
+        )
+
+
+@pytest.mark.parametrize(
+    ("make_jwt_key", "error_match"),
+    [
+        (lambda: "not a private key", "RSA private key encoded as PEM"),
+        (_encrypted_rsa_private_key_pem, "RSA private key encoded as PEM"),
+        (_rsa_public_key_pem, "must be an RSA private key"),
+        (_ec_private_key_pem, "RSA private key"),
+        (lambda: _rsa_private_key_pem(key_size=1024)[0], "at least 2048 bits"),
+    ],
+    ids=["garbage", "encrypted", "public-key", "ec-key", "short-key"],
+)
+def test_from_oauth_credentials_rejects_invalid_jwt_key(monkeypatch, make_jwt_key, error_match):
+    monkeypatch.setenv("MODAL_SERVER_URL", "http://localhost:1234")
+    with pytest.raises(InvalidError, match=error_match):
+        Client.from_oauth_credentials(
+            "refresh-token",
+            oauth_client_id="oc-client-id",
+            oauth_jwt_key=make_jwt_key(),
+        )
+
+
+def test_client_verify(
+    servicer,
+    client,
+    monkeypatch,
+):
+    monkeypatch.setattr(modal._utils.async_utils, "RETRY_N_ATTEMPTS_OVERRIDE", 1)
+    token_id = "ak-foo-2"
+    token_secret = "as-bar"
+    servicer.required_creds = {token_id: token_secret}
+
+    assert len(servicer.requests) == 0
+    client.verify(servicer.client_addr, (token_id, token_secret))
+    assert len(servicer.requests) == 1
+
+    with pytest.raises(AuthError):
+        client.verify(servicer.client_addr, ("foo", "bar"))
+
+    with pytest.raises(ConnectionError):
+        client.verify("https://localhost:443", ("foo", "bar"))

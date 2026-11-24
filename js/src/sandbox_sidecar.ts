@@ -1,0 +1,656 @@
+import { ClientError, Status } from "nice-grpc";
+import { v4 as uuidv4 } from "uuid";
+
+import {
+  GenericResult,
+  GenericResult_GenericStatus,
+  VolumeMount,
+} from "../proto/modal_proto/api";
+import {
+  TaskContainerGetRequest,
+  TaskContainerInfo,
+  TaskContainerListRequest,
+  TaskContainerTerminateRequest,
+  TaskContainerWaitRequest,
+  TaskUnmountDirectoryRequest,
+} from "../proto/modal_proto/task_command_router";
+import {
+  buildOutboundNetworkAccess,
+  buildTaskMountDirectoryRequestProto,
+  buildTaskSnapshotDirectoryRequestProto,
+  ContainerProcess,
+  defaultSandboxPTYInfo,
+  getReturnCode,
+  hydrateSandboxSecrets,
+  resolveMountImageId,
+  resolveTtlSeconds,
+  validateExecArgs,
+  validateWorkdir,
+  type SandboxExecParams,
+  type SandboxMountImageParams,
+  type SandboxSnapshotDirectoryParams,
+} from "./sandbox";
+import { SandboxFilesystem } from "./sandbox_fs";
+import type {
+  SidecarCreateOptions,
+  SidecarCreateRequest,
+  SidecarCreateResult,
+} from "./sandbox_common";
+import type { TaskCommandRouterClientImpl } from "./task_command_router_client";
+import {
+  AlreadyExistsError,
+  InternalFailure,
+  InvalidError,
+  NotFoundError,
+} from "./errors";
+import { Image } from "./image";
+import type { ModalClient } from "./client";
+import {
+  buildCloudBucketMountProtos,
+  type CloudBucketMount,
+} from "./cloud_bucket_mount";
+import {
+  collectSecretIds,
+  resolvableSecrets,
+  secretSources,
+  validateEnvVarKeys,
+  type Secret,
+} from "./secret";
+import type { Proxy } from "./proxy";
+import { volumeToMountProto, type Volume } from "./volume";
+
+/** Reserved name of a Sandbox's main container. */
+const MAIN_CONTAINER_NAME = "main";
+
+/**
+ * Per-RPC server-side wait timeout (in seconds) used while polling for a
+ * sidecar container's terminal status.
+ */
+const CONTAINER_WAIT_POLL_TIMEOUT_SECONDS = 10;
+
+type SandboxSidecarCommandRouter = Pick<
+  TaskCommandRouterClientImpl,
+  | "containerCreate"
+  | "containerGet"
+  | "containerList"
+  | "containerTerminate"
+  | "containerWait"
+  | "mountDirectory"
+  | "snapshotDirectory"
+  | "unmountDirectory"
+>;
+
+type SandboxSidecarAccess = {
+  client: ModalClient;
+  ensureAttached(): void;
+  validateCreate(options: SidecarCreateOptions): void;
+  create(request: SidecarCreateRequest): Promise<SidecarCreateResult>;
+  exec(
+    command: string[],
+    params: SandboxExecParams | undefined,
+    containerId: string,
+  ): Promise<ContainerProcess>;
+  commandRouter(): Promise<[string, SandboxSidecarCommandRouter]>;
+  reloadVolumes(
+    containerId: string,
+    params: SidecarReloadVolumesParams | undefined,
+  ): Promise<void>;
+  snapshotFilesystem(
+    containerId: string,
+    params: SidecarSnapshotFilesystemParams | undefined,
+  ): Promise<Image>;
+};
+
+/** Options for {@link SidecarService#create SidecarService.create()}. */
+export type SidecarCreateParams = {
+  /** Command to run in the sidecar container on startup. */
+  command?: string[];
+  /** Environment variables to set in the sidecar container. */
+  env?: Record<string, string>;
+  /** {@link Secret}s to inject into the sidecar container as environment variables. */
+  secrets?: Secret[];
+  /** Working directory of the sidecar container. */
+  workdir?: string;
+  /** Mount points for Modal {@link Volume}s. */
+  volumes?: Record<string, Volume>;
+  /**
+   * Mount points for Modal {@link CloudBucketMount}s. Not supported for GPU
+   * Sandboxes.
+   */
+  cloudBucketMounts?: Record<string, CloudBucketMount>;
+  /**
+   * List of CIDRs the sidecar is allowed to access. Independent of the main
+   * container; if not set, all CIDRs are allowed. An empty list blocks all
+   * external egress while preserving connectivity to the main container.
+   */
+  outboundCidrAllowlist?: string[];
+  /**
+   * List of domain names the sidecar is allowed to access. Supports wildcard
+   * prefixes (`*.example.com`). Independent of the main container.
+   */
+  outboundDomainAllowlist?: string[];
+  /**
+   * If true, the sidecar receives a MODAL_IDENTITY_TOKEN env var for
+   * OIDC-based auth (e.g. to AWS, GCP). The token identifies the sidecar
+   * container itself, not the main container. Not supported for GPU
+   * Sandboxes.
+   */
+  includeOidcIdentityToken?: boolean;
+  /**
+   * {@link Proxy} to route the sidecar's outbound traffic through, giving it
+   * a static outbound IP of its own, independent of the main container. Not
+   * supported for GPU Sandboxes.
+   */
+  proxy?: Proxy;
+  /** Enable a PTY for the sidecar. */
+  pty?: boolean;
+  /**
+   * Memory, in MiB, the sidecar consumes from the Sandbox's sidecar memory
+   * reserve (the `vm_sidecar_memory_reserve_mib` experimental option); unset
+   * consumes whatever is left of it. Ignored by Sandboxes without a reserve.
+   * Experimental.
+   */
+  experimentalMemoryReserveConsumeMiB?: number;
+};
+
+/** Options for {@link SidecarService#get SidecarService.get()}. */
+export type SidecarGetParams = {
+  /** If true, return the latest container with the name even if it has terminated. */
+  includeTerminated?: boolean;
+};
+
+/** Options for {@link SidecarService#list SidecarService.list()}. */
+export type SidecarListParams = {
+  /** If true, include terminated containers. */
+  includeTerminated?: boolean;
+};
+
+/** Options for {@link SidecarContainer#exec SidecarContainer.exec()}. */
+export type SidecarExecParams = SandboxExecParams;
+
+/** Options for {@link SidecarContainer#terminate SidecarContainer.terminate()}. */
+export type SidecarTerminateParams = {
+  /** If true, wait for the sidecar container to terminate. */
+  wait?: boolean;
+};
+
+/** Optional parameters for {@link SidecarContainer#snapshotFilesystem SidecarContainer.snapshotFilesystem()}. */
+export type SidecarSnapshotFilesystemParams = {
+  /** Overall budget for the snapshot call, in milliseconds. Defaults to 55000. */
+  timeoutMs?: number;
+  /** Lifetime of the resulting image in milliseconds. Defaults to 30 days. Pass `null` for no expiry. */
+  ttlMs?: number | null;
+};
+
+/** Optional parameters for {@link SidecarContainer#reloadVolumes SidecarContainer.reloadVolumes()}. */
+export type SidecarReloadVolumesParams = {
+  /** Overall budget in milliseconds. Defaults to 55000. */
+  timeoutMs?: number;
+};
+
+/** Optional parameters for {@link SidecarContainer#mountImage SidecarContainer.mountImage()}. */
+export type SidecarMountImageParams = SandboxMountImageParams;
+
+/** Optional parameters for {@link SidecarContainer#unmountImage SidecarContainer.unmountImage()}. */
+export type SidecarUnmountImageParams = Record<string, never>;
+
+/** Optional parameters for {@link SidecarContainer#snapshotDirectory SidecarContainer.snapshotDirectory()}. */
+export type SidecarSnapshotDirectoryParams = SandboxSnapshotDirectoryParams;
+
+function validateSidecarName(name: string): void {
+  if (name === "") {
+    throw new InvalidError("sidecar name must not be empty");
+  }
+  if (name === MAIN_CONTAINER_NAME) {
+    throw new InvalidError(
+      `the name "${MAIN_CONTAINER_NAME}" is reserved for the Sandbox's main ` +
+        `container. Use the Sandbox methods directly to interact with it`,
+    );
+  }
+}
+
+function buildSidecarVolumeMounts(
+  volumes: Record<string, Volume> | undefined,
+): VolumeMount[] {
+  const mountPathsByVolumeId = new Map<string, string[]>();
+  const volumeMounts: VolumeMount[] = [];
+  for (const [mountPath, volume] of Object.entries(volumes ?? {})) {
+    if (!volume) {
+      throw new InvalidError(
+        `Volume mounted at "${mountPath}" must not be null or undefined`,
+      );
+    }
+    const mountPaths = mountPathsByVolumeId.get(volume.volumeId) ?? [];
+    mountPaths.push(mountPath);
+    mountPathsByVolumeId.set(volume.volumeId, mountPaths);
+    volumeMounts.push(volumeToMountProto(mountPath, volume));
+  }
+  for (const mountPaths of mountPathsByVolumeId.values()) {
+    if (mountPaths.length > 1) {
+      throw new InvalidError(
+        "The same Volume cannot be mounted at multiple paths in a sidecar: " +
+          mountPaths.sort().join(", "),
+      );
+    }
+  }
+  return volumeMounts;
+}
+
+function sidecarContainerFromProto(
+  access: SandboxSidecarAccess,
+  info: TaskContainerInfo,
+): SidecarContainer {
+  return new SidecarContainer(
+    access,
+    info.containerId,
+    info.containerName,
+    info.result,
+  );
+}
+
+/**
+ * Creates and manages sidecar containers inside a Sandbox.
+ *
+ * EXPERIMENTAL: the API is subject to change.
+ */
+export class SidecarService {
+  readonly #access: SandboxSidecarAccess;
+
+  /** @internal @hidden */
+  constructor(access: SandboxSidecarAccess) {
+    this.#access = access;
+  }
+
+  /**
+   * Start a new sidecar container in the Sandbox. The {@link Image} must
+   * already be built by calling {@link Image#build Image.build()} before it is
+   * passed to `create`.
+   */
+  async create(
+    name: string,
+    image: Image,
+    params?: SidecarCreateParams,
+  ): Promise<SidecarContainer> {
+    this.#access.ensureAttached();
+    validateSidecarName(name);
+    if (!image || image.imageId === "") {
+      throw new InvalidError(
+        "sidecar image must already be built. Call image.build(app) first " +
+          "or use client.images.fromId(...)",
+      );
+    }
+    const command = params?.command ?? [];
+    validateExecArgs(command);
+    validateWorkdir(params?.workdir);
+    if (
+      params?.experimentalMemoryReserveConsumeMiB !== undefined &&
+      (!Number.isInteger(params.experimentalMemoryReserveConsumeMiB) ||
+        params.experimentalMemoryReserveConsumeMiB <= 0)
+    ) {
+      throw new InvalidError(
+        `experimentalMemoryReserveConsumeMiB must be a positive integer number of MiB, got: ${params.experimentalMemoryReserveConsumeMiB}`,
+      );
+    }
+
+    this.#access.validateCreate({
+      hasCloudBucketMounts:
+        Object.keys(params?.cloudBucketMounts ?? {}).length > 0,
+      hasProxy: params?.proxy !== undefined,
+      includeOidcIdentityToken: params?.includeOidcIdentityToken ?? false,
+    });
+
+    // Secrets and params.env are sent as ordered secret sources rather than
+    // folded into a server-side Secret. Locally-created Secrets (fromObject)
+    // are inlined, avoiding a SecretGetOrCreate round-trip; only the remaining
+    // resolvable Secrets (e.g. from fromName) need hydrating to secret IDs,
+    // which are also recorded on the definition.
+    validateEnvVarKeys(params?.env ?? {});
+    const resolvable = resolvableSecrets(params?.secrets ?? []);
+    await hydrateSandboxSecrets(
+      this.#access.client,
+      resolvable,
+      params?.cloudBucketMounts,
+    );
+    const secretIds = collectSecretIds(resolvable);
+    const sources = secretSources(params?.secrets ?? [], params?.env);
+
+    const volumeMounts = buildSidecarVolumeMounts(params?.volumes);
+    const cloudBucketMounts = buildCloudBucketMountProtos(
+      params?.cloudBucketMounts,
+    );
+
+    const ptyInfo = params?.pty ? defaultSandboxPTYInfo() : undefined;
+    const networkAccess = buildOutboundNetworkAccess(
+      false,
+      params?.outboundCidrAllowlist,
+      params?.outboundDomainAllowlist,
+    );
+
+    let resp;
+    try {
+      resp = await this.#access.create({
+        containerName: name,
+        imageId: image.imageId,
+        command,
+        workdir: params?.workdir ?? undefined,
+        secretIds,
+        secretSources: sources,
+        volumeMounts,
+        cloudBucketMounts,
+        networkAccess,
+        includeOidcIdentityToken: params?.includeOidcIdentityToken ?? false,
+        proxyId: params?.proxy?.proxyId,
+        ptyInfo,
+        memoryReserveConsumeMiB: params?.experimentalMemoryReserveConsumeMiB,
+      });
+    } catch (err) {
+      if (err instanceof ClientError) {
+        if (err.code === Status.ALREADY_EXISTS) {
+          throw new AlreadyExistsError(err.details || err.message);
+        }
+        if (err.code === Status.INVALID_ARGUMENT) {
+          throw new InvalidError(err.details || err.message);
+        }
+      }
+      throw err;
+    }
+
+    return new SidecarContainer(
+      this.#access,
+      resp.containerId,
+      resp.containerName || name,
+    );
+  }
+
+  /** Return a sidecar container by name. */
+  async get(
+    name: string,
+    params?: SidecarGetParams,
+  ): Promise<SidecarContainer> {
+    validateSidecarName(name);
+
+    const [taskId, client] = await this.#access.commandRouter();
+
+    let resp;
+    try {
+      resp = await client.containerGet(
+        TaskContainerGetRequest.create({
+          taskId,
+          containerName: name,
+          includeTerminated: params?.includeTerminated ?? false,
+        }),
+      );
+    } catch (err) {
+      if (err instanceof ClientError && err.code === Status.NOT_FOUND) {
+        throw new NotFoundError(`Sidecar container "${name}" not found`);
+      }
+      throw err;
+    }
+    if (!resp.container) {
+      throw new InternalFailure(
+        `server returned no container for sidecar "${name}"`,
+      );
+    }
+    return sidecarContainerFromProto(this.#access, resp.container);
+  }
+
+  /** Return all sidecar containers (not including the main container). */
+  async list(params?: SidecarListParams): Promise<SidecarContainer[]> {
+    const [taskId, client] = await this.#access.commandRouter();
+
+    const resp = await client.containerList(
+      TaskContainerListRequest.create({
+        taskId,
+        includeTerminated: params?.includeTerminated ?? false,
+      }),
+    );
+
+    return resp.containers
+      .filter((info) => info.containerName !== MAIN_CONTAINER_NAME)
+      .map((info) => sidecarContainerFromProto(this.#access, info));
+  }
+}
+
+/**
+ * A handle to a sidecar container running in a Sandbox.
+ *
+ * EXPERIMENTAL: the API is subject to change.
+ */
+export class SidecarContainer {
+  /** The fully qualified container ID. */
+  readonly containerId: string;
+  /** The logical name of the container within the Sandbox. */
+  readonly containerName: string;
+
+  readonly #access: SandboxSidecarAccess;
+  #result?: GenericResult;
+  #filesystem?: SandboxFilesystem;
+
+  /** @internal @hidden */
+  constructor(
+    access: SandboxSidecarAccess,
+    containerId: string,
+    containerName: string,
+    result?: GenericResult,
+  ) {
+    this.#access = access;
+    this.containerId = containerId;
+    this.containerName = containerName;
+    this.#result = result;
+  }
+
+  async exec(
+    command: string[],
+    params?: SidecarExecParams & { mode?: "text" },
+  ): Promise<ContainerProcess<string>>;
+
+  async exec(
+    command: string[],
+    params: SidecarExecParams & { mode: "binary" },
+  ): Promise<ContainerProcess<Uint8Array>>;
+
+  /** Run a command in the sidecar container and return the process handle. */
+  async exec(
+    command: string[],
+    params?: SidecarExecParams,
+  ): Promise<ContainerProcess> {
+    return this.#access.exec(command, params, this.containerId);
+  }
+
+  /** Namespace for filesystem APIs scoped to this sidecar container. */
+  get filesystem(): SandboxFilesystem {
+    if (!this.#filesystem) {
+      this.#filesystem = new SandboxFilesystem((command, params) =>
+        this.#access.exec(command, params, this.containerId),
+      );
+    }
+    return this.#filesystem;
+  }
+
+  /** Block until the sidecar container exits, and return its exit code. */
+  async wait(): Promise<number> {
+    if (
+      this.#result &&
+      this.#result.status !==
+        GenericResult_GenericStatus.GENERIC_STATUS_UNSPECIFIED
+    ) {
+      return getReturnCode(this.#result) ?? 0;
+    }
+
+    const [taskId, client] = await this.#access.commandRouter();
+    while (true) {
+      const resp = await client.containerWait(
+        TaskContainerWaitRequest.create({
+          taskId,
+          containerId: this.containerId,
+          timeout: CONTAINER_WAIT_POLL_TIMEOUT_SECONDS,
+        }),
+      );
+      const result = resp.result;
+      if (
+        !result ||
+        result.status === GenericResult_GenericStatus.GENERIC_STATUS_UNSPECIFIED
+      ) {
+        continue;
+      }
+      this.#result = result;
+      return getReturnCode(result) ?? 0;
+    }
+  }
+
+  /**
+   * Check if the sidecar container has finished running.
+   *
+   * Returns `null` if the container is still running, else the exit code.
+   */
+  async poll(): Promise<number | null> {
+    if (
+      this.#result &&
+      this.#result.status !==
+        GenericResult_GenericStatus.GENERIC_STATUS_UNSPECIFIED
+    ) {
+      return getReturnCode(this.#result);
+    }
+
+    const [taskId, client] = await this.#access.commandRouter();
+    const resp = await client.containerWait(
+      TaskContainerWaitRequest.create({
+        taskId,
+        containerId: this.containerId,
+        timeout: 0,
+      }),
+    );
+    const result = resp.result;
+    if (
+      result &&
+      result.status !== GenericResult_GenericStatus.GENERIC_STATUS_UNSPECIFIED
+    ) {
+      this.#result = result;
+    }
+    return getReturnCode(result);
+  }
+
+  async terminate(): Promise<void>;
+  async terminate(params: { wait: true }): Promise<number>;
+  /**
+   * Stop the sidecar container.
+   *
+   * The returned exit code is only meaningful when `wait` is true.
+   */
+  async terminate(params?: SidecarTerminateParams): Promise<number | void> {
+    const [taskId, client] = await this.#access.commandRouter();
+    await client.containerTerminate(
+      TaskContainerTerminateRequest.create({
+        taskId,
+        containerId: this.containerId,
+      }),
+    );
+    if (params?.wait) {
+      return this.wait();
+    }
+  }
+
+  /** Snapshot this Sidecar container's filesystem into an Image. */
+  async snapshotFilesystem(
+    params?: SidecarSnapshotFilesystemParams,
+  ): Promise<Image> {
+    return this.#access.snapshotFilesystem(this.containerId, params);
+  }
+
+  /**
+   * Reload all Volumes mounted in this sidecar container.
+   *
+   * Blocks until the reload completes, or throws a `TimeoutError` on timeout
+   * (the reload may still complete in the background).
+   */
+  async reloadVolumes(params?: SidecarReloadVolumesParams): Promise<void> {
+    await this.#access.reloadVolumes(this.containerId, params);
+  }
+
+  /**
+   * Mount an {@link Image} at a path in this Sidecar container's filesystem.
+   *
+   * @param path - The path where the directory should be mounted
+   * @param image - Optional {@link Image} to mount. If undefined, mounts an empty directory.
+   * @param params - Optional parameters; see {@link SidecarMountImageParams}.
+   */
+  async mountImage(
+    path: string,
+    image?: Image,
+    params?: SidecarMountImageParams,
+  ): Promise<void> {
+    const imageId = resolveMountImageId(image);
+    const [taskId, client] = await this.#access.commandRouter();
+    await client.mountDirectory(
+      buildTaskMountDirectoryRequestProto(
+        taskId,
+        path,
+        imageId,
+        params,
+        this.containerId,
+      ),
+    );
+  }
+
+  /**
+   * Unmounts an {@link Image} previously mounted at a path in this Sidecar container's filesystem.
+   *
+   * @param path - The mount path to unmount
+   */
+  async unmountImage(
+    path: string,
+    _params?: SidecarUnmountImageParams,
+  ): Promise<void> {
+    const [taskId, client] = await this.#access.commandRouter();
+    await client.unmountDirectory(
+      TaskUnmountDirectoryRequest.create({
+        taskId,
+        path: new TextEncoder().encode(path),
+        containerId: this.containerId,
+      }),
+    );
+  }
+
+  /**
+   * Snapshots and creates a new {@link Image} from a directory in the running Sidecar container.
+   *
+   * The resulting Image is retained for `ttlMs` (default: 30 days),
+   * as a hard cutoff measured from creation — usage does not extend
+   * the lifetime. Pass `ttlMs: null` to retain indefinitely.
+   *
+   * The call has an overall `timeoutMs` budget (default: 55000). If it
+   * elapses before a snapshot completes, the call is cancelled and an
+   * error is thrown.
+   *
+   * The Image can be used anywhere an Image is accepted, including as a mount
+   * or as the base filesystem for another container.
+   *
+   * @param path - The path of the directory to snapshot
+   * @param params - Optional parameters; see {@link SidecarSnapshotDirectoryParams}.
+   * @returns Promise that resolves to an {@link Image}
+   */
+  async snapshotDirectory(
+    path: string,
+    params?: SidecarSnapshotDirectoryParams,
+  ): Promise<Image> {
+    const timeoutMs = params?.timeoutMs || 55000;
+    const [taskId, client] = await this.#access.commandRouter();
+    const response = await client.snapshotDirectory(
+      buildTaskSnapshotDirectoryRequestProto(
+        taskId,
+        path,
+        uuidv4(),
+        resolveTtlSeconds(params?.ttlMs),
+        params,
+        this.containerId,
+      ),
+      { timeoutMs },
+    );
+    if (!response.imageId) {
+      throw new InternalFailure(
+        "Sidecar snapshot directory response missing `imageId`",
+      );
+    }
+    return new Image(this.#access.client, response.imageId, "");
+  }
+}

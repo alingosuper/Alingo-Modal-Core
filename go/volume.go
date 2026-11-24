@@ -1,0 +1,237 @@
+package modal
+
+import (
+	"context"
+	"fmt"
+
+	pb "github.com/modal-labs/Alingo-Modal-Core/go/proto/modal_proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// VolumeService provides Volume related operations.
+type VolumeService interface {
+	FromName(ctx context.Context, name string, params *VolumeFromNameParams) (*Volume, error)
+	Ephemeral(ctx context.Context, params *VolumeEphemeralParams) (*Volume, error)
+	Delete(ctx context.Context, name string, params *VolumeDeleteParams) error
+}
+
+type volumeServiceImpl struct{ client *Client }
+
+// Volume represents a Modal Volume that provides persistent storage.
+type Volume struct {
+	VolumeID        string
+	Name            string
+	mountOptions    resolvedVolumeMountOptions
+	cancelEphemeral context.CancelFunc
+}
+
+// resolvedVolumeMountOptions is the resolved mount configuration stored on a Volume.
+// The zero value represents an unconfigured (default) mount.
+type resolvedVolumeMountOptions struct {
+	readOnly bool
+	subPath  string
+}
+
+// VolumeMountOptionsParams are options for mounting a Volume. Fields are pointers so unset values
+// preserve the corresponding option from a previous WithMountOptions call (stacking).
+type VolumeMountOptionsParams struct {
+	ReadOnly *bool
+	SubPath  *string
+}
+
+// volumeToMountProto builds the VolumeMount proto from a Volume's mount configuration.
+func volumeToMountProto(mountPath string, volume *Volume) *pb.VolumeMount {
+	var subPath *string
+	if volume.mountOptions.subPath != "" {
+		subPath = &volume.mountOptions.subPath
+	}
+
+	return pb.VolumeMount_builder{
+		VolumeId:               volume.VolumeID,
+		MountPath:              mountPath,
+		AllowBackgroundCommits: true,
+		ReadOnly:               volume.mountOptions.readOnly,
+		SubPath:                subPath,
+	}.Build()
+}
+
+// VolumeFromNameParams are options for finding Modal Volumes.
+type VolumeFromNameParams struct {
+	Environment     string
+	CreateIfMissing bool
+	// Version selects a VolumeFS version: 0 leaves it unspecified (any version), while 1 or 2
+	// selects that version. This option is experimental and matches the Python SDK.
+	Version int
+}
+
+// FromName references a Volume by its name.
+func (s *volumeServiceImpl) FromName(ctx context.Context, name string, params *VolumeFromNameParams) (*Volume, error) {
+	if params == nil {
+		params = &VolumeFromNameParams{}
+	}
+
+	requestedVersion := pb.VolumeFsVersion_VOLUME_FS_VERSION_UNSPECIFIED
+	switch params.Version {
+	case 0:
+	case 1:
+		requestedVersion = pb.VolumeFsVersion_VOLUME_FS_VERSION_V1
+	case 2:
+		requestedVersion = pb.VolumeFsVersion_VOLUME_FS_VERSION_V2
+	default:
+		return nil, InvalidError{Exception: "VolumeFS version must be either 1 or 2"}
+	}
+
+	creationType := pb.ObjectCreationType_OBJECT_CREATION_TYPE_UNSPECIFIED
+	if params.CreateIfMissing {
+		creationType = pb.ObjectCreationType_OBJECT_CREATION_TYPE_CREATE_IF_MISSING
+	}
+
+	resp, err := s.client.cpClient.VolumeGetOrCreate(ctx, pb.VolumeGetOrCreateRequest_builder{
+		DeploymentName:     name,
+		EnvironmentName:    firstNonEmpty(params.Environment, s.client.profile.Environment),
+		ObjectCreationType: creationType,
+		Version:            requestedVersion,
+	}.Build())
+
+	if status, ok := status.FromError(err); ok && status.Code() == codes.NotFound {
+		return nil, NotFoundError{fmt.Sprintf("Volume '%s' not found", name)}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if params.Version != 0 {
+		actualVersion := normalizeVolumeVersion(resp.GetMetadata().GetVersion())
+		requestedVersion = normalizeVolumeVersion(requestedVersion)
+		if actualVersion != requestedVersion {
+			return nil, InvalidError{Exception: fmt.Sprintf(
+				"Volume '%s' exists but has version v%d, not v%d as requested. "+
+					"To access this Volume, either omit the version parameter or use the correct version.",
+				name,
+				actualVersion,
+				requestedVersion,
+			)}
+		}
+	}
+
+	s.client.logger.DebugContext(ctx, "Retrieved Volume", "volume_id", resp.GetVolumeId(), "volume_name", name)
+	return &Volume{VolumeID: resp.GetVolumeId(), Name: name, cancelEphemeral: nil}, nil
+}
+
+func normalizeVolumeVersion(version pb.VolumeFsVersion) pb.VolumeFsVersion {
+	if version == pb.VolumeFsVersion_VOLUME_FS_VERSION_UNSPECIFIED {
+		return pb.VolumeFsVersion_VOLUME_FS_VERSION_V1
+	}
+	return version
+}
+
+// WithMountOptions configures how a Volume is mounted. Fields left as nil on options preserve
+// the corresponding value from any previous WithMountOptions call on the same Volume (stacking).
+func (v *Volume) WithMountOptions(options *VolumeMountOptionsParams) *Volume {
+	merged := v.mountOptions
+	if options != nil {
+		if options.ReadOnly != nil {
+			merged.readOnly = *options.ReadOnly
+		}
+		if options.SubPath != nil {
+			if *options.SubPath == "/" {
+				merged.subPath = ""
+			} else {
+				merged.subPath = *options.SubPath
+			}
+		}
+	}
+	return &Volume{
+		VolumeID:        v.VolumeID,
+		Name:            v.Name,
+		mountOptions:    merged,
+		cancelEphemeral: v.cancelEphemeral,
+	}
+}
+
+// VolumeEphemeralParams are options for client.Volumes.Ephemeral.
+type VolumeEphemeralParams struct {
+	Environment string
+}
+
+// VolumeDeleteParams are options for client.Volumes.Delete.
+type VolumeDeleteParams struct {
+	Environment  string
+	AllowMissing bool
+}
+
+// Ephemeral creates a nameless, temporary Volume, that persists until CloseEphemeral is called, or the process exits.
+func (s *volumeServiceImpl) Ephemeral(ctx context.Context, params *VolumeEphemeralParams) (*Volume, error) {
+	if params == nil {
+		params = &VolumeEphemeralParams{}
+	}
+
+	resp, err := s.client.cpClient.VolumeGetOrCreate(ctx, pb.VolumeGetOrCreateRequest_builder{
+		ObjectCreationType: pb.ObjectCreationType_OBJECT_CREATION_TYPE_EPHEMERAL,
+		EnvironmentName:    firstNonEmpty(params.Environment, s.client.profile.Environment),
+	}.Build())
+	if err != nil {
+		return nil, err
+	}
+
+	s.client.logger.DebugContext(ctx, "Created ephemeral Volume", "volume_id", resp.GetVolumeId())
+
+	ephemeralCtx, cancel := context.WithCancel(context.Background())
+	startEphemeralHeartbeat(ephemeralCtx, func() error {
+		_, err := s.client.cpClient.VolumeHeartbeat(ephemeralCtx, pb.VolumeHeartbeatRequest_builder{
+			VolumeId: resp.GetVolumeId(),
+		}.Build())
+		return err
+	})
+
+	return &Volume{
+		VolumeID:        resp.GetVolumeId(),
+		cancelEphemeral: cancel,
+	}, nil
+}
+
+// CloseEphemeral deletes an ephemeral Volume, only used with VolumeEphemeral.
+func (v *Volume) CloseEphemeral() {
+	if v.cancelEphemeral != nil {
+		v.cancelEphemeral()
+	} else {
+		// We panic in this case because of invalid usage. In general, methods
+		// used with `defer` like CloseEphemeral should not return errors.
+		panic(fmt.Sprintf("Volume %s is not ephemeral", v.VolumeID))
+	}
+}
+
+// Delete deletes a named Volume.
+//
+// Warning: Deletion is irreversible and will affect any Apps currently using the Volume.
+func (s *volumeServiceImpl) Delete(ctx context.Context, name string, params *VolumeDeleteParams) error {
+	if params == nil {
+		params = &VolumeDeleteParams{}
+	}
+
+	volume, err := s.FromName(ctx, name, &VolumeFromNameParams{
+		Environment:     params.Environment,
+		CreateIfMissing: false,
+	})
+
+	if err != nil {
+		if _, ok := err.(NotFoundError); ok && params.AllowMissing {
+			return nil
+		}
+		return err
+	}
+
+	_, err = s.client.cpClient.VolumeDelete(ctx, pb.VolumeDeleteRequest_builder{
+		VolumeId: volume.VolumeID,
+	}.Build())
+
+	if err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound && params.AllowMissing {
+			return nil
+		}
+		return err
+	}
+
+	s.client.logger.DebugContext(ctx, "Deleted Volume", "volume_name", name, "volume_id", volume.VolumeID)
+	return nil
+}

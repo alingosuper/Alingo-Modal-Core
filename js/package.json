@@ -1,0 +1,75 @@
+{
+  "name": "modal",
+  "version": "0.11.2",
+  "description": "Modal SDK for JavaScript/TypeScript",
+  "license": "Apache-2.0",
+  "homepage": "https://modal.com/docs/guide/sdk-javascript-go",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alingosuper/Alingo-Modal-Core.git"
+  },
+  "bugs": "https://github.com/alingosuper/Alingo-Modal-Core/issues",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "/dist"
+  ],
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "types": "dist/index.d.ts",
+  "module": "dist/index.js",
+  "scripts": {
+    "build": "tsup",
+    "check": "tsc",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint",
+    "prepare": "scripts/gen-proto.sh",
+    "test": "MODAL_ENVIRONMENT=libmodal vitest run",
+    "test:watch": "MODAL_ENVIRONMENT=libmodal vitest",
+    "version": "npm run check",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.5",
+    "cbor-x": "^1.6.0",
+    "long": "^5.3.1",
+    "nice-grpc": "^2.1.12",
+    "protobufjs": "^7.5.0",
+    "smol-toml": "^1.9.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.28.0",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.15.2",
+    "eslint": "^9.28.0",
+    "eslint-plugin-import-x": "^4.18.0",
+    "globals": "^16.2.0",
+    "grpc-tools": "^1.13.1",
+    "jsonwebtoken": "^9.0.2",
+    "p-queue": "^8.1.0",
+    "prettier": "^3.5.3",
+    "ts-proto": "^2.7.0",
+    "tsup": "^8.4.0",
+    "tsx": "^4.20.5",
+    "typescript": "~5.8.3",
+    "typescript-eslint": "^8.72.1",
+    "vitest": "^4.1.12"
+  },
+  "overrides": {
+    "minimatch@>=7.0.0 <11.0.1": "^11.0.1"
+  },
+  "allowScripts": {
+    "grpc-tools@1.13.1": true,
+    "esbuild@0.25.3": true,
+    "cbor-extract": false,
+    "protobufjs": false,
+    "unrs-resolver": false
+  }
+}

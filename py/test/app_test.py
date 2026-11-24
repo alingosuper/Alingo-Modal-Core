@@ -1,0 +1,936 @@
+# Copyright Modal Labs 2022
+import asyncio
+import logging
+import pytest
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from unittest import mock
+
+from grpclib import GRPCError, Status
+
+from modal import App, Image, Sandbox, Secret, Volume, enable_output, fastapi_endpoint, method
+from modal._functions import _Function
+from modal._partial_function import _parse_custom_domains
+from modal._utils.async_utils import synchronizer
+from modal.client import _Client
+from modal.cls import _Cls
+from modal.exception import ExecutionError, InternalError, InvalidError, NotFoundError, ResourceExhaustedError
+from modal.runner import deploy_app, run_app
+from modal.types import AppState, AppStats
+from modal_proto import api_pb2
+
+from .supports import module_1, module_2
+
+
+def test_app_stats(client, servicer, app_stats_response):
+    response = app_stats_response
+    since = response.since.ToDatetime(tzinfo=timezone.utc)
+    until = response.until.ToDatetime(tzinfo=timezone.utc)
+    with servicer.intercept() as ctx:
+        ctx.add_response("AppGetOrCreate", api_pb2.AppGetOrCreateResponse(app_id="ap-stats"))
+        ctx.add_response("AppGetTimeRangeStats", response)
+        app = App.lookup("my-app", client=client, environment_name="other")
+        stats = app.stats(since=since, until=until)
+    assert ctx.get_requests("AppGetInfo") == []
+    assert ctx.get_requests("AppGetLifecycle") == []
+    lookup = ctx.pop_request("AppGetOrCreate")
+    assert lookup.app_name == "my-app" and lookup.environment_name == "other"
+    assert lookup.object_creation_type != api_pb2.OBJECT_CREATION_TYPE_CREATE_IF_MISSING
+    request = ctx.pop_request("AppGetTimeRangeStats")
+    assert request.app_id == "ap-stats"
+    assert request.since.ToDatetime(tzinfo=timezone.utc) == since
+    assert request.until.ToDatetime(tzinfo=timezone.utc) == until
+    assert stats.since == since and stats.until == until
+    assert stats.functions.total == AppStats.FunctionCounts(
+        calls=AppStats.CallCounts(total=80, succeeded=75, failed=5),
+        containers=AppStats.ContainerCounts(errors=7, total=6),
+    )
+    assert stats.functions["embed"].counts.calls == AppStats.CallCounts(total=60, succeeded=57, failed=3)
+    assert stats.functions["embed"].counts.containers == AppStats.ContainerCounts(1, 4)
+    assert stats.functions["embed"].object_id == "fu-embed"
+    assert stats.functions["reindex"].counts.calls.total == 0
+    assert stats.functions["reindex"].counts.containers.errors == 3
+    assert set(stats.functions) == {"embed", "ingest", "reindex"}
+    assert sum(row.counts.calls.total for row in stats.functions.values()) == 80
+    assert stats.servers.total == AppStats.ServerCounts(
+        requests=AppStats.RequestCounts(total=80, ok=78, failed=2),
+        containers=AppStats.ContainerCounts(errors=1, total=3),
+    )
+    assert stats.servers["gateway"].counts.requests.failed == 2
+    assert stats.servers["gateway"].object_id == "fu-gateway"
+    assert stats.sandboxes == AppStats.SandboxCounts(total=7, finished=5, live=2)
+    assert stats.deployment_count == 2
+    assert stats.lifecycle.state == AppState.DEPLOYED
+    assert stats.lifecycle.version == 42 and stats.lifecycle.deployed_by == "publisher"
+    with pytest.raises(KeyError):
+        stats.functions["Embed"]
+
+
+@pytest.mark.asyncio
+async def test_app_stats_async(client, servicer, app_stats_response):
+    with servicer.intercept() as ctx:
+        ctx.add_response("AppGetOrCreate", api_pb2.AppGetOrCreateResponse(app_id="ap-stats"))
+        ctx.add_response("AppGetTimeRangeStats", app_stats_response)
+        app = await App.lookup.aio("my-app", client=client)
+        result = await app.stats.aio()
+    assert isinstance(result, AppStats)
+    assert result.functions["ingest"].counts.containers.errors == 3
+
+
+@pytest.mark.parametrize("supplied_until", [None, datetime(2026, 10, 19, 12, tzinfo=timezone(timedelta(hours=2)))])
+def test_app_stats_default_window(client, servicer, app_stats_response, supplied_until):
+    now_before = datetime.now(timezone.utc)
+    with servicer.intercept() as ctx:
+        ctx.add_response("AppGetOrCreate", api_pb2.AppGetOrCreateResponse(app_id="ap-stats"))
+        ctx.add_response("AppGetTimeRangeStats", app_stats_response)
+        App.lookup("my-app", client=client).stats(until=supplied_until)
+    now_after = datetime.now(timezone.utc)
+    request = ctx.pop_request("AppGetTimeRangeStats")
+    until = request.until.ToDatetime(tzinfo=timezone.utc)
+    if supplied_until is None:
+        assert now_before <= until <= now_after
+    else:
+        assert until == supplied_until
+    assert until - request.since.ToDatetime(tzinfo=timezone.utc) == timedelta(hours=1)
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="Requires timezone switching")
+def test_app_stats_naive_datetimes(client, servicer, app_stats_response):
+    try:
+        with mock.patch.dict("os.environ", {"TZ": "Etc/GMT+4"}), servicer.intercept() as ctx:
+            time.tzset()
+            ctx.add_response("AppGetOrCreate", api_pb2.AppGetOrCreateResponse(app_id="ap-stats"))
+            ctx.add_response("AppGetTimeRangeStats", app_stats_response)
+            App.lookup("my-app", client=client).stats(since=datetime(2026, 10, 19, 8), until=datetime(2026, 10, 19, 9))
+    finally:
+        time.tzset()
+    request = ctx.pop_request("AppGetTimeRangeStats")
+    assert request.since.ToDatetime(tzinfo=timezone.utc) == datetime(2026, 10, 19, 12, tzinfo=timezone.utc)
+    assert request.until.ToDatetime(tzinfo=timezone.utc) == datetime(2026, 10, 19, 13, tzinfo=timezone.utc)
+
+
+def test_app_stats_requires_remote_app(client, servicer):
+    with pytest.raises(InvalidError, match="requires a running or stopped app"):
+        App().stats()
+    with servicer.intercept() as ctx:
+        ctx.add_response("AppGetOrCreate", api_pb2.AppGetOrCreateResponse(app_id="ap-stats"))
+        app = App.lookup("my-app", client=client)
+        now = datetime.now(timezone.utc)
+        with pytest.raises(InvalidError, match="must be before"):
+            app.stats(since=now, until=now)
+    assert ctx.get_requests("AppGetTimeRangeStats") == []
+
+
+@pytest.mark.parametrize("deployment_count", [None, 0])
+def test_app_stats_empty_and_deployment_presence(client, servicer, deployment_count):
+    response = api_pb2.AppGetTimeRangeStatsResponse()
+    if deployment_count is not None:
+        response.deployment_count = deployment_count
+    with servicer.intercept() as ctx:
+        ctx.add_response("AppGetOrCreate", api_pb2.AppGetOrCreateResponse(app_id="ap-stats"))
+        ctx.add_response("AppGetTimeRangeStats", response)
+        result = App.lookup("my-app", client=client).stats()
+    assert result.deployment_count == deployment_count
+    assert len(result.functions) == len(result.servers) == 0
+    assert result.functions.total.calls == AppStats.CallCounts(0, 0, 0)
+    assert result.servers.total.requests == AppStats.RequestCounts(0, 0, 0)
+    assert result.functions.total.containers == result.servers.total.containers == AppStats.ContainerCounts(0, 0)
+    assert result.sandboxes.total == 0
+
+
+def test_app_stats_running_app(client, servicer, app_stats_response):
+    app = App(include_source=False)
+    with servicer.intercept() as ctx:
+        ctx.add_response("AppGetTimeRangeStats", app_stats_response)
+        with app.run(client=client):
+            result = app.stats()
+            app_id = app.app_id
+    assert ctx.pop_request("AppGetTimeRangeStats").app_id == app_id
+    assert result.sandboxes.live == 2
+
+
+def test_app_stats_propagates_error(client, servicer):
+    async def unavailable(servicer, stream):
+        await stream.recv_message()
+        raise GRPCError(Status.RESOURCE_EXHAUSTED, "App stats query exhausted size limit")
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("AppGetOrCreate", api_pb2.AppGetOrCreateResponse(app_id="ap-stats"))
+        ctx.set_responder("AppGetTimeRangeStats", unavailable)
+        app = App.lookup("my-app", client=client)
+        with pytest.raises(ResourceExhaustedError, match="App stats query exhausted size limit"):
+            app.stats()
+
+
+def square(x):
+    return x**2
+
+
+@pytest.mark.asyncio
+async def test_redeploy(servicer, client):
+    app = App(image=Image.debian_slim().pip_install("pandas"), include_source=False)
+    app.function()(square)
+
+    # Deploy app
+    await app.deploy.aio(name="my-app", client=client)
+    assert app.app_id == "ap-1"
+    assert servicer.app_objects["ap-1"]["square"] == "fu-1"
+    assert servicer.app_state_history[app.app_id] == [api_pb2.APP_STATE_INITIALIZING, api_pb2.APP_STATE_DEPLOYED]
+
+    # Redeploy, make sure all ids are the same
+    await app.deploy.aio(name="my-app", client=client)
+    assert app.app_id == "ap-1"
+    assert servicer.app_objects["ap-1"]["square"] == "fu-1"
+    assert servicer.app_state_history[app.app_id] == [
+        api_pb2.APP_STATE_INITIALIZING,
+        api_pb2.APP_STATE_DEPLOYED,
+        api_pb2.APP_STATE_DEPLOYED,
+    ]
+
+    # Deploy to a different name, ids should change
+    await app.deploy.aio(name="my-app-xyz", client=client)
+    assert app.app_id == "ap-2"
+    assert servicer.app_objects["ap-2"]["square"] == "fu-2"
+    assert servicer.app_state_history[app.app_id] == [api_pb2.APP_STATE_INITIALIZING, api_pb2.APP_STATE_DEPLOYED]
+
+
+def dummy():
+    pass
+
+
+# Should exit without waiting for the "logs_timeout" grace period.
+@pytest.mark.timeout(5)
+def test_create_object_internal_exception(servicer, client):
+    servicer.function_create_error = GRPCError(Status.INTERNAL, "Function create failed")
+
+    app = App(include_source=False)
+    app.function()(dummy)
+
+    with servicer.intercept() as ctx:
+        with pytest.raises(InternalError):
+            with enable_output():  # this activates the log streaming loop, which could potentially hold up context exit
+                with app.run(client=client):
+                    pass
+
+    assert len(ctx.get_requests("FunctionCreate")) == 4  # some retries are applied to internal errors
+    assert len(ctx.get_requests("AppClientDisconnect")) == 1
+
+
+@pytest.mark.timeout(5)
+def test_create_object_invalid_exception(servicer, client):
+    servicer.function_create_error = GRPCError(Status.INVALID_ARGUMENT, "something was invalid")
+
+    app = App(include_source=False)
+    app.function()(dummy)
+
+    with servicer.intercept() as ctx:
+        with pytest.raises(InvalidError, match="something was invalid"):  # error should be converted
+            with enable_output():  # this activates the log streaming loop, which could potentially hold up context exit
+                with app.run(client=client):
+                    pass
+    assert len(ctx.get_requests("FunctionCreate")) == 1  # no retries on an invalid request
+    assert len(ctx.get_requests("AppClientDisconnect")) == 1
+
+
+def test_deploy_falls_back_to_app_name(servicer, client):
+    named_app = App(name="foo_app")
+    named_app.deploy(client=client)
+    app_names = {app_name for (_, app_name) in servicer.deployed_apps}
+    assert "foo_app" in app_names
+
+
+def test_deploy_uses_deployment_name_if_specified(servicer, client):
+    named_app = App(name="foo_app")
+    named_app.deploy(name="bar_app", client=client)
+    app_names = {app_name for (_, app_name) in servicer.deployed_apps}
+    assert "bar_app" in app_names
+    assert "foo_app" not in app_names
+
+
+def test_run_function_without_app_error():
+    app = App()
+    dummy_modal = app.function()(dummy)
+
+    with pytest.raises(ExecutionError) as excinfo:
+        dummy_modal.remote()
+
+    assert "hydrated" in str(excinfo.value)
+
+
+def test_missing_attr():
+    """Trying to call a non-existent function on the App should produce
+    an understandable error message."""
+
+    app = App()
+    with pytest.raises(AttributeError):
+        app.fun()  # type: ignore
+
+
+def test_same_function_name(caplog):
+    app = App()
+
+    # Add first function
+    with caplog.at_level(logging.WARNING):
+        app.function()(module_1.square)
+    assert len(caplog.records) == 0
+
+    # Add second function: check warning
+    with caplog.at_level(logging.WARNING):
+        app.function()(module_2.square)
+    assert len(caplog.records) == 1
+    assert "module_1" in caplog.text
+    assert "module_2" in caplog.text
+    assert "square" in caplog.text
+
+
+def test_named_app_repr():
+    assert repr(App("my-app")) == "App('my-app')"
+
+
+def test_run_state(client, servicer):
+    app = App()
+    with app.run(client=client):
+        assert servicer.app_state_history[app.app_id] == [api_pb2.APP_STATE_INITIALIZING, api_pb2.APP_STATE_EPHEMERAL]
+
+
+def test_deploy_state(client, servicer):
+    app = App()
+    app.deploy(name="foobar", client=client)
+    assert servicer.app_state_history[app.app_id] == [api_pb2.APP_STATE_INITIALIZING, api_pb2.APP_STATE_DEPLOYED]
+
+
+def test_detach_state(client, servicer):
+    app = App()
+    with app.run(client=client, detach=True):
+        assert servicer.app_state_history[app.app_id] == [api_pb2.APP_STATE_INITIALIZING, api_pb2.APP_STATE_DETACHED]
+
+
+def test_ephemeral_app_info(client, servicer):
+    app = App(include_source=False)
+    app.function()(square)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "AppGetInfo",
+            api_pb2.AppGetInfoResponse(
+                info=api_pb2.AppHandleMetadata(
+                    lifecycle=api_pb2.AppLifecycle(app_state=api_pb2.APP_STATE_EPHEMERAL),
+                    functions={"square": "fu-1"},
+                )
+            ),
+        )
+        with app.run(client=client):
+            info = app.info()
+
+    assert info.lifecycle.state == AppState.EPHEMERAL
+    assert info.lifecycle.deployed_at is None
+    assert info.lifecycle.stopped_at is None
+    assert info.functions == {"square": "fu-1"}
+
+
+def test_app_info_second_call_uses_cache(client, servicer):
+    app = App(include_source=False)
+    metadata = api_pb2.AppHandleMetadata(
+        description="cached-info",
+        lifecycle=api_pb2.AppLifecycle(app_state=api_pb2.APP_STATE_EPHEMERAL),
+    )
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("AppGetInfo", api_pb2.AppGetInfoResponse(info=metadata))
+        with app.run(client=client):
+            first_info = app.info()
+            second_info = app.info()
+
+    assert second_info == first_info
+    assert len(ctx.get_requests("AppGetInfo")) == 1
+
+
+def test_app_info_from_lookup(client, servicer):
+    metadata = api_pb2.AppHandleMetadata(
+        description="my-app",
+        lifecycle=api_pb2.AppLifecycle(app_state=api_pb2.APP_STATE_DEPLOYED),
+        functions={"square": "fu-123"},
+        servers={"server": "fu-456"},
+    )
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "AppGetOrCreate",
+            api_pb2.AppGetOrCreateResponse(app_id="ap-123", handle_metadata=metadata),
+        )
+        app = App.lookup("my-app", client=client)
+        info = app.info()
+
+    assert info.description == "my-app"
+    assert info.app_id == "ap-123"
+    assert info.lifecycle.state == AppState.DEPLOYED
+    assert info.functions == {"square": "fu-123"}
+    assert info.servers == {"server": "fu-456"}
+
+
+def test_app_info_from_lookup_does_not_make_extra_rpc(client, servicer):
+    metadata = api_pb2.AppHandleMetadata(
+        description="my-app",
+        lifecycle=api_pb2.AppLifecycle(app_state=api_pb2.APP_STATE_DEPLOYED),
+    )
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "AppGetOrCreate",
+            api_pb2.AppGetOrCreateResponse(app_id="ap-123", handle_metadata=metadata),
+        )
+        app = App.lookup("my-app", client=client)
+        app.info()
+
+    assert ctx.get_requests("AppGetInfo") == []
+
+
+def test_app_info_refresh_makes_rpc(client, servicer):
+    lookup_metadata = api_pb2.AppHandleMetadata(
+        description="before-refresh",
+        lifecycle=api_pb2.AppLifecycle(app_state=api_pb2.APP_STATE_DEPLOYED),
+    )
+    refreshed_metadata = api_pb2.AppHandleMetadata(
+        description="after-refresh",
+        lifecycle=api_pb2.AppLifecycle(app_state=api_pb2.APP_STATE_STOPPED),
+    )
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "AppGetOrCreate",
+            api_pb2.AppGetOrCreateResponse(app_id="ap-123", handle_metadata=lookup_metadata),
+        )
+        ctx.add_response("AppGetInfo", api_pb2.AppGetInfoResponse(info=refreshed_metadata))
+        app = App.lookup("my-app", client=client)
+        assert app.info().description == "before-refresh"
+        info = app.info(refresh=True)
+
+    requests = ctx.get_requests("AppGetInfo")
+    assert len(requests) == 1
+    assert requests[0].app_id == "ap-123"
+    assert info.description == "after-refresh"
+
+
+@pytest.mark.asyncio
+async def test_grpc_protocol(client, servicer):
+    app = App()
+    async with app.run(client=client):
+        await asyncio.sleep(0.01)  # wait for heartbeat
+    assert len(servicer.requests) == 3
+    assert isinstance(servicer.requests[0], api_pb2.AppCreateRequest)
+    assert isinstance(servicer.requests[1], api_pb2.AppHeartbeatRequest)
+    assert isinstance(servicer.requests[2], api_pb2.AppClientDisconnectRequest)
+
+
+async def web1(x):
+    return {"square": x**2}
+
+
+async def web2(x):
+    return {"cube": x**3}
+
+
+def test_registered_fastapi_endpoints(client, servicer):
+    app = App()
+    app.function()(square)
+    app.function()(fastapi_endpoint()(web1))
+    app.function()(fastapi_endpoint()(web2))
+
+    @app.cls(serialized=True)
+    class Cls:
+        @fastapi_endpoint()
+        def web3(self):
+            pass
+
+    assert app._local_state.web_endpoints == ["web1", "web2", "Cls.web3"]
+
+
+def test_init_types():
+    with pytest.raises(InvalidError):
+        # singular secret to plural argument
+        App(secrets=Secret.from_dict())  # type: ignore
+    with pytest.raises(InvalidError):
+        # not a Secret Object
+        App(secrets=[{"foo": "bar"}])  # type: ignore
+    with pytest.raises(InvalidError):
+        # should be an Image
+        App(image=Secret.from_dict())  # type: ignore
+
+    App(
+        image=Image.debian_slim().pip_install("pandas"),
+        secrets=[Secret.from_dict()],
+    )
+
+
+def test_set_image_on_app_as_attribute():
+    # TODO: do we want to deprecate this syntax? It's kind of random for image to
+    #     have a reserved name in the blueprint, and being the only of the construction
+    #     arguments that can be set on the instance after construction
+    custom_img = Image.debian_slim().apt_install("emacs")
+    app = App(image=custom_img)
+    assert app._get_default_image() == custom_img
+
+
+def test_redeploy_delete_objects(servicer, client):
+    # Deploy an app with objects d1 and d2
+    app = App()
+    app.function(name="d1", serialized=True)(dummy)
+    app.function(name="d2", serialized=True)(dummy)
+    app.deploy(name="xyz", client=client)
+
+    # Check objects
+    assert set(servicer.app_objects[app.app_id].keys()) == {"d1", "d2"}
+
+    # Deploy an app with objects d2 and d3
+    app = App()
+    app.function(name="d2", serialized=True)(dummy)
+    app.function(name="d3", serialized=True)(dummy)
+    app.deploy(name="xyz", client=client)
+
+    # Make sure d1 is deleted
+    assert set(servicer.app_objects[app.app_id].keys()) == {"d2", "d3"}
+
+
+def test_redeploy_reuse_name_for_different_type(servicer, client):
+    # Deploy an app where the tag "Foo" names a Function
+    app = App()
+    app.function(name="Foo", serialized=True)(dummy)
+    app.deploy(name="xyz", client=client)
+    assert _Function._is_id_type(servicer.app_objects[app.app_id]["Foo"])
+
+    # Redeploy the same app where "Foo" now names a Cls. The function id can't be
+    # reused for a class, so the object gets a fresh class id instead of failing.
+    app = App()
+
+    @app.cls(serialized=True)
+    class Foo:
+        @method()
+        def bar(self): ...
+
+    app.deploy(name="xyz", client=client)
+    assert _Cls._is_id_type(servicer.app_objects[app.app_id]["Foo"])
+
+    # Redeploy once more, swapping the tag back to a Function
+    app = App()
+    app.function(name="Foo", serialized=True)(dummy)
+    app.deploy(name="xyz", client=client)
+    assert _Function._is_id_type(servicer.app_objects[app.app_id]["Foo"])
+
+
+@pytest.mark.asyncio
+async def test_unhydrate(servicer, client):
+    app = App(include_source=False)
+
+    f = app.function()(dummy)
+
+    assert not f._is_hydrated
+    async with app.run(client=client):
+        assert f._is_hydrated
+
+    # After app finishes, it should unhydrate
+    assert not f._is_hydrated
+
+
+def test_keyboard_interrupt(servicer, client):
+    app = App(include_source=False)
+    app.function()(square)
+    with app.run(client=client):
+        # The exit handler should catch this interrupt and exit gracefully
+        raise KeyboardInterrupt()
+
+
+def test_function_image_positional():
+    app = App()
+    image = Image.debian_slim()
+
+    with pytest.raises(TypeError, match="positional argument"):
+
+        @app.function(image)  # type: ignore
+        def f():
+            pass
+
+
+def test_function_decorator_on_class():
+    app = App()
+    with pytest.raises(TypeError, match="cannot be used on a class"):
+
+        @app.function()
+        class Foo:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_deploy_disconnect(servicer, client):
+    app = App()
+    app.function(secrets=[Secret.from_name("nonexistent-secret")])(square)
+
+    with pytest.raises(NotFoundError):
+        await app.deploy.aio(name="my-app", client=client)
+
+    assert servicer.app_state_history["ap-1"] == [
+        api_pb2.APP_STATE_INITIALIZING,
+        api_pb2.APP_STATE_STOPPED,
+    ]
+
+
+def test_parse_custom_domains():
+    assert len(_parse_custom_domains(None)) == 0
+    assert len(_parse_custom_domains(["foo.com", "bar.com"])) == 2
+    with pytest.raises(AssertionError):
+        assert _parse_custom_domains("foo.com")
+
+
+def test_hydrated_other_app_object_gets_referenced(servicer, client):
+    app = App("my-app", include_source=False)
+    with servicer.intercept() as ctx:
+        with Volume.ephemeral(client=client) as vol:
+            app.function(volumes={"/vol": vol})(dummy)  # implicitly load vol
+            app.deploy(client=client)
+            function_create_req: api_pb2.FunctionCreateRequest = ctx.pop_request("FunctionCreate")
+            assert vol.object_id in {obj.object_id for obj in function_create_req.function.object_dependencies}
+
+
+def test_hasattr():
+    app = App()
+    assert not hasattr(app, "xyz")
+
+
+def test_app(client):
+    app = App(include_source=False)
+    square_modal = app.function()(square)
+
+    with app.run(client=client):
+        square_modal.remote(42)
+
+
+def test_non_string_app_name():
+    with pytest.raises(InvalidError, match="Must be string"):
+        App(Image.debian_slim())  # type: ignore
+
+
+def test_app_logs(servicer, client, set_env_client):
+    app = App(include_source=False)
+    f = app.function()(dummy)
+
+    with app.run(client=client):
+        f.remote()
+
+    logs = [entry.message for entry in app.logs.stream()]
+    assert logs == ["hello, world (1)\n"]
+
+
+def test_app_interactive(servicer, client, capsys):
+    app = App()
+
+    async def app_logs_pty(servicer, stream):
+        await stream.recv_message()
+
+        # Enable PTY
+        await stream.send_message(api_pb2.TaskLogsBatch(pty_exec_id="ta-123"))
+
+        # Send some data (should be written raw to stdout)
+        log = api_pb2.TaskLogs(data="some data\n", file_descriptor=api_pb2.FILE_DESCRIPTOR_STDOUT)
+        await stream.send_message(api_pb2.TaskLogsBatch(entry_id="xyz", items=[log]))
+
+        # Send an EOF
+        await stream.send_message(api_pb2.TaskLogsBatch(eof=True, task_id="ta-123"))
+
+        # Terminate app
+        await stream.send_message(api_pb2.TaskLogsBatch(app_done=True))
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("AppGetLogs", app_logs_pty)
+
+        with enable_output():
+            with app.run(client=client):
+                time.sleep(0.1)
+
+    captured = capsys.readouterr()
+    # PTY data is written raw to stdout; verify it ends with the expected data
+    # (quiet mode suppresses the "App completed" message that would otherwise follow)
+    assert captured.out.endswith("\nsome data\n\r")
+
+
+def test_app_interactive_no_output(servicer, client):
+    app = App()
+
+    msg = "Interactive mode requires output to be enabled. (Use the the `modal.enable_output()` context manager.)"
+    with pytest.raises(InvalidError, match=re.escape(msg)):
+        with app.run(client=client, interactive=True):
+            # Verify that interactive mode was disabled
+            assert not app._is_interactive_
+
+
+@pytest.mark.asyncio
+async def test_deploy_from_container(servicer, container_client):
+    app = App(image=Image.debian_slim().pip_install("pandas"), include_source=False)
+    app.function()(square)
+
+    # Deploy app
+    await app.deploy.aio(name="my-app", client=container_client)
+    assert servicer.app_objects["ap-1"]["square"] == "fu-1"
+    assert servicer.app_state_history[app.app_id] == [api_pb2.APP_STATE_INITIALIZING, api_pb2.APP_STATE_DEPLOYED]
+
+
+def test_app_create_bad_environment_name_error(client):
+    environment_name = "this=is@not.allowed"
+    app = App()
+
+    if sys.platform != "win32":
+        tasks_before = asyncio.all_tasks(synchronizer._loop)
+
+    with pytest.raises(InvalidError, match="Invalid Environment name"):
+        with run_app(
+            app, environment_name=environment_name, client=client
+        ):  # TODO: why isn't environment_name an argument to app.run?
+            pass
+
+    if sys.platform != "win32":  # proactor event loop has long lived helper tasks
+        # Check no new tasks leaked from this test. We compare against tasks_before rather
+        # than asserting an absolute count of 1, since the shared synchronizer loop may
+        # have tasks from other tests still running.
+        new_tasks = asyncio.all_tasks(synchronizer._loop) - tasks_before
+        assert len(new_tasks) == 0
+
+
+def test_overriding_function_warning(caplog):
+    app = App()
+
+    @app.function(serialized=True)
+    def func():  # type: ignore
+        return 1
+
+    assert len(caplog.messages) == 0
+
+    app_2 = App()
+    app_2.include(app)
+
+    assert len(caplog.messages) == 0
+
+    app_3 = App()
+
+    app_3.include(app)
+    app_3.include(app_2)
+
+    assert len(caplog.messages) == 0
+
+    app_4 = App()
+
+    @app_4.function(serialized=True)  # type: ignore
+    def func():  # noqa: F811
+        return 2
+
+    assert len(caplog.messages) == 0
+
+    app_3.include(app_4)
+    assert "Overriding existing function" in caplog.messages[0]
+
+
+@pytest.mark.parametrize("name", ["", " ", "no way", "my-app!", "a" * 65])
+def test_lookup_invalid_name(name):
+    with pytest.raises(InvalidError, match="Invalid App name"):
+        App.lookup(name)
+
+
+EPHEMERAL_APP_ID = "ap-" + "a" * 22
+
+
+@pytest.fixture
+def ephemeral_app_id(servicer):
+    servicer.app_state_history[EPHEMERAL_APP_ID].append(api_pb2.APP_STATE_EPHEMERAL)
+    servicer.app_environments[EPHEMERAL_APP_ID] = "dev"
+    return EPHEMERAL_APP_ID
+
+
+def test_lookup_by_app_id(client, servicer, ephemeral_app_id):
+    with servicer.intercept() as ctx:
+        app = App.lookup(ephemeral_app_id, client=client)
+        Sandbox.create("echo", "hi", app=app, client=client)
+
+    (lookup_request,) = ctx.get_requests("AppGetOrCreate")
+    assert lookup_request.app_name == ephemeral_app_id
+    assert lookup_request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_UNSPECIFIED
+
+    assert app.app_id == ephemeral_app_id
+    assert app.info().lifecycle.state == AppState.EPHEMERAL
+    assert ctx.pop_request("SandboxCreateV2").app_id == ephemeral_app_id
+
+
+def test_lookup_by_app_id_rejects_create_if_missing(client, servicer, ephemeral_app_id):
+    with servicer.intercept() as ctx:
+        with pytest.raises(InvalidError, match="not supported when looking up an App by ID"):
+            App.lookup(ephemeral_app_id, client=client, create_if_missing=True)
+
+    assert ctx.get_requests("AppGetOrCreate") == []
+
+
+def test_lookup_by_app_id_ignores_environment_name(client, ephemeral_app_id):
+    app = App.lookup(ephemeral_app_id, client=client, environment_name="does-not-exist")
+    assert app.app_id == ephemeral_app_id
+
+
+def test_lookup_by_app_id_not_found(client):
+    with pytest.raises(NotFoundError):
+        App.lookup("ap-" + "b" * 22, client=client)
+
+
+@pytest.mark.parametrize("mode", ["run", "deploy"])
+def test_tags(servicer, client, mode):
+    tags = {"foo": "bar", "baz": "qux"}
+    app = App(name="tag-tester", tags=tags, include_source=False)
+    app.function()(square)
+    with servicer.intercept() as ctx:
+        if mode == "deploy":
+            app.deploy(client=client, tag="some-other-tag")
+        elif mode == "run":
+            with app.run(client=client):
+                pass
+
+    request = ctx.pop_request("AppCreate")
+    assert request.tags == tags
+
+    request = ctx.pop_request("AppPublish")
+    assert request.tags == tags
+
+
+@pytest.mark.parametrize("s", ["a:b", "x/y", "a b", "a" * 65])
+def test_invalid_tags(s):
+    with pytest.raises(InvalidError, match=f"Invalid tag key: {s!r}"):
+        App(tags={s: "bar"})
+    with pytest.raises(InvalidError, match=f"Invalid tag value: {s!r}"):
+        App(tags={"foo": s})
+
+
+@pytest.mark.parametrize("inherit_tags", [True, False])
+def test_app_composition_tags(servicer, client, inherit_tags):
+    base_app = App(tags={"foo": "bar", "baz": "bum"}, include_source=False)
+    base_app.function()(square)
+
+    main_app = App(tags={"baz": "qux"})
+    main_app.include(base_app, inherit_tags=inherit_tags)
+
+    with servicer.intercept() as ctx:
+        main_app.deploy(name="inherit-test", client=client)
+
+    request = ctx.pop_request("AppPublish")
+    if inherit_tags:
+        assert request.tags == {"foo": "bar", "baz": "qux"}
+    else:
+        assert request.tags == {"baz": "qux"}
+
+
+def test_app_sandboxes_stats(servicer, client):
+    app = App.lookup("sandbox-stats-test", create_if_missing=True, client=client)
+    servicer.sandbox_stats_pages = 3
+    servicer.sandbox_stats_throttle_remaining = 1
+
+    since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    groups = list(app.sandboxes.stats(since=since, group_by_tags=["team"], tags={"env": "prod"}))
+    assert [g.tags for g in groups] == [{"team": None}, {"team": "team-1"}, {"team": "team-2"}]
+    assert groups[0].cost == Decimal("0.125")
+    assert groups[0].cost_by_resource == {"CPU": Decimal("0.1"), "Memory": Decimal("0.025")}
+
+    requests = servicer.sandbox_stats_requests
+    assert len(requests) == 4  # one throttled attempt, then three pages
+    assert [r.page_token for r in requests] == ["", "", "1", "2"]
+    assert requests[0].app_id == app.app_id
+    assert dict(requests[0].tags) == {"env": "prod"}
+    assert requests[0].since.ToDatetime() == since.replace(tzinfo=None)
+    assert not requests[0].HasField("until")
+
+    until = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    list(app.sandboxes.stats(since=since, until=until))
+    assert requests[-1].until.ToDatetime() == until.replace(tzinfo=None)
+
+    with pytest.raises(InvalidError, match="before"):
+        list(app.sandboxes.stats(since=since, until=since))
+    with pytest.raises(InvalidError, match="past"):
+        list(app.sandboxes.stats(since=datetime.now(timezone.utc) + timedelta(days=1)))
+    with pytest.raises(InvalidError, match="past"):
+        future = datetime.now(timezone.utc) + timedelta(days=1)
+        list(app.sandboxes.stats(since=future, until=future + timedelta(days=1)))
+
+    with pytest.raises(InvalidError, match="requires"):
+        list(App().sandboxes.stats(since=since))
+
+
+def test_app_set_tags(servicer, client):
+    app = App(include_source=False)
+    app.function()(square)
+    app.deploy(name="set-tags-test", client=client)
+
+    tags = {"x": "1", "y": "2"}
+    with servicer.intercept() as ctx:
+        app.set_tags(tags, client=client)
+
+    request = ctx.pop_request("AppSetTags")
+    assert request.tags == tags
+
+
+def test_app_stop(servicer, client):
+    app = App(include_source=False)
+    with pytest.raises(InvalidError, match="requires the App to have an ID"):
+        app.stop(client=client)
+
+    app.function()(square)
+    app.deploy(name="stop-test", client=client)
+
+    remote_app = App.lookup("stop-test", client=client)
+    with servicer.intercept() as ctx:
+        remote_app.stop()
+
+    request = ctx.pop_request("AppStop")
+    assert request.app_id == app.app_id
+    assert request.source == api_pb2.APP_STOP_SOURCE_PYTHON_CLIENT
+    with pytest.raises(NotFoundError):
+        App.lookup("stop-test", client=client)
+
+
+@pytest.fixture
+def no_env_client(monkeypatch):
+    async def from_env(*args, **kwargs):
+        raise AssertionError("_Client.from_env should not be called")
+
+    monkeypatch.setattr(_Client, "from_env", from_env)
+
+
+def test_app_stop_after_deploy_uses_deploy_client(servicer, client, no_env_client):
+    app = App(include_source=False)
+    app.function()(square)
+    app.deploy(name="stop-test", client=client)
+
+    with servicer.intercept() as ctx:
+        app.stop()
+
+    assert ctx.pop_request("AppStop").app_id == app.app_id
+
+
+def test_app_stop_after_run_uses_run_client(servicer, client, no_env_client):
+    app = App(include_source=False)
+    app.function()(square)
+    with app.run(client=client):
+        pass
+
+    with servicer.intercept() as ctx:
+        app.stop()
+
+    assert ctx.pop_request("AppStop").app_id == app.app_id
+
+
+def test_dashboard_url(client):
+    app = App(include_source=False)
+    with app.run(client=client):
+        assert app.get_dashboard_url() == f"https://modal.com/id/{app.app_id}"
+
+
+def test_staged_deploy(client, servicer):
+    main_app = App(name="main-app")
+    main_app.function()(square)
+
+    main_app.deploy(client=client)
+
+    with servicer.intercept() as ctx:
+        deploy_app(main_app, client=client, staged=True)
+
+    request = ctx.pop_request("AppPublish")
+    assert request.staged

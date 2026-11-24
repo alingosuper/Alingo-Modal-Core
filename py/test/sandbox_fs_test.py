@@ -1,0 +1,1733 @@
+# Copyright Modal Labs 2026
+import pathlib
+import pytest
+import random
+import threading
+import time
+from typing import Callable, Optional
+from unittest import mock
+
+from modal import App, Sandbox
+from modal.exception import (
+    InvalidError,
+    NotFoundError,
+    SandboxFilesystemDirectoryNotEmptyError,
+    SandboxFilesystemError,
+    SandboxFilesystemFileTooLargeError,
+    SandboxFilesystemIsADirectoryError,
+    SandboxFilesystemNotADirectoryError,
+    SandboxFilesystemNotFoundError,
+    SandboxFilesystemPathAlreadyExistsError,
+)
+
+# The auto-generated .pyi stub for io_streams only includes synchronicity-wrapped
+# types, so mypy cannot see this plain module-level constant. We suppress the
+# error here rather than defining a separate constant we'd have to keep in sync.
+from modal.io_streams import TASK_COMMAND_ROUTER_MAX_BUFFER_SIZE  # type: ignore[attr-defined]
+from modal.sandbox._task_command_router_client import STREAMING_STDIN_CHUNK_SIZE
+from modal.types import FileInfo, FileType, FileWatchEvent, FileWatchEventType
+
+from .supports.skip import skip_windows
+
+skip_non_subprocess = skip_windows("Needs subprocess support")
+
+_MOCK_SANDBOX_FS_TOOLS_PATH = pathlib.Path(__file__).parent / "supports" / "mock_sandbox_fs_tools.py"
+
+
+def _random_bytes(size: int, *, seed: int) -> bytes:
+    rng = random.Random(seed)
+    return bytes(rng.getrandbits(8) for _ in range(size))
+
+
+@pytest.fixture
+def sandbox_fs_tools(monkeypatch, tmp_path):
+    """Points the sandbox filesystem tools path at the mock script.
+
+    The mock exec backend ("router") runs commands as local subprocesses,
+    so this script is executed directly on the host. It emulates the Rust
+    binary's behavior for ReadFile, including structured JSON error
+    payloads on stderr.
+
+    We wrap the Python script in a shell script that explicitly calls the
+    current test interpreter (sys.executable). This avoids inheriting the
+    Bazel PYTHONPATH when the subprocess runs via the shebang's `env python3`,
+    which would otherwise cause import hook version mismatches (e.g. ddtrace).
+    """
+    import sys
+
+    wrapper = tmp_path / "mock_sandbox_fs_tools"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{_MOCK_SANDBOX_FS_TOOLS_PATH}" "$@"\n')
+    wrapper.chmod(0o755)
+    monkeypatch.setattr("modal.sandbox._filesystem._SANDBOX_FS_TOOLS_PATH", str(wrapper))
+
+
+@pytest.fixture
+def app(client):
+    app_ = App()
+    with app_.run(client=client):
+        yield app_
+
+
+@pytest.fixture
+def sandbox(app):
+    sb = None
+    try:
+        sb = Sandbox.create(app=app)
+        yield sb
+    finally:
+        if sb:
+            sb.terminate()
+
+
+# ---------------------------------------------------------------------------
+# read_text
+# ---------------------------------------------------------------------------
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_text_returns_expected_text(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "read-text.txt")
+    text_payload = "hello from read_text\nsnowman: ☃\n"
+    (tmp_path / "read-text.txt").write_text(text_payload, encoding="utf-8")
+
+    assert sandbox.filesystem.read_text(remote_path) == text_payload
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_text_returns_empty_string_for_empty_file(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_path = str(tmp_path / "empty.txt")
+    (tmp_path / "empty.txt").write_text("", encoding="utf-8")
+
+    assert sandbox.filesystem.read_text(remote_path) == ""
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_text_errors_on_relative_remote_path(servicer, client, sandbox):
+    with pytest.raises(InvalidError, match="absolute remote_path values"):
+        sandbox.filesystem.read_text("relative/path.txt")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_text_errors_when_remote_path_missing(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "read-text-missing.txt")
+
+    with pytest.raises(SandboxFilesystemNotFoundError):
+        sandbox.filesystem.read_text(remote_path)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_text_errors_when_remote_path_is_directory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_dir = str(tmp_path / "read-text-dir")
+    (tmp_path / "read-text-dir").mkdir()
+
+    with pytest.raises(SandboxFilesystemIsADirectoryError):
+        sandbox.filesystem.read_text(remote_dir)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_text_errors_when_file_too_large(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, monkeypatch
+):
+    monkeypatch.setenv("_MODAL_TEST_MAX_READ_FILE_SIZE", "5")
+    remote_path = str(tmp_path / "read-text-large.txt")
+    (tmp_path / "read-text-large.txt").write_text("more than five bytes", encoding="utf-8")
+
+    with pytest.raises(SandboxFilesystemFileTooLargeError):
+        sandbox.filesystem.read_text(remote_path)
+
+
+# ---------------------------------------------------------------------------
+# read_bytes
+# ---------------------------------------------------------------------------
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_bytes_returns_expected_bytes(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "read-bytes.bin")
+    payload = b"\x00\x01\x02binary\x00payload\xff"
+    (tmp_path / "read-bytes.bin").write_bytes(payload)
+
+    assert sandbox.filesystem.read_bytes(remote_path) == payload
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_bytes_returns_empty_bytes_for_empty_file(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_path = str(tmp_path / "empty.bin")
+    (tmp_path / "empty.bin").write_bytes(b"")
+
+    assert sandbox.filesystem.read_bytes(remote_path) == b""
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_bytes_errors_on_relative_remote_path(servicer, client, sandbox):
+    with pytest.raises(InvalidError, match="absolute remote_path values"):
+        sandbox.filesystem.read_bytes("relative/path.bin")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_bytes_errors_when_remote_path_missing(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "read-bytes-missing.bin")
+
+    with pytest.raises(SandboxFilesystemNotFoundError):
+        sandbox.filesystem.read_bytes(remote_path)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_bytes_errors_when_remote_path_is_directory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_dir = str(tmp_path / "read-bytes-dir")
+    (tmp_path / "read-bytes-dir").mkdir()
+
+    with pytest.raises(SandboxFilesystemIsADirectoryError):
+        sandbox.filesystem.read_bytes(remote_dir)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_read_bytes_errors_when_file_too_large(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, monkeypatch
+):
+    monkeypatch.setenv("_MODAL_TEST_MAX_READ_FILE_SIZE", "5")
+    remote_path = str(tmp_path / "read-bytes-large.bin")
+    (tmp_path / "read-bytes-large.bin").write_bytes(b"more than five bytes")
+
+    with pytest.raises(SandboxFilesystemFileTooLargeError):
+        sandbox.filesystem.read_bytes(remote_path)
+
+
+# ---------------------------------------------------------------------------
+# copy_to_local
+# ---------------------------------------------------------------------------
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_to_local_writes_file_to_correct_local_location(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    payload = _random_bytes(1024, seed=1)
+    src = tmp_path / "source.bin"
+    src.write_bytes(payload)
+    local_path = tmp_path / "nested" / "copied.bin"
+
+    sandbox.filesystem.copy_to_local(str(src), local_path)
+
+    assert local_path.exists()
+    assert local_path.read_bytes() == payload
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_to_local_creates_parent_directories_if_needed(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    payload = _random_bytes(2048, seed=2)
+    src = tmp_path / "source-parent.bin"
+    src.write_bytes(payload)
+    local_path = tmp_path / "deep" / "nested" / "path" / "copied.bin"
+
+    sandbox.filesystem.copy_to_local(str(src), local_path)
+
+    assert local_path.read_bytes() == payload
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_to_local_copies_correct_contents_when_file_is_empty(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    src = tmp_path / "empty.bin"
+    src.write_bytes(b"")
+    local_path = tmp_path / "empty-out.bin"
+
+    sandbox.filesystem.copy_to_local(str(src), local_path)
+
+    assert local_path.read_bytes() == b""
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_to_local_overwrites_existing_local_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    payload = _random_bytes(4096, seed=5)
+    src = tmp_path / "overwrite-source.bin"
+    src.write_bytes(payload)
+    local_path = tmp_path / "overwrite.bin"
+    local_path.write_bytes(b"old-data")
+
+    sandbox.filesystem.copy_to_local(str(src), local_path)
+
+    assert local_path.read_bytes() == payload
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_to_local_preserves_existing_file_on_remote_error(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    local_path = tmp_path / "existing.bin"
+    local_path.write_bytes(b"stable-content")
+    remote_path = str(tmp_path / "missing.bin")
+
+    with pytest.raises(SandboxFilesystemNotFoundError):
+        sandbox.filesystem.copy_to_local(remote_path, local_path)
+
+    assert local_path.read_bytes() == b"stable-content"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_to_local_errors_on_relative_remote_path(servicer, client, sandbox, tmp_path):
+    with pytest.raises(InvalidError, match="absolute remote_path values"):
+        sandbox.filesystem.copy_to_local("relative/path.bin", tmp_path / "ignored.bin")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_to_local_errors_if_remote_does_not_exist(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_path = str(tmp_path / "missing.bin")
+    local_path = tmp_path / "missing-out.bin"
+
+    with pytest.raises(SandboxFilesystemNotFoundError):
+        sandbox.filesystem.copy_to_local(remote_path, local_path)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_to_local_errors_when_local_path_is_directory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    payload = _random_bytes(512, seed=6)
+    src = tmp_path / "local-dir-source.bin"
+    src.write_bytes(payload)
+    local_dir = tmp_path / "local-dir"
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises((IsADirectoryError, OSError)):
+        sandbox.filesystem.copy_to_local(str(src), local_dir)
+
+    # Verify no temp files were leaked in the target directory.
+    leftover = list(local_dir.parent.glob(".modal-sandbox-fs-tmp-*"))
+    assert leftover == [], f"temp file leaked: {leftover}"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_to_local_errors_when_remote_path_is_directory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_dir = str(tmp_path / "remote-dir")
+    (tmp_path / "remote-dir").mkdir()
+
+    with pytest.raises(SandboxFilesystemIsADirectoryError):
+        sandbox.filesystem.copy_to_local(remote_dir, tmp_path / "unused.bin")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_to_local_errors_when_file_too_large(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, monkeypatch
+):
+    monkeypatch.setenv("_MODAL_TEST_MAX_READ_FILE_SIZE", "5")
+    src = tmp_path / "copy-large.bin"
+    src.write_bytes(b"more than five bytes")
+    local_path = tmp_path / "copy-large-out.bin"
+
+    with pytest.raises(SandboxFilesystemFileTooLargeError):
+        sandbox.filesystem.copy_to_local(str(src), local_path)
+
+    assert not local_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# write_bytes
+# ---------------------------------------------------------------------------
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_bytes_writes_expected_bytes(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "write-bytes.bin")
+    payload = b"\x00\x01\x02binary\x00payload\xff"
+
+    sandbox.filesystem.write_bytes(payload, remote_path)
+
+    assert (tmp_path / "write-bytes.bin").read_bytes() == payload
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_bytes_writes_empty_data(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "write-empty.bin")
+
+    sandbox.filesystem.write_bytes(b"", remote_path)
+
+    assert (tmp_path / "write-empty.bin").read_bytes() == b""
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_bytes_creates_parent_directories(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "nested" / "deep" / "write.bin")
+    payload = _random_bytes(1024, seed=20)
+
+    sandbox.filesystem.write_bytes(payload, remote_path)
+
+    assert (tmp_path / "nested" / "deep" / "write.bin").read_bytes() == payload
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_bytes_overwrites_existing_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "overwrite.bin")
+    (tmp_path / "overwrite.bin").write_bytes(b"old-data")
+
+    sandbox.filesystem.write_bytes(b"new-data", remote_path)
+
+    assert (tmp_path / "overwrite.bin").read_bytes() == b"new-data"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_bytes_accepts_bytearray(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "write-bytearray.bin")
+    payload = bytearray(b"\x00\x01\x02bytearray\xff")
+
+    sandbox.filesystem.write_bytes(payload, remote_path)
+
+    assert (tmp_path / "write-bytearray.bin").read_bytes() == payload
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_bytes_accepts_memoryview(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "write-memoryview.bin")
+    raw = b"\x00\x01\x02memoryview\xff"
+
+    sandbox.filesystem.write_bytes(memoryview(raw), remote_path)
+
+    assert (tmp_path / "write-memoryview.bin").read_bytes() == raw
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_bytes_handles_data_exceeding_stdin_buffer_limit(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_path = str(tmp_path / "write-large.bin")
+    payload = _random_bytes(TASK_COMMAND_ROUTER_MAX_BUFFER_SIZE + 1024, seed=40)
+
+    sandbox.filesystem.write_bytes(payload, remote_path)
+
+    assert (tmp_path / "write-large.bin").read_bytes() == payload
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_bytes_errors_on_relative_remote_path(servicer, client, sandbox):
+    with pytest.raises(InvalidError, match="absolute remote_path values"):
+        sandbox.filesystem.write_bytes(b"payload", "relative/path.bin")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_bytes_errors_on_unsupported_data_type(servicer, client, sandbox, tmp_path):
+    with pytest.raises(TypeError):
+        sandbox.filesystem.write_bytes("not-bytes", str(tmp_path / "unused.bin"))  # type: ignore[arg-type]
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_bytes_errors_when_remote_path_is_directory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_dir = str(tmp_path / "write-dir")
+    (tmp_path / "write-dir").mkdir()
+
+    with pytest.raises(SandboxFilesystemIsADirectoryError):
+        sandbox.filesystem.write_bytes(b"payload", remote_dir)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_bytes_errors_when_parent_is_a_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"I am a file")
+    remote_path = str(blocker / "child.txt")
+
+    with pytest.raises(SandboxFilesystemNotADirectoryError):
+        sandbox.filesystem.write_bytes(b"payload", remote_path)
+
+
+# ---------------------------------------------------------------------------
+# write_text
+# ---------------------------------------------------------------------------
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_text_writes_expected_text(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "write-text.txt")
+    text_payload = "hello from write_text\nsnowman: ☃\n"
+
+    sandbox.filesystem.write_text(text_payload, remote_path)
+
+    assert (tmp_path / "write-text.txt").read_bytes() == text_payload.encode("utf-8")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_text_writes_empty_string(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "write-empty.txt")
+
+    sandbox.filesystem.write_text("", remote_path)
+
+    assert (tmp_path / "write-empty.txt").read_bytes() == b""
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_text_creates_parent_directories(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "nested" / "deep" / "write.txt")
+
+    sandbox.filesystem.write_text("nested text", remote_path)
+
+    assert (tmp_path / "nested" / "deep" / "write.txt").read_text(encoding="utf-8") == "nested text"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_text_overwrites_existing_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "overwrite.txt")
+    (tmp_path / "overwrite.txt").write_text("old-data", encoding="utf-8")
+
+    sandbox.filesystem.write_text("new-data", remote_path)
+
+    assert (tmp_path / "overwrite.txt").read_text(encoding="utf-8") == "new-data"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_text_handles_data_exceeding_stdin_buffer_limit(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_path = str(tmp_path / "write-large.txt")
+    # Generate text larger than the stdin buffer limit
+    text_payload = "x" * (TASK_COMMAND_ROUTER_MAX_BUFFER_SIZE + 1024)
+
+    sandbox.filesystem.write_text(text_payload, remote_path)
+
+    assert (tmp_path / "write-large.txt").read_bytes() == text_payload.encode("utf-8")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_text_errors_on_relative_remote_path(servicer, client, sandbox):
+    with pytest.raises(InvalidError, match="absolute remote_path values"):
+        sandbox.filesystem.write_text("data", "relative/path.txt")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_text_errors_on_non_string_data(servicer, client, sandbox, tmp_path):
+    with pytest.raises(TypeError):
+        sandbox.filesystem.write_text(b"not-text", str(tmp_path / "unused.txt"))  # type: ignore[arg-type]
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_text_errors_when_remote_path_is_directory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_dir = str(tmp_path / "write-text-dir")
+    (tmp_path / "write-text-dir").mkdir()
+
+    with pytest.raises(SandboxFilesystemIsADirectoryError):
+        sandbox.filesystem.write_text("data", remote_dir)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_write_text_errors_when_parent_is_a_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    blocker = tmp_path / "blocker-text"
+    blocker.write_bytes(b"I am a file")
+    remote_path = str(blocker / "child.txt")
+
+    with pytest.raises(SandboxFilesystemNotADirectoryError):
+        sandbox.filesystem.write_text("data", remote_path)
+
+
+# ---------------------------------------------------------------------------
+# copy_from_local
+# ---------------------------------------------------------------------------
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_writes_file_to_correct_remote_location(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    payload = _random_bytes(8192, seed=30)
+    src = tmp_path / "source.bin"
+    src.write_bytes(payload)
+    remote_path = str(tmp_path / "copied.bin")
+
+    sandbox.filesystem.copy_from_local(src, remote_path)
+
+    assert (tmp_path / "copied.bin").read_bytes() == payload
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_copies_text_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    src = tmp_path / "source.txt"
+    src.write_text("text content", encoding="utf-8")
+    remote_path = str(tmp_path / "copied.txt")
+
+    sandbox.filesystem.copy_from_local(src, remote_path)
+
+    assert (tmp_path / "copied.txt").read_text(encoding="utf-8") == "text content"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_copies_empty_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    src = tmp_path / "empty.bin"
+    src.write_bytes(b"")
+    remote_path = str(tmp_path / "copied-empty.bin")
+
+    sandbox.filesystem.copy_from_local(src, remote_path)
+
+    assert (tmp_path / "copied-empty.bin").read_bytes() == b""
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_copies_file_opened_in_text_mode(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    src = tmp_path / "text-mode.txt"
+    with open(src, "w") as f:
+        f.write("written in text mode\n")
+    remote_path = str(tmp_path / "copied-text-mode.txt")
+
+    sandbox.filesystem.copy_from_local(src, remote_path)
+
+    assert (tmp_path / "copied-text-mode.txt").read_text(encoding="utf-8") == "written in text mode\n"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_errors_on_relative_remote_path(servicer, client, sandbox, tmp_path):
+    src = tmp_path / "source.bin"
+    src.write_bytes(b"data")
+
+    with pytest.raises(InvalidError, match="absolute remote_path values"):
+        sandbox.filesystem.copy_from_local(src, "relative/path.bin")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_errors_when_local_path_missing(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    missing_local = tmp_path / "missing-local.bin"
+    remote_path = str(tmp_path / "unused.bin")
+
+    with pytest.raises(FileNotFoundError):
+        sandbox.filesystem.copy_from_local(missing_local, remote_path)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_errors_when_local_path_is_directory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    local_dir = tmp_path / "source-dir"
+    local_dir.mkdir()
+    remote_path = str(tmp_path / "unused.bin")
+
+    with pytest.raises(IsADirectoryError):
+        sandbox.filesystem.copy_from_local(local_dir, remote_path)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_errors_when_remote_path_is_directory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    src = tmp_path / "copy-from-local-src.bin"
+    src.write_bytes(b"payload")
+    remote_dir = str(tmp_path / "copy-from-local-dir")
+    (tmp_path / "copy-from-local-dir").mkdir()
+
+    with pytest.raises(SandboxFilesystemIsADirectoryError):
+        sandbox.filesystem.copy_from_local(src, remote_dir)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_errors_when_parent_is_a_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    src = tmp_path / "copy-from-local-parent-src.bin"
+    src.write_bytes(b"payload")
+    blocker = tmp_path / "copy-from-local-blocker"
+    blocker.write_bytes(b"I am a file")
+    remote_path = str(blocker / "child.bin")
+
+    with pytest.raises(SandboxFilesystemNotADirectoryError):
+        sandbox.filesystem.copy_from_local(src, remote_path)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_resumes_after_transient_stream_failure(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    payload = random.Random(31).randbytes(2 * STREAMING_STDIN_CHUNK_SIZE + 12345)
+    src = tmp_path / "source.bin"
+    src.write_bytes(payload)
+    remote_path = str(tmp_path / "copied.bin")
+
+    # Fail the stream once, mid-upload. The client should query the accepted
+    # offset, seek the source, and resume from there.
+    tcr = servicer.task_command_router
+    tcr.stdin_stream_fail_after_bytes = STREAMING_STDIN_CHUNK_SIZE
+    tcr.stdin_stream_failures_remaining = 1
+
+    sandbox.filesystem.copy_from_local(src, remote_path)
+
+    # The initial attempt failed once, then a single resume completed the upload.
+    assert tcr.stdin_stream_attempt_count == 2
+    assert (tmp_path / "copied.bin").read_bytes() == payload
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_raises_after_exhausting_resume_attempts(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    # Each failed attempt commits one chunk before failing, so the payload must
+    # be large enough that the upload cannot complete within the attempt budget.
+    payload = random.Random(32).randbytes(12 * STREAMING_STDIN_CHUNK_SIZE)
+    src = tmp_path / "source.bin"
+    src.write_bytes(payload)
+    remote_path = str(tmp_path / "copied.bin")
+
+    tcr = servicer.task_command_router
+    tcr.stdin_stream_fail_after_bytes = 1
+    tcr.stdin_stream_failures_remaining = 100
+
+    with pytest.raises(NotFoundError, match="unavailable"):
+        sandbox.filesystem.copy_from_local(src, remote_path)
+
+    # The initial attempt plus 9 resumes, each failing.
+    assert tcr.stdin_stream_attempt_count == 10
+
+
+@skip_non_subprocess
+def test_sandbox_fs_copy_from_local_succeeds_when_response_lost_after_upload(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    payload = random.Random(33).randbytes(STREAMING_STDIN_CHUNK_SIZE + 12345)
+    src = tmp_path / "source.bin"
+    src.write_bytes(payload)
+    remote_path = str(tmp_path / "copied.bin")
+
+    # The server accepts every byte and the End message (closing stdin), but the
+    # response is lost. The client should detect the completed upload from the
+    # stdin status instead of reporting failure.
+    servicer.task_command_router.stdin_stream_drop_response = True
+
+    sandbox.filesystem.copy_from_local(src, remote_path)
+
+    assert not servicer.task_command_router.stdin_stream_drop_response, "failure was never injected"
+    assert (tmp_path / "copied.bin").read_bytes() == payload
+
+
+@skip_non_subprocess
+@pytest.mark.timeout(60)
+def test_sandbox_fs_write_bytes_raises_when_stdin_rejected_while_process_running(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    # The upload is rejected while the write command is still running, so the
+    # command never exits. The write must raise rather than wait for it.
+    servicer.task_command_router.stdin_stream_reject = True
+
+    with pytest.raises(SandboxFilesystemError):
+        sandbox.filesystem.write_bytes(b"payload", str(tmp_path / "never-written.txt"))
+
+    assert not servicer.task_command_router.stdin_stream_reject, "failure was never injected"
+    assert not (tmp_path / "never-written.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# list_files
+# ---------------------------------------------------------------------------
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_returns_expected_entries(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_dir = str(tmp_path / "list-dir")
+    (tmp_path / "list-dir").mkdir()
+    (tmp_path / "list-dir" / "hello.txt").write_text("hello", encoding="utf-8")
+    (tmp_path / "list-dir" / "subdir").mkdir()
+
+    result = sandbox.filesystem.list_files(remote_dir)
+
+    assert isinstance(result, list)
+    assert len(result) == 2
+    names = {entry.name for entry in result}
+    assert names == {"hello.txt", "subdir"}
+
+    file_entry = next(e for e in result if e.name == "hello.txt")
+    assert file_entry.is_file()
+    assert not file_entry.is_dir()
+    assert not file_entry.is_symlink()
+    assert file_entry.type == FileType.FILE
+    assert file_entry.size == 5
+
+    dir_entry = next(e for e in result if e.name == "subdir")
+    assert dir_entry.is_dir()
+    assert not dir_entry.is_file()
+    assert dir_entry.type == FileType.DIRECTORY
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_errors_on_relative_remote_path(servicer, client, sandbox):
+    with pytest.raises(InvalidError, match="absolute remote_path values"):
+        sandbox.filesystem.list_files("relative/path")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_fileinfo_has_correct_metadata(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_dir = str(tmp_path / "meta-dir")
+    (tmp_path / "meta-dir").mkdir()
+    file_content = "test content"
+    (tmp_path / "meta-dir" / "test.txt").write_text(file_content, encoding="utf-8")
+
+    result = sandbox.filesystem.list_files(remote_dir)
+
+    assert len(result) == 1
+    entry = result[0]
+    assert isinstance(entry, FileInfo)
+    assert entry.name == "test.txt"
+    assert entry.path.endswith("/meta-dir/test.txt")
+    assert entry.type == FileType.FILE
+    assert entry.size == len(file_content)
+    assert entry.permissions  # should be a non-empty octal string
+    assert entry.owner  # should be a non-empty string
+    assert entry.group  # should be a non-empty string
+    assert entry.modified_time > 0
+    assert entry.mode > 0
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_returns_empty_list_for_empty_directory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_dir = str(tmp_path / "empty-dir")
+    (tmp_path / "empty-dir").mkdir()
+
+    result = sandbox.filesystem.list_files(remote_dir)
+
+    assert result == []
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_includes_nested_directory_entries(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_dir = str(tmp_path / "nested-dir")
+    (tmp_path / "nested-dir").mkdir()
+    (tmp_path / "nested-dir" / "a").mkdir()
+    (tmp_path / "nested-dir" / "a" / "deep.txt").write_text("deep", encoding="utf-8")
+    (tmp_path / "nested-dir" / "b.txt").write_text("b", encoding="utf-8")
+
+    result = sandbox.filesystem.list_files(remote_dir)
+
+    # list_files only lists immediate children, not recursively
+    assert len(result) == 2
+    names = {entry.name for entry in result}
+    assert names == {"a", "b.txt"}
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_errors_when_path_does_not_exist(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "nonexistent-dir")
+
+    with pytest.raises(SandboxFilesystemNotFoundError):
+        sandbox.filesystem.list_files(remote_path)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_errors_when_path_is_a_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_path = str(tmp_path / "not-a-dir.txt")
+    (tmp_path / "not-a-dir.txt").write_text("I am a file", encoding="utf-8")
+
+    with pytest.raises(SandboxFilesystemNotADirectoryError):
+        sandbox.filesystem.list_files(remote_path)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_errors_when_path_component_is_a_file(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    blocker = tmp_path / "blocker.txt"
+    blocker.write_text("I am a file", encoding="utf-8")
+    remote_path = str(blocker / "subdir")
+
+    with pytest.raises(SandboxFilesystemNotADirectoryError):
+        sandbox.filesystem.list_files(remote_path)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_returns_correct_type_for_symlinks(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    import os
+
+    remote_dir = str(tmp_path / "symlink-type-dir")
+    (tmp_path / "symlink-type-dir").mkdir()
+    os.symlink("/dev/null", tmp_path / "symlink-type-dir" / "link")
+
+    result = sandbox.filesystem.list_files(remote_dir)
+
+    assert len(result) == 1
+    assert result[0].type == FileType.SYMLINK
+    assert result[0].is_symlink()
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_shows_symlink_target_for_symlinked_files(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    import os
+
+    target = tmp_path / "target.txt"
+    target.write_text("content", encoding="utf-8")
+    link_dir = tmp_path / "links"
+    link_dir.mkdir()
+    os.symlink(target, link_dir / "link.txt")
+
+    result = sandbox.filesystem.list_files(str(link_dir))
+
+    assert len(result) == 1
+    assert result[0].symlink_target == str(target)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_does_not_show_symlink_target_for_nonsymlinked_file(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_dir = str(tmp_path / "no-symlink-file-dir")
+    (tmp_path / "no-symlink-file-dir").mkdir()
+    (tmp_path / "no-symlink-file-dir" / "file.txt").write_text("hello", encoding="utf-8")
+
+    result = sandbox.filesystem.list_files(remote_dir)
+
+    assert len(result) == 1
+    assert result[0].symlink_target is None
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_does_not_show_symlink_target_for_nonsymlinked_directory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    remote_dir = str(tmp_path / "no-symlink-dir-dir")
+    (tmp_path / "no-symlink-dir-dir").mkdir()
+    (tmp_path / "no-symlink-dir-dir" / "subdir").mkdir()
+
+    result = sandbox.filesystem.list_files(remote_dir)
+
+    assert len(result) == 1
+    assert result[0].symlink_target is None
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_entries_sorted_by_name(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    remote_dir = str(tmp_path / "sorted-dir")
+    (tmp_path / "sorted-dir").mkdir()
+    (tmp_path / "sorted-dir" / "zebra.txt").write_text("z", encoding="utf-8")
+    (tmp_path / "sorted-dir" / "alpha.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "sorted-dir" / "middle.txt").write_text("m", encoding="utf-8")
+
+    result = sandbox.filesystem.list_files(remote_dir)
+
+    assert [entry.name for entry in result] == ["alpha.txt", "middle.txt", "zebra.txt"]
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_dangling_symlink_reported_as_symlink(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    import os
+
+    remote_dir = str(tmp_path / "dangling-dir")
+    (tmp_path / "dangling-dir").mkdir()
+    os.symlink(tmp_path / "nonexistent-target", tmp_path / "dangling-dir" / "dangling-link")
+
+    result = sandbox.filesystem.list_files(remote_dir)
+
+    assert len(result) == 1
+    assert result[0].type == FileType.SYMLINK
+    assert result[0].is_symlink()
+    assert result[0].symlink_target == str(tmp_path / "nonexistent-target")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_follows_symlink_if_path_is_directory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    import os
+
+    target_dir = tmp_path / "target-dir"
+    target_dir.mkdir()
+    (target_dir / "file.txt").write_text("hello", encoding="utf-8")
+    link = tmp_path / "link-to-dir"
+    os.symlink(target_dir, link)
+
+    result = sandbox.filesystem.list_files(str(link))
+
+    assert len(result) == 1
+    assert result[0].name == "file.txt"
+    assert result[0].type == FileType.FILE
+    assert result[0].path.startswith(str(link))
+
+
+@skip_non_subprocess
+def test_sandbox_fs_list_files_symlink_to_directory_reported_as_symlink(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    import os
+
+    remote_dir = str(tmp_path / "dir-with-dirlink")
+    (tmp_path / "dir-with-dirlink").mkdir()
+    target_dir = tmp_path / "dir-with-dirlink" / "target-dir"
+    target_dir.mkdir()
+    os.symlink(target_dir, tmp_path / "dir-with-dirlink" / "link-to-dir")
+
+    result = sandbox.filesystem.list_files(remote_dir)
+
+    link_entry = next(e for e in result if e.name == "link-to-dir")
+    assert link_entry.type == FileType.SYMLINK
+    assert link_entry.is_symlink()
+    assert link_entry.symlink_target == str(target_dir)
+
+
+# ---------------------------------------------------------------------------
+# remove
+# ---------------------------------------------------------------------------
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_remove_file_removes_a_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools, recursive):
+    file_path = tmp_path / "to-remove.txt"
+    file_path.write_bytes(b"bye")
+
+    sandbox.filesystem.remove(str(file_path), recursive=recursive)
+
+    assert not file_path.exists()
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_remove_errors_when_file_missing(servicer, client, sandbox, tmp_path, sandbox_fs_tools, recursive):
+    missing = str(tmp_path / "missing.txt")
+
+    with pytest.raises(SandboxFilesystemNotFoundError):
+        sandbox.filesystem.remove(missing, recursive=recursive)
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_remove_removes_empty_directory(servicer, client, sandbox, tmp_path, sandbox_fs_tools, recursive):
+    dir_path = tmp_path / "a-dir"
+    dir_path.mkdir()
+
+    sandbox.filesystem.remove(str(dir_path), recursive=recursive)
+
+    assert not dir_path.exists()
+
+
+@skip_non_subprocess
+def test_sandbox_fs_remove_errors_when_target_is_nonempty_directory_and_not_recursive(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    dir_path = tmp_path / "nonempty-dir"
+    dir_path.mkdir()
+    (dir_path / "file.txt").write_bytes(b"hello")
+
+    with pytest.raises(SandboxFilesystemDirectoryNotEmptyError):
+        sandbox.filesystem.remove(str(dir_path), recursive=False)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_remove_recursive_removes_directory_tree(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    dir_path = tmp_path / "tree"
+    (dir_path / "nested").mkdir(parents=True)
+    (dir_path / "nested" / "file.txt").write_bytes(b"hello")
+
+    sandbox.filesystem.remove(str(dir_path), recursive=True)
+
+    assert not dir_path.exists()
+
+
+@skip_non_subprocess
+def test_sandbox_fs_remove_removes_symlink_without_following_it(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    import os
+
+    target = tmp_path / "target.txt"
+    link = tmp_path / "link.txt"
+    target.write_bytes(b"original")
+    os.symlink(target, link)
+
+    sandbox.filesystem.remove(str(link))
+
+    assert not link.exists()
+    assert target.read_bytes() == b"original"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_remove_errors_on_relative_remote_path(servicer, client, sandbox):
+    with pytest.raises(InvalidError, match="absolute remote_path values"):
+        sandbox.filesystem.remove("relative/path.txt")
+
+
+# ---------------------------------------------------------------------------
+# make_directory
+# ---------------------------------------------------------------------------
+
+
+@skip_non_subprocess
+def test_sandbox_fs_make_directory_no_parents_creates_directory(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    new_dir = tmp_path / "new-dir"
+
+    sandbox.filesystem.make_directory(str(new_dir), create_parents=False)
+
+    assert new_dir.is_dir()
+
+
+@skip_non_subprocess
+def test_sandbox_fs_make_directory_creates_nested_directories(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    nested = tmp_path / "a" / "b" / "c"
+
+    sandbox.filesystem.make_directory(str(nested))
+
+    assert nested.is_dir()
+
+
+@skip_non_subprocess
+def test_sandbox_fs_make_directory_is_idempotent_when_already_exists(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    existing = tmp_path / "existing"
+    existing.mkdir()
+
+    sandbox.filesystem.make_directory(str(existing))
+
+    assert existing.is_dir()
+
+
+@skip_non_subprocess
+def test_sandbox_fs_make_directory_no_parents_errors_when_already_exists(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    existing = tmp_path / "existing"
+    existing.mkdir()
+
+    with pytest.raises(SandboxFilesystemPathAlreadyExistsError):
+        sandbox.filesystem.make_directory(str(existing), create_parents=False)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_make_directory_no_parents_errors_when_parent_missing(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    missing = tmp_path / "missing-parent" / "child"
+
+    with pytest.raises(SandboxFilesystemNotFoundError):
+        sandbox.filesystem.make_directory(str(missing), create_parents=False)
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("parents", [False, True])
+def test_sandbox_fs_make_directory_errors_when_target_is_a_file(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, parents
+):
+    file_path = tmp_path / "existing-file"
+    file_path.write_bytes(b"I am a file")
+
+    with pytest.raises(SandboxFilesystemPathAlreadyExistsError):
+        sandbox.filesystem.make_directory(str(file_path), create_parents=parents)
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("parents", [False, True])
+def test_sandbox_fs_make_directory_errors_when_ancestor_is_a_file(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, parents
+):
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"I am a file")
+    blocked = blocker / "child"
+
+    with pytest.raises(SandboxFilesystemNotADirectoryError):
+        sandbox.filesystem.make_directory(str(blocked), create_parents=parents)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_make_directory_no_parents_errors_on_relative_remote_path(servicer, client, sandbox):
+    with pytest.raises(InvalidError, match="absolute remote_path values"):
+        sandbox.filesystem.make_directory("relative/path", create_parents=False)
+
+
+# ---------------------------------------------------------------------------
+# stat
+# ---------------------------------------------------------------------------
+
+
+@skip_non_subprocess
+def test_sandbox_fs_stat_returns_metadata_for_regular_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    file_path = tmp_path / "stat-file.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    file_path.chmod(0o644)
+
+    info = sandbox.filesystem.stat(str(file_path))
+
+    assert isinstance(info, FileInfo)
+    assert info.name == "stat-file.txt"
+    assert info.path == str(file_path)
+    assert info.type == FileType.FILE
+    assert info.is_file()
+    assert not info.is_dir()
+    assert not info.is_symlink()
+    assert info.size == 5
+    assert info.permissions == "0644"
+    assert info.mode > 0
+    assert info.modified_time > 0
+    assert info.owner
+    assert info.group
+    assert info.symlink_target is None
+
+
+@skip_non_subprocess
+def test_sandbox_fs_stat_returns_metadata_for_directory(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    dir_path = tmp_path / "stat-dir"
+    dir_path.mkdir()
+
+    info = sandbox.filesystem.stat(str(dir_path))
+
+    assert info.name == "stat-dir"
+    assert info.path == str(dir_path)
+    assert info.type == FileType.DIRECTORY
+    assert info.is_dir()
+    assert not info.is_file()
+    assert not info.is_symlink()
+    assert info.symlink_target is None
+
+
+@skip_non_subprocess
+def test_sandbox_fs_stat_returns_metadata_for_empty_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    file_path = tmp_path / "empty.txt"
+    file_path.write_bytes(b"")
+
+    info = sandbox.filesystem.stat(str(file_path))
+
+    assert info.type == FileType.FILE
+    assert info.size == 0
+
+
+@skip_non_subprocess
+def test_sandbox_fs_stat_reports_symlink_to_file_as_symlink(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    import os
+
+    target = tmp_path / "stat-target.txt"
+    target.write_text("hello", encoding="utf-8")
+    link = tmp_path / "stat-link.txt"
+    os.symlink(target, link)
+
+    info = sandbox.filesystem.stat(str(link))
+
+    assert info.name == "stat-link.txt"
+    assert info.path == str(link)
+    assert info.type == FileType.SYMLINK
+    assert info.is_symlink()
+    assert info.symlink_target == str(target)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_stat_reports_symlink_to_directory_as_symlink(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    import os
+
+    target_dir = tmp_path / "stat-target-dir"
+    target_dir.mkdir()
+    link = tmp_path / "stat-link-to-dir"
+    os.symlink(target_dir, link)
+
+    info = sandbox.filesystem.stat(str(link))
+
+    assert info.type == FileType.SYMLINK
+    assert info.is_symlink()
+    assert info.symlink_target == str(target_dir)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_stat_reports_dangling_symlink_as_symlink(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    import os
+
+    missing = tmp_path / "stat-missing-target"
+    link = tmp_path / "stat-dangling-link"
+    os.symlink(missing, link)
+
+    info = sandbox.filesystem.stat(str(link))
+
+    assert info.type == FileType.SYMLINK
+    assert info.is_symlink()
+    assert info.symlink_target == str(missing)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_stat_preserves_relative_symlink_target(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    import os
+
+    # Relative target, with no directory prefix. lstat reads the link text
+    # verbatim, so this exact string must come back through.
+    link = tmp_path / "stat-rel-link.txt"
+    os.symlink("target.txt", link)
+
+    info = sandbox.filesystem.stat(str(link))
+
+    assert info.type == FileType.SYMLINK
+    assert info.symlink_target == "target.txt"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_stat_permissions_string_reflects_mode(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    file_path = tmp_path / "perm-file.txt"
+    file_path.write_bytes(b"")
+    file_path.chmod(0o755)
+
+    info = sandbox.filesystem.stat(str(file_path))
+
+    assert info.permissions == "0755"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_stat_errors_on_relative_remote_path(servicer, client, sandbox):
+    with pytest.raises(InvalidError, match="absolute remote_path values"):
+        sandbox.filesystem.stat("relative/path.txt")
+
+
+@skip_non_subprocess
+def test_sandbox_fs_stat_errors_when_path_does_not_exist(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    missing = str(tmp_path / "stat-missing")
+
+    with pytest.raises(SandboxFilesystemNotFoundError):
+        sandbox.filesystem.stat(missing)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_stat_errors_when_ancestor_is_a_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    blocker = tmp_path / "stat-blocker"
+    blocker.write_bytes(b"I am a file")
+
+    with pytest.raises(SandboxFilesystemNotADirectoryError):
+        sandbox.filesystem.stat(str(blocker / "child"))
+
+
+# ---------------------------------------------------------------------------
+# watch
+# ---------------------------------------------------------------------------
+
+
+def _run_watch_with_trigger(
+    sandbox: Sandbox,
+    path: str,
+    trigger: Callable[[int], None],
+    *,
+    recursive: bool = False,
+    filter: Optional[list[FileWatchEventType]] = None,
+    timeout: float = 0.5,
+) -> list[FileWatchEvent]:
+    """Run watch() while trigger(i) fires every 50ms in the background."""
+    stop = threading.Event()
+
+    def _runner():
+        i = 0
+        while not stop.is_set():
+            try:
+                trigger(i)
+            except Exception:
+                pass
+            i += 1
+            stop.wait(0.05)
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    try:
+        return list(
+            sandbox.filesystem.watch(
+                path,
+                recursive=recursive,
+                filter=filter,
+                timeout=timeout,  # type: ignore
+            )
+        )
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+
+
+@skip_non_subprocess
+def test_sandbox_fs_watch_errors_on_relative_remote_path(servicer, client, sandbox):
+    with pytest.raises(InvalidError, match="absolute remote_path values"):
+        for _ in sandbox.filesystem.watch("relative/path"):
+            pass
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_watch_errors_when_path_does_not_exist(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, recursive
+):
+    missing = str(tmp_path / "watch-missing")
+
+    with pytest.raises(SandboxFilesystemNotFoundError):
+        for _ in sandbox.filesystem.watch(missing, recursive=recursive, timeout=2):
+            pass
+
+
+@skip_non_subprocess
+@pytest.mark.flaky(max_runs=2)
+@pytest.mark.timeout(30)
+def test_sandbox_fs_watch_returns_immediately_on_zero_timeout(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    """timeout=0 must return without yielding any events."""
+    watch_dir = tmp_path / "watch-zero-timeout-dir"
+    watch_dir.mkdir()
+
+    events = list(sandbox.filesystem.watch(str(watch_dir), timeout=0))
+    assert events == []
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_watch_emits_create_event_for_new_file(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, recursive
+):
+    watch_dir = tmp_path / "watch-create-dir"
+    watch_dir.mkdir()
+
+    def trigger(i: int) -> None:
+        (watch_dir / f"trigger-{i}.txt").write_text("hello", encoding="utf-8")
+
+    events = _run_watch_with_trigger(sandbox, str(watch_dir), trigger, recursive=recursive)
+
+    assert any(e.type == FileWatchEventType.Create for e in events), f"no Create event in: {events}"
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_watch_emits_modify_event_for_existing_file(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, recursive
+):
+    watch_dir = tmp_path / "watch-modify-dir"
+    watch_dir.mkdir()
+    target = watch_dir / "existing.txt"
+    target.write_bytes(b"initial")
+
+    def trigger(i: int) -> None:
+        target.write_text(f"v{i}", encoding="utf-8")
+
+    events = _run_watch_with_trigger(sandbox, str(watch_dir), trigger, recursive=recursive)
+
+    assert any(e.type == FileWatchEventType.Modify for e in events), f"no Modify event in: {events}"
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_watch_emits_remove_event_for_deleted_file(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, recursive
+):
+    watch_dir = tmp_path / "watch-remove-dir"
+    watch_dir.mkdir()
+
+    def trigger(i: int) -> None:
+        # Create a fresh file each iteration and remove the previous one.
+        # Splitting create and remove across iterations gives the watcher
+        # time to observe both transitions instead of seeing nothing.
+        (watch_dir / f"f-{i}.txt").write_text("hi", encoding="utf-8")
+        if i >= 1:
+            (watch_dir / f"f-{i - 1}.txt").unlink(missing_ok=True)
+
+    events = _run_watch_with_trigger(sandbox, str(watch_dir), trigger, recursive=recursive)
+
+    assert any(e.type == FileWatchEventType.Remove for e in events), f"no Remove event in: {events}"
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_watch_emits_rename_event_for_renamed_file(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, recursive
+):
+    watch_dir = tmp_path / "watch-rename-dir"
+    watch_dir.mkdir()
+    # Pre-create so the file is already in the mock's initial snapshot.
+    (watch_dir / "before.txt").write_text("content", encoding="utf-8")
+
+    def trigger(i: int) -> None:
+        before = watch_dir / "before.txt"
+        after = watch_dir / "after.txt"
+        if before.exists():
+            before.rename(after)
+        elif after.exists():
+            after.rename(before)
+
+    events = _run_watch_with_trigger(sandbox, str(watch_dir), trigger, recursive=recursive)
+
+    assert any(e.type == FileWatchEventType.Modify for e in events), f"no Modify event in: {events}"
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_watch_rename_event_includes_both_paths(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, recursive
+):
+    watch_dir = tmp_path / "watch-rename-paths-dir"
+    watch_dir.mkdir()
+    # Pre-create so the file is already in the mock's initial snapshot.
+    (watch_dir / "before.txt").write_text("content", encoding="utf-8")
+
+    def trigger(i: int) -> None:
+        before = watch_dir / "before.txt"
+        after = watch_dir / "after.txt"
+        if before.exists():
+            before.rename(after)
+        elif after.exists():
+            after.rename(before)
+
+    events = _run_watch_with_trigger(sandbox, str(watch_dir), trigger, recursive=recursive)
+
+    modify_events = [e for e in events if e.type == FileWatchEventType.Modify]
+    assert modify_events, f"no Modify events in: {events}"
+
+    all_paths = {p for e in modify_events for p in e.paths}
+    assert any("before" in p for p in all_paths), f"expected source path in rename events; got paths: {all_paths}"
+    assert any("after" in p for p in all_paths), f"expected destination path in rename events; got paths: {all_paths}"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_watch_emits_event_when_path_is_a_file(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    target = tmp_path / "watched.txt"
+    target.write_bytes(b"initial")
+
+    def trigger(i: int) -> None:
+        target.write_text(f"v{i}", encoding="utf-8")
+
+    events = _run_watch_with_trigger(sandbox, str(target), trigger)
+
+    assert any(e.type == FileWatchEventType.Modify for e in events), f"no Modify event in: {events}"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_watch_recursive_observes_events_in_subdirectory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    watch_dir = tmp_path / "watch-recursive-dir"
+    watch_dir.mkdir()
+    subdir = watch_dir / "nested"
+    subdir.mkdir()
+
+    def trigger(i: int) -> None:
+        (subdir / f"deep-{i}.txt").write_text("hi", encoding="utf-8")
+
+    events = _run_watch_with_trigger(sandbox, str(watch_dir), trigger, recursive=True)
+
+    assert any(p.startswith(str(subdir)) for e in events for p in e.paths), (
+        f"expected at least one event under {subdir}; got: {events}"
+    )
+
+
+@skip_non_subprocess
+def test_sandbox_fs_watch_nonrecursive_ignores_events_in_subdirectory(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools
+):
+    watch_dir = tmp_path / "watch-nonrecursive-dir"
+    watch_dir.mkdir()
+    subdir = watch_dir / "nested"
+    subdir.mkdir()
+
+    def trigger(i: int) -> None:
+        (subdir / f"deep-{i}.txt").write_text("hi", encoding="utf-8")
+
+    events = _run_watch_with_trigger(sandbox, str(watch_dir), trigger, recursive=False)
+
+    assert events == [], f"non-recursive watch should ignore subdirectory events; got: {events}"
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_watch_filter_drops_unmatched_events(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, recursive
+):
+    watch_dir = tmp_path / "watch-filter-drops-dir"
+    watch_dir.mkdir()
+
+    def trigger(i: int) -> None:
+        (watch_dir / f"f-{i}.txt").write_text("hi", encoding="utf-8")
+
+    events = _run_watch_with_trigger(
+        sandbox,
+        str(watch_dir),
+        trigger,
+        filter=[FileWatchEventType.Remove],
+        recursive=recursive,
+    )
+
+    assert events == [], f"filter=[REMOVE] should drop Create events; got: {events}"
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize(
+    "allowed",
+    [
+        [FileWatchEventType.Create],
+        [FileWatchEventType.Create, FileWatchEventType.Remove],
+    ],
+)
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_watch_filter_keeps_only_matching_events(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, allowed, recursive
+):
+    watch_dir = tmp_path / "watch-filter-keeps-dir"
+    watch_dir.mkdir()
+
+    def trigger(i: int) -> None:
+        (watch_dir / f"f-{i}.txt").write_text("hi", encoding="utf-8")
+        if i >= 1:
+            (watch_dir / f"f-{i - 1}.txt").unlink(missing_ok=True)
+
+    events = _run_watch_with_trigger(sandbox, str(watch_dir), trigger, filter=allowed, recursive=recursive)
+
+    assert events, "expected at least one event"
+    seen_types = {e.type for e in events}
+    for t in allowed:
+        assert t in seen_types, f"expected {t} in events; got: {seen_types}"
+    assert seen_types <= set(allowed), f"unexpected event types: {seen_types - set(allowed)}"
+
+
+@skip_non_subprocess
+@pytest.mark.parametrize("recursive", [False, True])
+def test_sandbox_fs_watch_empty_filter_yields_no_events(
+    servicer, client, sandbox, tmp_path, sandbox_fs_tools, recursive
+):
+    watch_dir = tmp_path / "watch-empty-filter-dir"
+    watch_dir.mkdir()
+
+    def trigger(i: int) -> None:
+        (watch_dir / f"f-{i}.txt").write_text("hi", encoding="utf-8")
+
+    events = _run_watch_with_trigger(sandbox, str(watch_dir), trigger, filter=[], recursive=recursive)
+
+    assert events == [], f"empty filter should drop all events; got: {events}"
+
+
+@skip_non_subprocess
+@pytest.mark.flaky(max_runs=2)
+@pytest.mark.timeout(30)
+def test_sandbox_fs_watch_break_returns_quickly(servicer, client, sandbox, tmp_path, sandbox_fs_tools):
+    watch_dir = tmp_path / "watch-break-dir"
+    watch_dir.mkdir()
+
+    def _writer():
+        time.sleep(0.2)
+        (watch_dir / "trigger.txt").write_text("hello", encoding="utf-8")
+
+    threading.Thread(target=_writer, daemon=True).start()
+    for _ in sandbox.filesystem.watch(str(watch_dir), timeout=60):
+        break
+
+
+# ---------------------------------------------------------------------------
+# Sidecar container filesystem tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def sidecar(sandbox):
+    """Sidecar container for filesystem operation tests."""
+    image = mock.Mock()
+    image.object_id = "im-test-1"
+    image._mount_layers = []
+    container = sandbox._experimental_sidecars.create("sleep", "600", name="fs-test-sidecar", image=image)
+    yield container
+    container.terminate(wait=False)
+
+
+@skip_non_subprocess
+def test_sidecar_read_write_text(sidecar, sandbox_fs_tools, tmp_path):
+    path = str(tmp_path / "sidecar-text.txt")
+    sidecar.filesystem.write_text("hello sidecar\n", path)
+    assert sidecar.filesystem.read_text(path) == "hello sidecar\n"
+
+
+@skip_non_subprocess
+def test_sidecar_read_write_bytes(sidecar, sandbox_fs_tools, tmp_path):
+    path = str(tmp_path / "sidecar-blob.bin")
+    sidecar.filesystem.write_bytes(b"\x00\x01\x02", path)
+    assert sidecar.filesystem.read_bytes(path) == b"\x00\x01\x02"
+
+
+@skip_non_subprocess
+def test_sidecar_copy_from_local(sidecar, sandbox_fs_tools, tmp_path):
+    src = tmp_path / "src.txt"
+    src.write_text("local content")
+    dest = str(tmp_path / "from-local.txt")
+    sidecar.filesystem.copy_from_local(src, dest)
+    assert sidecar.filesystem.read_text(dest) == "local content"
+
+
+@skip_non_subprocess
+def test_sidecar_copy_to_local(sidecar, sandbox_fs_tools, tmp_path):
+    remote_path = str(tmp_path / "remote.txt")
+    sidecar.filesystem.write_text("remote content", remote_path)
+    dest = tmp_path / "dest.txt"
+    sidecar.filesystem.copy_to_local(remote_path, dest)
+    assert dest.read_text() == "remote content"
+
+
+@skip_non_subprocess
+def test_sidecar_make_directory_and_list_files(sidecar, sandbox_fs_tools, tmp_path):
+    parent = str(tmp_path / "mydir")
+    sub = str(tmp_path / "mydir" / "sub")
+    sidecar.filesystem.make_directory(sub)
+    entries = sidecar.filesystem.list_files(parent)
+    assert any(e.name == "sub" and e.is_dir() for e in entries)
+
+
+@skip_non_subprocess
+def test_sidecar_remove(sidecar, sandbox_fs_tools, tmp_path):
+    path = str(tmp_path / "bye.txt")
+    sidecar.filesystem.write_text("bye", path)
+    sidecar.filesystem.remove(path)
+    with pytest.raises(SandboxFilesystemNotFoundError):
+        sidecar.filesystem.read_text(path)
+
+
+@skip_non_subprocess
+def test_sidecar_stat(sidecar, sandbox_fs_tools, tmp_path):
+    path = str(tmp_path / "stat.txt")
+    sidecar.filesystem.write_text("stat me", path)
+    info = sidecar.filesystem.stat(path)
+    assert info.is_file()
+    assert info.size == len("stat me")
+
+
+@skip_non_subprocess
+def test_sidecar_read_text_not_found(sidecar, sandbox_fs_tools, tmp_path):
+    with pytest.raises(SandboxFilesystemNotFoundError):
+        sidecar.filesystem.read_text(str(tmp_path / "does-not-exist.txt"))
+
+
+@skip_non_subprocess
+def test_sidecar_write_to_directory_raises(sidecar, sandbox_fs_tools, tmp_path):
+    adir = str(tmp_path / "adir")
+    sidecar.filesystem.make_directory(adir)
+    with pytest.raises(SandboxFilesystemIsADirectoryError):
+        sidecar.filesystem.write_text("data", adir)
+
+
+@skip_non_subprocess
+def test_sidecar_relative_path_rejected(sidecar):
+    with pytest.raises(InvalidError):
+        sidecar.filesystem.read_text("relative/path.txt")
+
+
+@pytest.fixture
+def sandbox_v2(app):
+    sb = None
+    try:
+        sb = Sandbox._experimental_create(app=app)
+        yield sb
+    finally:
+        if sb:
+            sb.terminate()
+
+
+def test_sandbox_fs_v2_filesystem_property_does_not_raise(sandbox_v2):
+    assert sandbox_v2.filesystem is not None
+
+
+@skip_non_subprocess
+def test_sandbox_fs_v2_read_write_text(sandbox_v2, sandbox_fs_tools, tmp_path):
+    path = str(tmp_path / "v2-text.txt")
+    sandbox_v2.filesystem.write_text("hello v2\n", path)
+    assert sandbox_v2.filesystem.read_text(path) == "hello v2\n"
+
+
+@skip_non_subprocess
+def test_sandbox_fs_v2_read_write_bytes(sandbox_v2, sandbox_fs_tools, tmp_path):
+    path = str(tmp_path / "v2-blob.bin")
+    sandbox_v2.filesystem.write_bytes(b"\x00\x01\x02", path)
+    assert sandbox_v2.filesystem.read_bytes(path) == b"\x00\x01\x02"

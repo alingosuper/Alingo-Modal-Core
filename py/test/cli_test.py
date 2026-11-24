@@ -1,0 +1,10203 @@
+# Copyright Modal Labs 2022-2023
+import asyncio
+import csv
+import io
+import json
+import logging
+import os
+import platform
+import pytest
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
+from importlib import resources
+from pathlib import Path
+from pickle import dumps
+from typing import cast
+from unittest import mock
+
+import click
+import pytest_asyncio
+import toml
+from google.protobuf.empty_pb2 import Empty
+from google.protobuf.timestamp_pb2 import Timestamp
+from grpclib import GRPCError, Status
+
+import modal
+from modal._serialization import PICKLE_PROTOCOL, serialize_proto_params
+from modal._utils.grpc_testing import InterceptionContext
+from modal._utils.logger import logger
+from modal.cli import _audit_logs
+from modal.cli._suggest import get_hint
+from modal.cli.entry_point import entrypoint_cli
+from modal.exception import DeprecationError, InvalidError, NotFoundError, _CliUserExecutionError
+from modal.types import LogEntry
+from modal_proto import api_pb2
+
+from . import helpers
+from .conftest import MockClientServicer, Volume, run_cli_command, servicer_factory
+from .supports.skip import skip_windows
+
+dummy_app_file = """
+import modal
+
+import other_module
+
+app = modal.App("my_app")
+
+# Sanity check that the module is imported properly
+import sys
+mod = sys.modules[__name__]
+assert mod.app == app
+"""
+
+dummy_other_module_file = "x = 42"
+
+
+def _commands_with_yes(
+    command: click.Command, path: tuple[str, ...] = ()
+) -> Iterator[tuple[tuple[str, ...], click.Command]]:
+    if any(isinstance(param, click.Option) and "--yes" in param.opts for param in command.params):
+        yield path, command
+    if isinstance(command, click.Group):
+        for name, subcommand in command.commands.items():
+            yield from _commands_with_yes(subcommand, (*path, name))
+
+
+@pytest.mark.parametrize(
+    "path, command",
+    [pytest.param(path, command, id=" ".join(path)) for path, command in _commands_with_yes(entrypoint_cli)],
+)
+@pytest.mark.filterwarnings("ignore:.*`modal.NetworkFileSystem` is deprecated:modal.exception.DeprecationError")
+def test_yes_commands_abort_without_terminal(path, command, servicer, set_env_client, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    # Force both skill commands down a path requiring confirmation.
+    target_dir = tmp_path / ".agents" / "skills" / "modal"
+    target_dir.mkdir(parents=True)
+    (target_dir / "old.txt").write_text("old")
+
+    app_id = "ap-aaaaaaaaaaaaaaaaaaaaaa"
+    servicer.app_state_history[app_id] = [api_pb2.APP_STATE_DEPLOYED]
+    _add_endpoint_lifecycle(servicer)
+    if path == ("nfs", "delete"):
+        run_cli_command(["nfs", "create", "test-name"])
+    required_options = {
+        ("server", "deploy"): ["--image", "docker.io/nginx", "--port", "80"],
+        ("workspace", "member-tokens", "disable"): ["ak-0000000000000000000000"],
+        ("workspace", "member-tokens", "enable"): ["ak-0000000000000000000000"],
+        ("workspace", "member-tokens", "delete"): ["ak-0000000000000000000000"],
+    }.get(path, [])
+    if path == ("server", "deploy"):
+        # Deploy once so that deploying again asks to confirm the redeploy.
+        run_cli_command([*path, *required_options, "--yes"])
+    argument_values = {
+        "app_identifier": app_id,
+        "endpoint_identifier": "ep-aaaaaaaaaaaaaaaaaaaaaa",
+        "container_id": "ta-123",
+        "name": "test-name:latest" if path == ("image", "names", "delete") else "test-name",
+    }
+
+    args = list(path)
+    for param in command.params:
+        if isinstance(param, click.Argument) and param.required:
+            assert param.nargs == 1, f"Provide test arguments for {' '.join(path)}"
+            args.append(argument_values.get(param.name, "test-name"))
+    args.extend(required_options)
+
+    # A non-TTY stdin may remain open indefinitely. Never attempt to read it.
+    def unexpected_prompt(*args, **kwargs):
+        pytest.fail("Attempted to prompt without an interactive terminal")
+
+    monkeypatch.setattr(click, "confirm", unexpected_prompt)
+    with servicer.intercept() as ctx:
+        if path == ("container", "stop"):
+            ctx.add_response("TaskGetInfo", api_pb2.TaskGetInfoResponse(info=api_pb2.TaskInfo(id="ta-123")))
+        res = run_cli_command(args, expected_exit_code=1)
+    assert "Aborted: no interactive terminal detected. Rerun with --yes (-y) to skip confirmation." in str(
+        res.exception
+    )
+
+
+@pytest.fixture(autouse=True)
+def command_suggestion_server(server_url_env):
+    """Keep command guidance requests on the mock server."""
+
+
+def windows_sleep():
+    # For some time-sensitive operations, we need brief sleeps on Windows so that events
+    # don't appear to have happened at the same time with the low-resolution clock
+    if platform.system() == "Windows":
+        time.sleep(1 / 32)
+
+
+def test_app_deploy_success(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        # Deploy as a script in cwd
+        run_cli_command(["deploy", "myapp.py"])
+
+        # Deploy as a module
+        run_cli_command(["deploy", "-m", "myapp"])
+
+        # Deploy as a script with an absolute path
+        run_cli_command(["deploy", os.path.abspath("myapp.py")])
+
+    app_names = {app_name for (_, app_name) in servicer.deployed_apps}
+    assert "my_app" in app_names
+
+
+def test_app_deploy_with_name(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        run_cli_command(["deploy", "myapp.py", "--name", "my_app_foo"])
+
+    app_names = {app_name for (_, app_name) in servicer.deployed_apps}
+    assert "my_app_foo" in app_names
+
+
+def test_secret_create_list_delete(servicer, set_env_client):
+    # fail without any keys
+    run_cli_command(["secret", "create", "foo"], 2, None)
+
+    run_cli_command(["secret", "create", "foo", "VAR=foo"])
+    windows_sleep()
+    assert "foo" in run_cli_command(["secret", "list"]).stdout
+
+    # Creating the same one again should fail
+    run_cli_command(["secret", "create", "foo", "VAR=foo"], expected_exit_code=1)
+
+    # But it should succeed with --force
+    run_cli_command(["secret", "create", "foo", "VAR=foo", "--force"])
+
+    # Create a few more
+    run_cli_command(["secret", "create", "bar", "VAR=bar"])
+    run_cli_command(["secret", "create", "buz", "VAR=buz"])
+    windows_sleep()
+    assert len(json.loads(run_cli_command(["secret", "list", "--json"]).stdout)) == 3
+
+    # We can delete it
+    run_cli_command(["secret", "delete", "foo", "--yes"])
+    assert "foo" not in run_cli_command(["secret", "list"]).stdout
+
+
+def test_workspace_members_list_cli(servicer, set_env_client):
+    members = json.loads(run_cli_command(["workspace", "members", "list", "--json"]).stdout)
+    # The mock servicer workspace has Alice (owner, active) and Bob (user, never active)
+    by_name = {m["name"]: m for m in members}
+    assert by_name["Alice"]["role"] == "owner"
+    assert by_name["Alice"]["email"] == "alice@example.com"
+    assert by_name["Bob"]["role"] == "member"
+    # Members who have never been active have a null timestamp
+    assert by_name["Bob"]["last_active"] is None
+
+    # Non-JSON output renders the members in a table
+    assert "Alice" in run_cli_command(["workspace", "members", "list"]).stdout
+
+
+def test_workspace_proxy_tokens_cli(servicer, set_env_client):
+    # `create` prints the Modal-Key / Modal-Secret request headers and the bearer
+    # credential; `--json` emits them as JSON
+    data = json.loads(
+        run_cli_command(["workspace", "proxy-tokens", "create", "--name", "production-webhooks", "--json"]).stdout
+    )
+    assert set(data) == {"Authorization", "Modal-Key", "Modal-Secret"}
+    token_id = data["Modal-Key"]
+    assert token_id in servicer.webhook_tokens
+    assert servicer.webhook_tokens[token_id]["name"] == "production-webhooks"
+    # The bearer credential joins the token id and secret with a period
+    assert data["Authorization"] == f"Bearer {token_id}.{data['Modal-Secret']}"
+
+    # `list` shows the token, including its scoped status
+    listed = json.loads(run_cli_command(["workspace", "proxy-tokens", "list", "--json"]).stdout)
+    assert [row["token_id"] for row in listed] == [token_id]
+    assert listed[0]["name"] == "production-webhooks"
+    assert listed[0]["created_by"] == servicer.default_username
+    # `scoped` is emitted as a real JSON boolean, not a string
+    assert listed[0]["scoped"] is False
+
+    # The non-JSON table also renders (the bool is stringified for rich)
+    output = run_cli_command(["workspace", "proxy-tokens", "list"]).stdout
+    assert token_id in output
+    assert "production-webhooks" in output
+    assert servicer.default_username in output
+
+    # `update` changes the name shown by subsequent listings
+    update_output = run_cli_command(
+        ["workspace", "proxy-tokens", "update", token_id, "name", "staging-webhooks"]
+    ).stdout
+    assert "Updated proxy token" in update_output
+    listed = json.loads(run_cli_command(["workspace", "proxy-tokens", "list", "--json"]).stdout)
+    assert listed[0]["name"] == "staging-webhooks"
+
+    invalid_update = run_cli_command(
+        ["workspace", "proxy-tokens", "update", token_id, "naem", "other-webhooks"],
+        expected_exit_code=2,
+    )
+    assert "Unknown proxy token setting 'naem'. Supported settings: name." in invalid_update.stderr
+
+    # `delete` removes it (requires confirmation, bypassed with --yes)
+    run_cli_command(["workspace", "proxy-tokens", "delete", token_id, "--yes"])
+    assert token_id not in servicer.webhook_tokens
+    assert json.loads(run_cli_command(["workspace", "proxy-tokens", "list", "--json"]).stdout) == []
+
+
+def test_workspace_proxy_tokens_allow_revoke_cli(servicer, set_env_client):
+    # Seed a scoped token (the kind that can be associated with environments)
+    servicer.webhook_tokens["wt-1"] = {"created_at": 1577836800.0, "scoped": True}
+    servicer.webhook_token_environments["wt-1"] = set()
+
+    # `allow` associates the token with an environment ...
+    run_cli_command(["workspace", "proxy-tokens", "allow", "wt-1", "main"])
+    assert servicer.webhook_token_environments["wt-1"] == {servicer.environments["main"]}
+    # ... and `list -e` filters to the tokens associated with that environment
+    listed = json.loads(run_cli_command(["workspace", "proxy-tokens", "list", "-e", "main", "--json"]).stdout)
+    assert [row["token_id"] for row in listed] == ["wt-1"]
+
+    # `revoke` removes the association
+    run_cli_command(["workspace", "proxy-tokens", "revoke", "wt-1", "main"])
+    assert servicer.webhook_token_environments["wt-1"] == set()
+    assert json.loads(run_cli_command(["workspace", "proxy-tokens", "list", "-e", "main", "--json"]).stdout) == []
+
+
+def test_workspace_settings_fetch_cli(servicer, set_env_client):
+    res = run_cli_command(["workspace", "settings", "list"])
+    assert "image-builder-version" in res.stdout
+    assert "2024.10" in res.stdout
+    assert "default-environment" in res.stdout
+    assert "main" in res.stdout
+
+    # --json emits machine-readable output with "setting" and "value" keys
+    rows = json.loads(run_cli_command(["workspace", "settings", "list", "--json"]).stdout)
+    by_setting = {r["setting"]: r["value"] for r in rows}
+    assert by_setting["image-builder-version"] == "2024.10"
+    assert by_setting["default-environment"] == "main"
+
+
+def test_workspace_settings_set_cli(servicer, set_env_client):
+    res = run_cli_command(["workspace", "settings", "set", "image-builder-version", "2025.06"])
+    assert "image-builder-version" in res.stdout
+    assert "✓" in res.stdout
+    assert servicer.workspace_image_builder_version == "2025.06"
+
+    run_cli_command(["workspace", "settings", "set", "default-environment", "prod"])
+    assert servicer.workspace_default_environment_name == "prod"
+
+
+def test_workspace_settings_set_failure_cli(servicer, set_env_client):
+    async def bad_handler(self, stream):
+        from grpclib import GRPCError, Status
+
+        await stream.recv_message()
+        raise GRPCError(Status.INVALID_ARGUMENT, "invalid version")
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("WorkspaceSetImageBuilderVersion", bad_handler)
+        res = run_cli_command(
+            ["workspace", "settings", "set", "image-builder-version", "bad"],
+            expected_exit_code=1,
+        )
+
+    assert "image-builder-version" in res.stdout
+    assert "✗" in res.stdout
+
+
+def test_image_cli_list(servicer, set_env_client, monkeypatch):
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(delay: float):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr("modal.cli.image.asyncio.sleep", fake_sleep)
+
+    def add_image_tag(tag: str, image_id: str, revision_id: str, created_at: float, updated_at: float) -> None:
+        servicer.image_tags[tag] = image_id
+        servicer.image_tag_metadata[tag] = (revision_id, created_at, updated_at)
+
+    servicer.images["im-named-a"] = api_pb2.Image()
+    servicer.images["im-named-b"] = api_pb2.Image()
+    now = time.time()
+    add_image_tag("demo-image:latest", "im-named-b", "ir-0001", now - 60, now)
+    add_image_tag("demo-image:v1", "im-named-a", "ir-0002", now - 120, now - 30)
+
+    listed = json.loads(run_cli_command(["image", "names", "list", "--prefix", "demo", "--json"]).stdout)
+    assert [(item["tag"], item["image_id"]) for item in listed] == [
+        ("demo-image:latest", "im-named-b"),
+        ("demo-image:v1", "im-named-a"),
+    ]
+    assert all(item["created_at"] and item["updated_at"] for item in listed)
+
+    list_table = run_cli_command(["image", "names", "list", "--prefix", "demo"]).stdout
+    assert "demo-image:latest" in list_table
+    assert "demo-image:v1" in list_table
+    assert "Showing 2 results" in list_table
+
+    servicer.image_list_tags_requests.clear()
+    sleep_calls.clear()
+
+    for index in range(201):
+        add_image_tag(
+            f"many-{index:04d}:latest",
+            "im-named-a",
+            f"ir-{index:04d}",
+            now + index,
+            now + index,
+        )
+
+    paginated = json.loads(run_cli_command(["image", "names", "list", "--prefix", "many", "--json"]).stdout)
+    assert len(paginated) == 201
+    assert paginated[0]["tag"] == "many-0000:latest"
+    assert paginated[-1]["tag"] == "many-0200:latest"
+    assert [request.max_objects for request in servicer.image_list_tags_requests] == [100, 100, 100]
+    assert [request.page_token for request in servicer.image_list_tags_requests] == ["", "100", "200"]
+    assert sleep_calls == [1.0, 1.0]
+
+    servicer.image_list_tags_requests.clear()
+    sleep_calls.clear()
+
+    paginated_table = run_cli_command(["image", "names", "list", "--prefix", "many"]).stdout
+    assert "Showing 201 results" in paginated_table
+    assert [request.max_objects for request in servicer.image_list_tags_requests] == [100, 100, 100]
+    assert sleep_calls == [1.0, 1.0]
+
+    help_text = run_cli_command(["image", "--help"]).stdout
+    assert "names" in help_text
+    assert "history" not in help_text
+
+    names_help_text = run_cli_command(["image", "names", "--help"]).stdout
+    assert "delete" in names_help_text
+    assert "list" in names_help_text
+    assert "history" not in names_help_text
+
+    list_help_text = run_cli_command(["image", "names", "list", "--help"]).stdout
+    assert "--prefix" in list_help_text
+
+    delete_help_text = run_cli_command(["image", "names", "delete", "--help"]).stdout
+    assert "--all" not in delete_help_text
+    assert "--filter-name" not in delete_help_text
+    assert "--env" in delete_help_text
+    assert "--yes" in delete_help_text
+
+
+def test_image_cli_logs(set_env_client, monkeypatch):
+    fetch_calls: list[int | None] = []
+
+    async def fake_fetch(*, layers=1):
+        fetch_calls.append(layers)
+        yield LogEntry(
+            message=f"logs for {layers=}\n",
+            timestamp=datetime.now(timezone.utc),
+            source="stdout",
+            object_id="im-123",
+            context_ids=[],
+        )
+
+    image_api = mock.Mock()
+    image_api.from_id.return_value.logs.fetch.aio.side_effect = fake_fetch
+    monkeypatch.setattr("modal.cli.image.Image", image_api)
+
+    assert run_cli_command(["image", "logs", "im-123"]).stdout == "logs for layers=1\n"
+    assert run_cli_command(["image", "logs", "im-123", "--layers", "3"]).stdout == "logs for layers=3\n"
+    assert run_cli_command(["image", "logs", "im-123", "--all"]).stdout == "logs for layers=None\n"
+    assert fetch_calls == [1, 3, None]
+    assert image_api.from_id.call_args_list == [mock.call("im-123")] * 3
+
+    result = run_cli_command(
+        ["image", "logs", "im-123", "--layers", "3", "--all"],
+        expected_exit_code=2,
+    )
+    assert "--all cannot be combined with --layers" in result.stderr
+
+    result = run_cli_command(["image", "logs", "im-123", "--layers", "0"], expected_exit_code=2)
+    assert "--layers" in result.stderr
+
+
+def test_image_cli_logs_empty(set_env_client, monkeypatch):
+    async def fake_fetch(*, layers=1):
+        entries: list[LogEntry] = []
+        for entry in entries:
+            yield entry
+
+    image_api = mock.Mock()
+    image_api.from_id.return_value.logs.fetch.aio.side_effect = fake_fetch
+    monkeypatch.setattr("modal.cli.image.Image", image_api)
+
+    assert run_cli_command(["image", "logs", "im-123"]).stdout == "No build logs found for Image im-123.\n"
+
+
+@pytest.fixture
+def image_build_context(tmp_path, test_dir):
+    shutil.copy(test_dir / "supports" / "test-dockerfile", tmp_path / "Dockerfile")
+    return str(tmp_path)
+
+
+@pytest.mark.parametrize("flag", ["--name", "-t"])
+def test_image_cli_build_name_forms(servicer, set_env_client, image_build_context, flag):
+    run_cli_command(["image", "build", flag, "my-image", image_build_context])
+    assert list(servicer.image_tags) == ["my-image:latest"]
+
+
+def test_image_cli_build_platform(servicer, set_env_client, image_build_context):
+    run_cli_command(["image", "build", "-t", "my-image", "--platform", "linux/arm64", image_build_context])
+    root_layers = [image for image in servicer.images.values() if not image.base_images]
+    assert [image.platform for image in root_layers] == ["linux/arm64"]
+
+
+def test_image_cli_build_dot_context_dir(servicer, set_env_client, image_build_context, monkeypatch):
+    monkeypatch.chdir(image_build_context)
+    run_cli_command(["image", "build", "-t", "my-image", "."])
+    assert list(servicer.image_tags) == ["my-image:latest"]
+
+
+def test_image_cli_build_requires_context_dir(servicer, set_env_client, image_build_context, monkeypatch):
+    monkeypatch.chdir(image_build_context)
+    res = run_cli_command(["image", "build", "-t", "my-image"], expected_exit_code=2)
+    assert "Missing argument 'CONTEXT_DIR'." in res.stderr
+    assert servicer.image_tags == {}
+
+
+def test_image_cli_build_help(set_env_client):
+    res = run_cli_command(["image", "build", "--help"])
+    assert "CONTEXT_DIR" in res.stdout
+    assert "-t, --name [ENV/]NAME[:TAG]" in res.stdout
+
+
+def test_image_cli_build_requires_name(servicer, set_env_client, image_build_context):
+    res = run_cli_command(["image", "build", image_build_context], expected_exit_code=2)
+    assert "Missing option '-t' / '--name'" in res.stderr
+    assert servicer.image_tags == {}
+
+
+def test_image_cli_build_rejects_positional_name(servicer, set_env_client, image_build_context):
+    res = run_cli_command(["image", "build", "-t", "a", "b", image_build_context], expected_exit_code=2)
+    assert "Got unexpected extra argument" in res.stderr
+    assert servicer.image_tags == {}
+
+
+def test_image_cli_build_rejects_missing_context_dir(servicer, set_env_client, tmp_path):
+    res = run_cli_command(["image", "build", "-t", "my-image", str(tmp_path / "missing")], expected_exit_code=2)
+    assert "is not a directory" in res.stderr
+    assert servicer.image_tags == {}
+
+
+def test_image_cli_build_requires_dockerfile(servicer, set_env_client, tmp_path):
+    res = run_cli_command(["image", "build", "-t", "my-image", str(tmp_path)], expected_exit_code=2)
+    assert "No Dockerfile found" in res.stderr
+    assert servicer.image_tags == {}
+
+
+def test_image_cli_build_publishes(servicer, set_env_client, image_build_context):
+    res = run_cli_command(["image", "build", "-t", "my-image", image_build_context])
+    assert list(servicer.image_tags) == ["my-image:latest"]
+    image_id = servicer.image_tags["my-image:latest"]
+    assert image_id in servicer.images
+    assert f"Image built: {image_id}" in res.stdout
+    assert "Image published as my-image:latest!" in res.stdout
+    assert 'modal.Image.from_name("my-image:latest")' in res.stdout
+
+
+def test_image_cli_build_with_tag_and_env(servicer, set_env_client, image_build_context):
+    with servicer.intercept() as ctx:
+        run_cli_command(["image", "build", "-t", "my-image:v1", image_build_context, "--env", "other"])
+    assert list(servicer.image_tags) == ["other/my-image:v1"]
+    app_requests = ctx.get_requests("AppCreate")
+    assert app_requests and all(req.environment_name == "other" for req in app_requests)
+
+
+def test_image_cli_build_context_dir(servicer, set_env_client, tmp_path):
+    context_dir = tmp_path / "context"
+    context_dir.mkdir()
+    (context_dir / "data.txt").write_text("hello")
+    (context_dir / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY data.txt /data.txt\n")
+
+    run_cli_command(["image", "build", "-t", "my-image", str(context_dir)])
+    assert list(servicer.image_tags) == ["my-image:latest"]
+    assert any(filename.endswith("data.txt") for contents in servicer.mount_contents.values() for filename in contents)
+
+
+def test_image_cli_build_file_option(servicer, set_env_client, tmp_path):
+    context_dir = tmp_path / "context"
+    context_dir.mkdir()
+    (context_dir / "data.txt").write_text("hello")
+    dockerfile = tmp_path / "Dockerfile.custom"
+    dockerfile.write_text("FROM python:3.12-slim\nCOPY data.txt /data.txt\n")
+
+    run_cli_command(["image", "build", "-t", "my-image", str(context_dir), "-f", str(dockerfile)])
+    assert list(servicer.image_tags) == ["my-image:latest"]
+    assert any(filename.endswith("data.txt") for contents in servicer.mount_contents.values() for filename in contents)
+
+
+@pytest.mark.parametrize("force_build", [False, True])
+def test_image_cli_build_force_build(servicer, set_env_client, image_build_context, force_build):
+    args = ["image", "build", "-t", "my-image", image_build_context]
+    run_cli_command(args + (["--force-build"] if force_build else []))
+    assert servicer.force_built_images == (sorted(servicer.images) if force_build else [])
+
+
+def _base_layer(servicer, tag: str) -> api_pb2.Image:
+    image = servicer.images[servicer.image_tags[tag]]
+    while image.base_images:
+        image = servicer.images[image.base_images[0].image_id]
+    return image
+
+
+def test_image_cli_build_registry_secret(servicer, set_env_client, image_build_context):
+    run_cli_command(["secret", "create", "my-registry", "REGISTRY_USERNAME=a", "REGISTRY_PASSWORD=b"])
+    run_cli_command(["image", "build", "-t", "my-image", "--registry-secret", "my-registry", image_build_context])
+    image = _base_layer(servicer, "my-image:latest")
+    assert image.dockerfile_commands[0].startswith("FROM ")
+    assert image.image_registry_config.secret_id == servicer.deployed_secrets[("my-registry", "main")]
+    assert image.image_registry_config.registry_auth_type == api_pb2.REGISTRY_AUTH_TYPE_STATIC_CREDS
+
+
+def test_image_cli_build_registry_secret_not_found(servicer, set_env_client, image_build_context):
+    res = run_cli_command(
+        ["image", "build", "-t", "my-image", "--registry-secret", "missing", image_build_context], expected_exit_code=1
+    )
+    assert isinstance(res.exception, NotFoundError)
+    assert servicer.image_tags == {}
+
+
+def test_image_cli_build_registry_secret_from_env(servicer, set_env_client, image_build_context, monkeypatch):
+    monkeypatch.setenv("REGISTRY_USERNAME", "me")
+    monkeypatch.setenv("REGISTRY_PASSWORD", "s3cret")
+    run_cli_command(
+        [
+            "image",
+            "build",
+            "-t",
+            "my-image",
+            "--registry-secret-from-env",
+            "REGISTRY_USERNAME, REGISTRY_PASSWORD,",
+            image_build_context,
+        ]
+    )
+    config = _base_layer(servicer, "my-image:latest").image_registry_config
+    assert config.registry_auth_type == api_pb2.REGISTRY_AUTH_TYPE_STATIC_CREDS
+    assert dict(servicer.secrets[config.secret_id]) == {"REGISTRY_USERNAME": "me", "REGISTRY_PASSWORD": "s3cret"}
+
+
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        (
+            ["--registry-secret", "my-registry", "--registry-secret-from-env", "REGISTRY_USERNAME"],
+            "--registry-secret and --registry-secret-from-env cannot be used together",
+        ),
+        (["--registry-secret-from-env", "REGISTRY_USERNAME"], "Registry Secret must include exactly one of"),
+    ],
+)
+def test_image_cli_build_registry_secret_errors(
+    servicer, set_env_client, image_build_context, monkeypatch, args, error
+):
+    monkeypatch.setenv("REGISTRY_USERNAME", "me")
+    monkeypatch.delenv("UNSET_VAR", raising=False)
+    res = run_cli_command(["image", "build", "-t", "my-image", *args, image_build_context], expected_exit_code=2)
+    assert error in res.stderr
+    assert not servicer.images
+
+
+def test_image_cli_build_registry_secret_from_unset_env(servicer, set_env_client, image_build_context, monkeypatch):
+    monkeypatch.delenv("UNSET_VAR", raising=False)
+    args = ["image", "build", "-t", "my-image", "--registry-secret-from-env", "UNSET_VAR", image_build_context]
+    res = run_cli_command(args, expected_exit_code=1)
+    assert isinstance(res.exception, InvalidError)
+    assert "UNSET_VAR" in str(res.exception)
+    assert not servicer.images
+
+
+def test_image_cli_build_env_prefix_with_env(servicer, set_env_client, image_build_context):
+    run_cli_command(["secret", "create", "my-registry", "REGISTRY_USERNAME=a", "REGISTRY_PASSWORD=b", "--env", "dev"])
+    args = ["-t", "prod/my-image", "--registry-secret", "my-registry", "--env", "dev", image_build_context]
+    run_cli_command(["image", "build", *args])
+    assert list(servicer.image_tags) == ["prod/my-image:latest"]
+    assert list(servicer.app_environments.values()) == ["dev"]
+    image = _base_layer(servicer, "prod/my-image:latest")
+    assert image.image_registry_config.secret_id == servicer.deployed_secrets[("my-registry", "dev")]
+
+
+def test_image_cli_history(servicer, set_env_client, monkeypatch):
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(delay: float):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr("modal.cli.image.asyncio.sleep", fake_sleep)
+
+    help_text = run_cli_command(["image", "--help"]).stdout
+    assert "history" not in help_text
+
+    names_help_text = run_cli_command(["image", "names", "--help"]).stdout
+    assert "history" not in names_help_text
+
+    now = time.time()
+
+    def history_response(
+        tag: str,
+        image_ids: list[str],
+        created_at: list[float],
+        published_by: list[str] | None = None,
+    ) -> api_pb2.ImageTagRevisionsResponse:
+        return api_pb2.ImageTagRevisionsResponse(
+            items=[
+                api_pb2.ImageTagRevisionsItem(
+                    image_id=image_id,
+                    revision_id=f"ir-test-{index:04d}",
+                    created_at=created_at[index],
+                    published_by=published_by[index] if published_by else "",
+                )
+                for index, image_id in enumerate(image_ids)
+            ],
+            tag=tag,
+            environment_name="main",
+        )
+
+    demo_history = history_response(
+        "demo-image:latest",
+        ["im-named-b", "im-named-a"],
+        [now, now - 60],
+        published_by=["alice@example.com", "bob@example.com"],
+    )
+    with servicer.intercept() as ctx:
+        ctx.add_response("ImageTagRevisions", demo_history)
+        history_json = json.loads(run_cli_command(["image", "names", "history", "demo-image", "--json"]).stdout)
+    assert [item["image_id"] for item in history_json] == ["im-named-b", "im-named-a"]
+    assert all("published_at" in item for item in history_json)
+    assert all("published_by" in item for item in history_json)
+    assert [item["published_by"] for item in history_json] == ["alice@example.com", "bob@example.com"]
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("ImageTagRevisions", demo_history)
+        history_table = run_cli_command(["image", "names", "history", "demo-image"]).stdout
+    assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", history_table)
+    assert "Published by" in history_table
+    assert "alice@example.com" in history_table
+    assert "Showing 2 results" in history_table
+
+    empty_history = history_response("missing-image:latest", [], [])
+    with servicer.intercept() as ctx:
+        ctx.add_response("ImageTagRevisions", empty_history)
+        result = run_cli_command(["image", "names", "history", "missing-image"], expected_exit_code=1)
+    assert "No publishing history found for named image 'missing-image:latest'." in result.stderr
+
+
+def _built_image_id(result) -> str:
+    """Return the ID of the Image that the CLI reported building."""
+    match = re.search(r"(?:Pulled|Used a cached pull of) \S+ as (im-\S+)", result.stdout)
+    assert match, f"no built Image ID in output:\n{result.stdout}"
+    return match.group(1)
+
+
+def _built_image(servicer, result) -> api_pb2.Image:
+    """Return the Image that the CLI reported building."""
+    return servicer.images[_built_image_id(result)]
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_tag"),
+    [
+        ("my-image", "cli-env/my-image:latest"),
+        ("my-image:v1", "cli-env/my-image:v1"),
+        ("name-env/my-image", "name-env/my-image:latest"),
+        ("name-env/my-image:v1", "name-env/my-image:v1"),
+    ],
+)
+def test_image_cli_publish_name_environment_scoping(servicer, set_env_client, modal_config, name, expected_tag):
+    # An environment prefix in --name takes precedence over --env; an unscoped name derives from --env
+    with modal_config("[default]\nenvironment = 'profile-env'\n"):
+        result = run_cli_command(["image", "pull", "docker.io/python:3.13-slim", "--name", name, "--env", "cli-env"])
+
+    assert list(servicer.image_tags) == [expected_tag]
+    assert servicer.image_tags[expected_tag] == _built_image_id(result)
+    assert f"Image published as {expected_tag}" in result.stdout
+    assert f'modal.Image.from_name("{expected_tag}")' in result.stdout
+
+    # The builder App runs in the --env environment even when --name is scoped to another one
+    assert list(servicer.app_environments.values()) == ["cli-env"]
+
+
+def test_image_cli_publish_name_environment_prefix_with_registry_secret(servicer, set_env_client):
+    # The registry Secret is looked up in --env, while the Image is published to the --name prefix
+    servicer.secrets["st-registry"] = dict.fromkeys(["REGISTRY_USERNAME", "REGISTRY_PASSWORD"], "x")
+    servicer.deployed_secrets[("my-registry-secret", "cli-env")] = "st-registry"
+    result = run_cli_command(
+        [
+            "image",
+            "pull",
+            "docker.io/my-org/my-image",
+            "--registry-secret",
+            "my-registry-secret",
+            "--name",
+            "name-env/my-image",
+            "--env",
+            "cli-env",
+        ]
+    )
+
+    assert _built_image(servicer, result).image_registry_config.secret_id == "st-registry"
+    assert list(servicer.image_tags) == ["name-env/my-image:latest"]
+    assert list(servicer.app_environments.values()) == ["cli-env"]
+
+
+def test_image_cli_publish_name_uses_profile_environment_as_fallback(servicer, set_env_client, modal_config):
+    # Without --env, an unscoped name derives from the environment set in the config profile
+    with modal_config("[default]\nenvironment = 'profile-env'\n"):
+        run_cli_command(["image", "pull", "docker.io/python:3.13-slim", "--name", "my-image"])
+
+    assert list(servicer.image_tags) == ["profile-env/my-image:latest"]
+
+
+def test_image_cli_pull(servicer, set_env_client):
+    result = run_cli_command(["image", "pull", "docker.io/python:3.13-slim", "--name", "my-python"])
+    image = _built_image(servicer, result)
+
+    assert any("FROM docker.io/python:3.13-slim" in cmd for cmd in image.dockerfile_commands)
+    assert image.image_registry_config.registry_auth_type == api_pb2.REGISTRY_AUTH_TYPE_UNSPECIFIED
+    assert not image.image_registry_config.secret_id
+    assert "Pulling docker.io/python:3.13-slim" in result.stdout
+    assert "Initialized." not in result.stdout
+    assert "Created objects." not in result.stdout
+    assert "App completed." not in result.stdout
+    # Build logs are shown, but not the App's log stream, where the server reports the App stopping
+    assert "build starting" in result.stdout
+    assert servicer.app_get_logs_initial_count == 0
+
+    # The build runs in an ephemeral App that is stopped afterwards
+    assert not servicer.deployed_apps
+    [app_id] = servicer.app_environments
+    assert servicer.app_state_history[app_id][-1] == api_pb2.APP_STATE_STOPPED
+    assert servicer.image_tags["my-python:latest"] == _built_image_id(result)
+
+
+def test_image_cli_pull_platform(servicer, set_env_client):
+    result = run_cli_command(["image", "pull", "docker.io/python:3.13-slim", "--platform", "linux/arm64"])
+    image = _built_image(servicer, result)
+    assert image.platform == "linux/arm64"
+
+
+@pytest.mark.parametrize(("args", "force_built"), [([], False), (["--force-build"], True)])
+def test_image_cli_pull_force_build(servicer, set_env_client, monkeypatch, args, force_built):
+    monkeypatch.delenv("MODAL_FORCE_BUILD", raising=False)
+    result = run_cli_command(["image", "pull", "docker.io/python:3.13-slim", *args])
+
+    assert (_built_image_id(result) in servicer.force_built_images) == force_built
+
+
+@pytest.mark.parametrize(
+    ("image_ref", "repull_args", "cached", "hint_shown"),
+    [
+        ("docker.io/python:3.13-slim", [], True, True),
+        ("docker.io/python:3.13-slim", ["--force-build"], False, False),
+        ("docker.io/python@sha256:0123abcd", [], True, False),
+    ],
+)
+def test_image_cli_pull_cached(servicer, set_env_client, monkeypatch, image_ref, repull_args, cached, hint_shown):
+    monkeypatch.delenv("MODAL_FORCE_BUILD", raising=False)
+    first = run_cli_command(["image", "pull", image_ref])
+    assert f"Pulled {image_ref} as {_built_image_id(first)}" in first.stdout
+
+    second = run_cli_command(["image", "pull", image_ref, *repull_args])
+    assert ("Used a cached pull of" in second.stdout) == cached
+    # Rich wraps the long cached-pull line at the terminal width
+    assert ("Pass --force-build to pull it from the registry again." in " ".join(second.stdout.split())) == hint_shown
+    assert _built_image_id(second) == _built_image_id(first)
+
+
+@pytest.mark.parametrize(
+    ("keys", "auth_type"),
+    [
+        (["REGISTRY_USERNAME", "REGISTRY_PASSWORD"], api_pb2.REGISTRY_AUTH_TYPE_STATIC_CREDS),
+        (["AWS_ROLE_ARN", "AWS_REGION", "OTHER"], api_pb2.REGISTRY_AUTH_TYPE_AWS),
+    ],
+)
+def test_image_cli_pull_named_secret(servicer, set_env_client, keys, auth_type):
+    servicer.secrets["st-registry"] = dict.fromkeys(keys, "x")
+    servicer.deployed_secrets[("my-registry-secret", "main")] = "st-registry"
+    result = run_cli_command(["image", "pull", "docker.io/my-org/my-image", "--registry-secret", "my-registry-secret"])
+    image = _built_image(servicer, result)
+
+    assert image.image_registry_config.registry_auth_type == auth_type
+    assert image.image_registry_config.secret_id == "st-registry"
+
+
+AWS_KEYS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"]
+AWS_SESSION_KEYS = [*AWS_KEYS, "AWS_SESSION_TOKEN"]
+AWS_OIDC_KEYS = ["AWS_ROLE_ARN", "AWS_REGION"]
+GCP_KEYS = ["SERVICE_ACCOUNT_JSON"]
+BASIC_KEYS = ["REGISTRY_USERNAME", "REGISTRY_PASSWORD"]
+
+
+@pytest.mark.parametrize(
+    ("image_ref", "keys", "auth_type"),
+    [
+        ("123456789012.dkr.ecr.us-east-1.amazonaws.com/my-image", AWS_KEYS, api_pb2.REGISTRY_AUTH_TYPE_AWS),
+        ("123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn/my-image", AWS_SESSION_KEYS, api_pb2.REGISTRY_AUTH_TYPE_AWS),
+        ("123456789012.dkr-ecr.us-east-1.on.aws/my-image", AWS_OIDC_KEYS, api_pb2.REGISTRY_AUTH_TYPE_AWS),
+        ("us-east1-docker.pkg.dev/my-project/my-repo/my-image", GCP_KEYS, api_pb2.REGISTRY_AUTH_TYPE_GCP),
+        ("my-registry.example.com/my-image", GCP_KEYS, api_pb2.REGISTRY_AUTH_TYPE_GCP),
+        ("us-east1-docker.pkg.dev/my-project/my-repo/my-image", BASIC_KEYS, api_pb2.REGISTRY_AUTH_TYPE_STATIC_CREDS),
+        ("123456789012.dkr.ecr.us-east-1.amazonaws.com/my-image", BASIC_KEYS, api_pb2.REGISTRY_AUTH_TYPE_STATIC_CREDS),
+    ],
+)
+def test_image_cli_pull_infers_registry_auth(servicer, set_env_client, monkeypatch, image_ref, keys, auth_type):
+    for key in keys:
+        monkeypatch.setenv(key, "x")
+    result = run_cli_command(["image", "pull", image_ref, "--registry-secret-from-env", ",".join(keys)])
+    image = _built_image(servicer, result)
+
+    assert image.image_registry_config.registry_auth_type == auth_type
+    assert dict(servicer.secrets[image.image_registry_config.secret_id]) == dict.fromkeys(keys, "x")
+
+
+@pytest.mark.parametrize(
+    "secret_vars",
+    ["REGISTRY_USERNAME,REGISTRY_PASSWORD,REGISTRY_REGION", "REGISTRY_USERNAME, REGISTRY_PASSWORD,,REGISTRY_REGION,"],
+)
+def test_image_cli_pull_secret_from_env_comma_separated(servicer, set_env_client, monkeypatch, secret_vars):
+    monkeypatch.setenv("REGISTRY_USERNAME", "me")
+    monkeypatch.setenv("REGISTRY_PASSWORD", "s3cret")
+    monkeypatch.setenv("REGISTRY_REGION", "us-east-1")
+    result = run_cli_command(["image", "pull", "docker.io/my-org/my-image", "--registry-secret-from-env", secret_vars])
+    image = _built_image(servicer, result)
+
+    assert dict(servicer.secrets[image.image_registry_config.secret_id]) == {
+        "REGISTRY_USERNAME": "me",
+        "REGISTRY_PASSWORD": "s3cret",
+        "REGISTRY_REGION": "us-east-1",
+    }
+
+
+def test_image_cli_pull_without_credentials_skips_inference(servicer, set_env_client):
+    result = run_cli_command(["image", "pull", "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-image"])
+    image = _built_image(servicer, result)
+    assert image.image_registry_config.registry_auth_type == api_pb2.REGISTRY_AUTH_TYPE_UNSPECIFIED
+    assert not image.image_registry_config.secret_id
+
+
+def test_image_cli_pull_secret_errors(servicer, set_env_client, monkeypatch):
+    monkeypatch.delenv("REGISTRY_PASSWORD", raising=False)
+
+    result = run_cli_command(
+        [
+            "image",
+            "pull",
+            "docker.io/my-org/my-image",
+            "--registry-secret",
+            "my-secret",
+            "--registry-secret-from-env",
+            "REGISTRY_PASSWORD",
+        ],
+        expected_exit_code=2,
+    )
+    assert "--registry-secret and --registry-secret-from-env cannot be used together" in result.stderr
+
+    result = run_cli_command(
+        ["image", "pull", "docker.io/my-org/my-image", "--registry-secret-from-env", "REGISTRY_PASSWORD"],
+        expected_exit_code=1,
+    )
+    assert isinstance(result.exception, InvalidError)
+    assert "REGISTRY_PASSWORD" in str(result.exception)
+
+    # A partial set of keys matches no kind of authentication
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "x")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")
+    result = run_cli_command(
+        [
+            "image",
+            "pull",
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-image",
+            "--registry-secret-from-env",
+            "AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY",
+        ],
+        expected_exit_code=2,
+    )
+    assert "Registry Secret must include exactly one of" in result.stderr
+
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("REGISTRY_USERNAME", "x")
+    monkeypatch.setenv("REGISTRY_PASSWORD", "x")
+    result = run_cli_command(
+        [
+            "image",
+            "pull",
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-image",
+            "--registry-secret-from-env",
+            "AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION,REGISTRY_USERNAME,REGISTRY_PASSWORD",
+        ],
+        expected_exit_code=2,
+    )
+    assert (
+        "Registry Secret has keys for more than one kind of authentication (AWS, username and password)"
+        in result.stderr
+    )
+
+    for image_ref in ["node:20", "my-org/my-image"]:
+        result = run_cli_command(["image", "pull", image_ref], expected_exit_code=2)
+        assert f"IMAGE_REF must start with the registry host, e.g. docker.io/{image_ref}" in result.stderr
+
+    assert not servicer.images
+
+
+def test_image_cli_history_uses_implicit_environment_as_fallback(servicer, set_env_client, modal_config):
+    def history_response(tag: str) -> api_pb2.ImageTagRevisionsResponse:
+        return api_pb2.ImageTagRevisionsResponse(
+            items=[
+                api_pb2.ImageTagRevisionsItem(
+                    image_id="im-named-a",
+                    revision_id="ir-test-0000",
+                    created_at=time.time(),
+                )
+            ],
+            tag=tag,
+            environment_name="main",
+        )
+
+    config = """
+    [default]
+    environment = "profile-env"
+    """
+
+    with modal_config(config), servicer.intercept() as ctx:
+        ctx.add_response("ImageTagRevisions", history_response("profile-env/demo-image:latest"))
+        run_cli_command(["image", "names", "history", "demo-image"])
+        req = ctx.pop_request("ImageTagRevisions")
+    assert req.tag == "profile-env/demo-image:latest"
+
+    with modal_config(config), servicer.intercept() as ctx:
+        ctx.add_response("ImageTagRevisions", history_response("some-prefix/demo-image:latest"))
+        run_cli_command(["image", "names", "history", "some-prefix/demo-image"])
+        req = ctx.pop_request("ImageTagRevisions")
+    assert req.tag == "some-prefix/demo-image:latest"
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_tag", "expected_output"),
+    [
+        (
+            ["sglang-image:latest", "--yes"],
+            "sglang-image:latest",
+            "Deleted named Image 'sglang-image:latest'",
+        ),
+        (["sglang-image:v1", "-y"], "sglang-image:v1", "Deleted named Image 'sglang-image:v1'"),
+    ],
+)
+def test_image_cli_delete(
+    servicer,
+    set_env_client,
+    args: list[str],
+    expected_tag: str,
+    expected_output: str,
+):
+    with servicer.intercept() as ctx:
+        ctx.add_response("ImageNameDelete", Empty())
+        result = run_cli_command(["image", "names", "delete", *args])
+        request = ctx.pop_request("ImageNameDelete")
+
+    assert request.tag == expected_tag
+    assert expected_output in result.stdout
+
+
+def test_image_cli_delete_requires_confirmation(servicer, set_env_client):
+    with servicer.intercept() as ctx:
+        result = run_cli_command(
+            ["image", "names", "delete", "sglang-image:latest"],
+            expected_exit_code=1,
+        )
+        requests = ctx.get_requests("ImageNameDelete")
+
+    assert requests == []
+    assert "Rerun with --yes" in str(result.exception)
+    assert (
+        "Are you sure you want to delete 'sglang-image:latest'? This also deletes the associated publishing history."
+    ) in result.stdout
+
+
+@pytest.mark.parametrize("name", ["demo:v1", "prod/demo:v1"])
+def test_image_cli_delete_single_tag_with_env(servicer, set_env_client, modal_config, name):
+    with modal_config('[default]\nenvironment = "profile-env"'), servicer.intercept() as ctx:
+        ctx.add_response("ImageNameDelete", Empty())
+        run_cli_command(["image", "names", "delete", name, "--env", "prod", "--yes"])
+        assert ctx.pop_request("ImageNameDelete").tag == "prod/demo:v1"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--yes"],
+        ["demo:v1", "--filter-name", "demo"],
+        ["demo", "--all"],
+        ["dev/demo:v1", "--env", "prod"],
+    ],
+)
+def test_image_cli_delete_rejects_conflicting_selection(servicer, set_env_client, args):
+    with servicer.intercept() as ctx:
+        run_cli_command(["image", "names", "delete", *args], expected_exit_code=2)
+        assert ctx.get_requests("ImageListTags") == []
+        assert ctx.get_requests("ImageNameDelete") == []
+
+
+def test_image_cli_delete_requires_explicit_tag(servicer, set_env_client):
+    with servicer.intercept() as ctx:
+        result = run_cli_command(
+            ["image", "names", "delete", "sglang-image", "--yes"],
+            expected_exit_code=2,
+        )
+
+    assert ctx.get_requests("ImageNameDelete") == []
+    assert "An explicit tag is required" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["workspace/environment/sglang-image:v1", "--yes"],
+    ],
+)
+def test_image_cli_delete_rejects_workspace_qualified_name(servicer, set_env_client, args):
+    with servicer.intercept() as ctx:
+        result = run_cli_command(
+            ["image", "names", "delete", *args],
+            expected_exit_code=2,
+        )
+
+    assert ctx.get_requests("ImageListTags") == []
+    assert ctx.get_requests("ImageNameDelete") == []
+    assert "Workspace-qualified Image names are not supported" in result.stderr
+
+
+def test_image_cli_reports_failure(servicer, set_env_client):
+    async def delete_responder(self, stream):
+        from grpclib import GRPCError, Status
+
+        request = await stream.recv_message()
+        if request.tag == "main/partial-delete:v1":
+            raise GRPCError(Status.INVALID_ARGUMENT, "deletion failed")
+        await stream.send_message(Empty())
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("ImageNameDelete", delete_responder)
+        result = run_cli_command(
+            ["image", "names", "delete", "main/partial-delete:v1", "--yes"],
+            expected_exit_code=1,
+        )
+        requests = ctx.get_requests("ImageNameDelete")
+
+    assert [request.tag for request in requests] == [
+        "main/partial-delete:v1",
+    ]
+    assert isinstance(result.exception, GRPCError)
+    assert "deletion failed" in str(result.exception)
+    assert "Deleted named Image" not in result.stdout
+
+
+def test_image_cli_delete_uses_implicit_environment_as_fallback(
+    servicer,
+    set_env_client,
+    modal_config,
+):
+    config = """
+    [default]
+    environment = "profile-env"
+    """
+
+    with modal_config(config), servicer.intercept() as ctx:
+        ctx.add_response("ImageNameDelete", Empty())
+        run_cli_command(["image", "names", "delete", "sglang-image:v1", "--yes"])
+        request = ctx.pop_request("ImageNameDelete")
+
+    assert request.tag == "profile-env/sglang-image:v1"
+
+
+@pytest.mark.parametrize(
+    ("command_args", "flash_endpoint_auth_token", "expected_cmd"),
+    [
+        (
+            ["curl", "https://workspace--app.modal.direct", "-X", "POST"],
+            "flash-token",
+            [
+                "curl",
+                "-H",
+                "Modal-Authorization: Bearer flash-token",
+                "https://workspace--app.modal.direct",
+                "-X",
+                "POST",
+            ],
+        ),
+        (
+            ["curl", "-X", "GET", "https://workspace--app.modal.direct"],
+            "flash-token",
+            [
+                "curl",
+                "-H",
+                "Modal-Authorization: Bearer flash-token",
+                "-X",
+                "GET",
+                "https://workspace--app.modal.direct",
+            ],
+        ),
+        (
+            ["curl", "--url=https://workspace--app.modal.direct", "-X", "GET"],
+            "flash-token",
+            [
+                "curl",
+                "-H",
+                "Modal-Authorization: Bearer flash-token",
+                "--url=https://workspace--app.modal.direct",
+                "-X",
+                "GET",
+            ],
+        ),
+        (
+            ["curl", "https://workspace--app.modal.direct", "-X", "POST"],
+            "",
+            ["curl", "https://workspace--app.modal.direct", "-X", "POST"],
+        ),
+    ],
+)
+def test_curl_uses_flash_endpoint_auth_token(
+    servicer, set_env_client, monkeypatch, tmp_path, command_args, flash_endpoint_auth_token, expected_cmd
+):
+    curl_calls = []
+    servicer.flash_endpoint_auth_token = flash_endpoint_auth_token
+    monkeypatch.setenv("XDG_CACHE_HOME", tmp_path.as_posix())
+
+    def fake_subprocess_call(cmd):
+        curl_calls.append(cmd)
+        return 0
+
+    monkeypatch.setattr(subprocess, "call", fake_subprocess_call)
+
+    run_cli_command(command_args)
+
+    assert [request.url for request in servicer.cli_get_flash_endpoint_auth_token_requests] == [
+        "https://workspace--app.modal.direct"
+    ]
+    assert curl_calls == [expected_cmd]
+
+
+def test_curl_skips_flash_endpoint_auth_token_for_non_direct_url(servicer, set_env_client, monkeypatch, tmp_path):
+    curl_calls = []
+    servicer.flash_endpoint_auth_token = "flash-token"
+    monkeypatch.setenv("XDG_CACHE_HOME", tmp_path.as_posix())
+
+    def fake_subprocess_call(cmd):
+        curl_calls.append(cmd)
+        return 0
+
+    monkeypatch.setattr(subprocess, "call", fake_subprocess_call)
+
+    run_cli_command(["curl", "https://workspace--app.modal.run", "-X", "POST"])
+
+    assert servicer.cli_get_flash_endpoint_auth_token_requests == []
+    assert curl_calls == [["curl", "https://workspace--app.modal.run", "-X", "POST"]]
+
+
+def test_curl_caches_flash_endpoint_auth_token(servicer, set_env_client, monkeypatch, tmp_path):
+    import modal.cli.curl as curl_module
+
+    curl_calls = []
+    servicer.flash_endpoint_auth_token = "flash-token"
+    monkeypatch.setenv("XDG_CACHE_HOME", tmp_path.as_posix())
+
+    def fake_subprocess_call(cmd):
+        curl_calls.append(cmd)
+        return 0
+
+    monkeypatch.setattr(subprocess, "call", fake_subprocess_call)
+
+    run_cli_command(["curl", "https://workspace--app.modal.direct", "-X", "POST"])
+
+    async def unexpected_from_env():
+        raise AssertionError("cached curl token should not need a Modal client")
+
+    monkeypatch.setattr(curl_module._Client, "from_env", unexpected_from_env)
+
+    run_cli_command(["curl", "https://workspace--app.modal.direct", "-X", "POST"])
+
+    assert [request.url for request in servicer.cli_get_flash_endpoint_auth_token_requests] == [
+        "https://workspace--app.modal.direct"
+    ]
+    assert curl_calls == [
+        [
+            "curl",
+            "-H",
+            "Modal-Authorization: Bearer flash-token",
+            "https://workspace--app.modal.direct",
+            "-X",
+            "POST",
+        ],
+        [
+            "curl",
+            "-H",
+            "Modal-Authorization: Bearer flash-token",
+            "https://workspace--app.modal.direct",
+            "-X",
+            "POST",
+        ],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("env_content", "expected_exit_code", "expected_stderr"),
+    [
+        ("KEY1=VAL1\nKEY2=VAL2", 0, None),
+        ("", 2, "You need to specify at least one key for your secret"),
+        ("=VAL", 2, "You need to specify at least one key for your secret"),
+        ("KEY=", 0, None),
+        ("KEY=413", 0, None),  # dotenv reads everything as string...
+        ("KEY", 2, "Non-string value"),  # ... except this, which is read as None
+    ],
+)
+def test_secret_create_from_dotenv(
+    servicer, set_env_client, tmp_path, env_content, expected_exit_code, expected_stderr
+):
+    env_file = tmp_path / ".env"
+    env_file.write_text(env_content)
+    run_cli_command(
+        ["secret", "create", "foo", "--from-dotenv", env_file.as_posix()],
+        expected_exit_code=expected_exit_code,
+        expected_stderr=expected_stderr,
+    )
+
+
+@pytest.mark.parametrize(
+    ("json_content", "expected_exit_code", "expected_stderr"),
+    [
+        ('{"KEY1": "VAL1",\n"KEY2": "VAL2"}', 0, None),
+        ("", 2, "Could not parse JSON file"),
+        ("{}", 2, "You need to specify at least one key for your secret"),
+        ('{"": ""}', 2, "Invalid key"),
+        ('{"KEY": ""}', 0, None),
+        ('{"KEY": "413"}', 0, None),
+        ('{"KEY": null}', 2, "Non-string value"),
+        ('{"KEY": 413}', 2, "Non-string value"),
+        ('{"KEY": {"NESTED": "val"}}', 2, "Non-string value"),
+    ],
+)
+def test_secret_create_from_json(servicer, set_env_client, tmp_path, json_content, expected_exit_code, expected_stderr):
+    json_file = tmp_path / "test.json"
+    json_file.write_text(json_content)
+    run_cli_command(
+        ["secret", "create", "foo", "--from-json", json_file.as_posix()],
+        expected_exit_code=expected_exit_code,
+        expected_stderr=expected_stderr,
+    )
+
+
+def test_app_token_new(servicer, set_env_client, server_url_env, modal_config, mock_webbrowser):
+    servicer.required_creds = {"abc": "xyz"}
+    mock_webbrowser()
+
+    with modal_config() as config_file_path:
+        run_cli_command(["token", "new", "--profile", "_test"])
+        assert "_test" in toml.load(config_file_path)
+        assert servicer.token_flow_expires_in_seconds == 0
+
+
+def test_app_token_new_expires_in(servicer, set_env_client, server_url_env, modal_config, mock_webbrowser):
+    servicer.required_creds = {"abc": "xyz"}
+    mock_webbrowser()
+
+    with modal_config():
+        run_cli_command(["token", "new", "--profile", "_test", "--expires-in", "12h"])
+        assert servicer.token_flow_expires_in_seconds == 12 * 3600
+
+    with modal_config():
+        res = run_cli_command(["token", "new", "--profile", "_test", "--expires-in", "12 hours"], expected_exit_code=2)
+        assert "--expires-in" in res.stderr
+
+
+def test_token_env_var_warning(servicer, set_env_client, server_url_env, modal_config, mock_webbrowser, monkeypatch):
+    servicer.required_creds = {"abc": "xyz"}
+    mock_webbrowser()
+
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-123")
+    with modal_config():
+        res = run_cli_command(["token", "new"])
+        assert "MODAL_TOKEN_ID environment variable is" in res.stdout
+
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-xyz")
+    with modal_config():
+        res = run_cli_command(["token", "new"])
+        assert "MODAL_TOKEN_ID / MODAL_TOKEN_SECRET environment variables are" in res.stdout
+
+    monkeypatch.delenv("MODAL_TOKEN_ID")
+    monkeypatch.delenv("MODAL_TOKEN_SECRET")
+    monkeypatch.setenv("MODAL_OAUTH_REFRESH_TOKEN", "refresh-token")
+    with modal_config():
+        res = run_cli_command(["token", "new"])
+        assert "MODAL_OAUTH_REFRESH_TOKEN environment variable is" in res.stdout
+
+    monkeypatch.setenv("MODAL_OAUTH_JWT_KEY", "private-key")
+    with modal_config():
+        res = run_cli_command(["token", "new"])
+        normalized_output = " ".join(res.stdout.split())
+        assert "MODAL_OAUTH_REFRESH_TOKEN / MODAL_OAUTH_JWT_KEY environment variables are" in normalized_output
+
+
+def test_token_info(servicer, set_env_client):
+    res = run_cli_command(["token", "info"])
+    assert "ak-test123" in res.stdout
+    assert "test-workspace" in res.stdout
+    assert "test-user" in res.stdout
+
+
+@pytest.mark.parametrize("command", (["token", "new", "--delete-existing"], ["token", "rotate"]))
+def test_token_new_delete_existing(command, servicer, set_env_client, server_url_env, modal_config, mock_webbrowser):
+    mock_webbrowser()
+
+    resp: api_pb2.TokenCreateResponse = servicer._create_token("old-token", None)
+
+    config = f"""
+    [test-username]
+    token_id = "{resp.token_id}"
+    token_secret = "{resp.token_secret}"
+    active = true
+    """
+
+    servicer.required_creds = {"abc": "xyz", resp.token_id: resp.token_secret}
+
+    with servicer.intercept() as ctx, modal_config(config):
+        res = run_cli_command(command)
+        assert "Previous token in profile" in res.stdout
+        assert "has been deleted." in res.stdout
+
+    assert ctx.calls.pop() == ("TokenDelete", api_pb2.TokenDeleteRequest(token_id=resp.token_id))
+    # Indicates that the deletion request was sent to the mock
+    assert servicer.workspace_member_tokens[resp.token_id] is None
+
+
+@pytest.mark.parametrize(
+    ("mode_args", "routing_region", "expected_mode", "label"),
+    [
+        ([], "us-east", api_pb2.ENDPOINT_SERVING_MODE_DEDICATED, "Dedicated"),
+        (["--shared"], "us-west", api_pb2.ENDPOINT_SERVING_MODE_SHARED, "Shared"),
+    ],
+)
+def test_endpoint_create(servicer, set_env_client, mode_args, routing_region, expected_mode, label):
+    res = run_cli_command(
+        [
+            "endpoint",
+            "create",
+            *mode_args,
+            "--name=qwen-chat",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            f"--routing-region={routing_region}",
+            "--env=main",
+        ]
+    )
+
+    assert f"{label} Endpoint 'qwen-chat'" in res.stdout
+    assert "started provisioning" in " ".join(res.stdout.split())
+    (request,) = servicer.endpoint_create_requests
+    assert request.name == "qwen-chat"
+    assert request.description == ""
+    assert request.serving_mode == expected_mode
+    assert list(request.proxy_regions) == [routing_region]
+    assert request.compute_region.WhichOneof("placement") == "auto"
+    assert request.model.base_model_repo_id == "Qwen/Qwen3.6-27B-FP8"
+    # api_surfaces and input_modalities are defaulted by the server, not the client.
+    assert list(request.api_surfaces) == []
+    assert list(request.input_modalities) == []
+    assert request.environment_name == "main"
+    assert request.unauthenticated is False
+
+
+@pytest.mark.parametrize("mode_args", [[], ["--shared"]])
+def test_endpoint_create_shows_url(servicer, set_env_client, mode_args):
+    # Omit --routing-region to exercise the default (us-west).
+    res = run_cli_command(
+        [
+            "endpoint",
+            "create",
+            *mode_args,
+            "--name=qwen-chat",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+        ]
+    )
+
+    # Collapse whitespace since the rich console wraps long lines at the test terminal width.
+    normalized_stdout = " ".join(res.stdout.split())
+    assert "Endpoint 'qwen-chat'" in normalized_stdout
+    assert "started provisioning" in normalized_stdout
+    assert "View progress at" in normalized_stdout
+    assert "https://modal.com/endpoints/test-user/main/ep-0000000000000000000001" in normalized_stdout
+    assert "modal endpoint list" in normalized_stdout
+    assert '"model":' not in normalized_stdout
+    (request,) = servicer.endpoint_create_requests
+    assert list(request.proxy_regions) == ["us-west"]
+    assert request.compute_region.WhichOneof("placement") == "auto"
+    assert not request.HasField("autoscaler_settings")
+
+
+@pytest.mark.parametrize("mode_args", [[], ["--shared"]])
+def test_endpoint_create_shows_model_name(servicer, set_env_client, mode_args):
+    servicer.endpoint_create_model_name = "qwen-chat"
+
+    res = run_cli_command(["endpoint", "create", "--name=qwen-chat", "--model=Qwen/Qwen3.6-27B-FP8", *mode_args])
+
+    assert 'Send "model": "qwen-chat" in requests to the Endpoint.' in " ".join(res.stdout.split())
+
+
+def test_endpoint_create_rejects_multiple_routing_regions(servicer, set_env_client):
+    res = run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=qwen-chat",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--routing-region=us-east",
+            "--routing-region=us-west",
+        ],
+        expected_exit_code=2,
+    )
+
+    assert "--routing-region can only be specified once" in res.stderr
+    assert servicer.endpoint_create_requests == []
+
+
+def test_endpoint_create_colocates_compute(servicer, set_env_client):
+    run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=qwen-chat",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--colocate-compute",
+        ]
+    )
+
+    (request,) = servicer.endpoint_create_requests
+    assert request.compute_region.WhichOneof("placement") == "colocated"
+
+
+def test_endpoint_create_uses_explicit_compute_regions(servicer, set_env_client):
+    run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=qwen-chat",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--compute-region=ca",
+            "--compute-region=us-east",
+        ]
+    )
+
+    (request,) = servicer.endpoint_create_requests
+    assert request.compute_region.WhichOneof("placement") == "explicit"
+    assert list(request.compute_region.explicit.regions) == ["ca", "us-east"]
+
+
+def test_endpoint_create_rejects_explicit_and_colocated_compute(servicer, set_env_client):
+    run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=qwen-chat",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--compute-region=ca",
+            "--colocate-compute",
+        ],
+        expected_exit_code=2,
+        expected_stderr="--compute-region and --colocate-compute are mutually exclusive",
+    )
+    assert servicer.endpoint_create_requests == []
+
+
+def test_endpoint_create_unauthenticated(servicer, set_env_client):
+    run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=qwen-chat",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--unauthenticated",
+        ]
+    )
+
+    (request,) = servicer.endpoint_create_requests
+    assert request.unauthenticated is True
+
+
+@pytest.mark.parametrize("mode_args", [[], ["--shared"]])
+def test_endpoint_create_leaves_default_name_to_server(servicer, set_env_client, mode_args):
+    run_cli_command(["endpoint", "create", "--model=Qwen/Qwen3.6-27B-FP8", *mode_args])
+
+    (request,) = servicer.endpoint_create_requests
+    assert request.name == ""
+
+
+def test_endpoint_create_uses_empty_environment_without_default(servicer, set_env_client, modal_config):
+    with modal_config():
+        run_cli_command(
+            [
+                "endpoint",
+                "create",
+                "--model=Qwen/Qwen3.6-27B-FP8",
+            ]
+        )
+
+    (request,) = servicer.endpoint_create_requests
+    assert request.environment_name == ""
+
+
+def test_endpoint_create_custom_hf_requires_model(servicer, set_env_client):
+    run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=my-ft",
+            "--custom-hf-repo=acme/qwen-ft",
+        ],
+        expected_exit_code=2,
+        expected_stderr="Missing option.*--model",
+    )
+    assert servicer.endpoint_create_requests == []
+
+
+def test_endpoint_create_custom_sources_are_exclusive(servicer, set_env_client):
+    res = run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=my-ft",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--custom-hf-repo=acme/qwen-ft",
+            "--custom-volume-name=qwen-ft",
+        ],
+        expected_exit_code=2,
+    )
+    assert "--custom-hf-repo and --custom-volume-name are mutually exclusive" in res.stderr
+    assert servicer.endpoint_create_requests == []
+
+
+def test_endpoint_create_custom_volume_path_requires_name(servicer, set_env_client):
+    res = run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=my-ep",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--custom-volume-path=/models/qwen",
+        ],
+        expected_exit_code=2,
+    )
+    assert "--custom-volume-path requires --custom-volume-name" in res.stderr
+    assert servicer.endpoint_create_requests == []
+
+
+def test_endpoint_create_custom_hf_with_model(servicer, set_env_client):
+    run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=my-ft",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--custom-hf-repo=acme/qwen-ft",
+            "--custom-hf-revision=abc123",
+        ]
+    )
+    (request,) = servicer.endpoint_create_requests
+    assert request.model.WhichOneof("source") == "custom"
+    assert request.model.custom.base_model_repo_id == "Qwen/Qwen3.6-27B-FP8"
+    assert request.model.custom.huggingface.repo_id == "acme/qwen-ft"
+    assert request.model.custom.huggingface.revision == "abc123"
+
+
+def test_endpoint_create_custom_hf_token_with_model(servicer, set_env_client):
+    run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=my-ft",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--custom-hf-repo=acme/qwen-ft",
+            "--custom-hf-token=hf-secret",
+        ]
+    )
+
+    (request,) = servicer.endpoint_create_requests
+    assert request.model.custom.huggingface.huggingface_token == "hf-secret"
+
+
+def test_endpoint_create_custom_hf_token_requires_hf_repo(servicer, set_env_client):
+    res = run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=my-ft",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--custom-hf-token=hf-secret",
+        ],
+        expected_exit_code=2,
+    )
+
+    assert "--custom-hf-revision and --custom-hf-token require --custom-hf-repo" in res.stderr
+    assert servicer.endpoint_create_requests == []
+
+
+def test_endpoint_create_custom_volume_with_model(servicer, set_env_client):
+    servicer.deployed_volumes[("qwen-ft", "main")] = "vo-123"
+    servicer.volumes["vo-123"] = Volume(version=api_pb2.VOLUME_FS_VERSION_V1, files={})
+
+    run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--custom-volume-name=qwen-ft",
+            "--custom-volume-path=/models/qwen",
+        ]
+    )
+    (request,) = servicer.endpoint_create_requests
+    assert request.name == ""
+    assert request.model.WhichOneof("source") == "custom"
+    assert request.model.custom.base_model_repo_id == "Qwen/Qwen3.6-27B-FP8"
+    assert request.model.custom.modal_volume.volume_id == "vo-123"
+    assert request.model.custom.modal_volume.model_path == "/models/qwen"
+    assert "qwen3-6-27b-fp8" in servicer.endpoint_ids_by_name["main"]
+
+
+def test_endpoint_create_custom_volume_requires_path(servicer, set_env_client):
+    res = run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=my-ft",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--custom-volume-name=qwen-ft",
+        ],
+        expected_exit_code=2,
+    )
+    assert "--custom-volume-path is required with --custom-volume-name" in res.stderr
+    assert servicer.endpoint_create_requests == []
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--unauthenticated",
+        "--compute-region=us-west",
+        "--colocate-compute",
+        "--routing-region=us-east",
+        "--custom-hf-repo=acme/qwen-ft",
+        "--custom-hf-repo=",
+        "--custom-hf-revision=abc123",
+        "--custom-hf-revision=",
+        "--custom-hf-token=hf-secret",
+        "--custom-hf-token=",
+        "--custom-volume-name=qwen-ft",
+        "--custom-volume-name=",
+        "--custom-volume-path=/models/qwen",
+        "--custom-volume-path=",
+        "--min-containers=1",
+        "--max-containers=10",
+        "--buffer-containers=1",
+        "--scaleup-window=30",
+        "--scaledown-window=600",
+    ],
+)
+def test_endpoint_create_shared_rejects_incompatible_options(servicer, set_env_client, option):
+    with servicer.intercept() as ctx:
+        res = run_cli_command(
+            ["endpoint", "create", "--shared", "--model=Qwen/Qwen3.6-27B-FP8", option],
+            expected_exit_code=2,
+            expected_stderr=option.split("=")[0],
+        )
+    if option.startswith("--routing-region"):
+        assert "Shared Endpoints require --routing-region us-west" in res.stderr
+    else:
+        assert f"{option.split('=')[0]} cannot be used with --shared" in res.stderr
+    assert ctx.calls == []
+
+
+def test_endpoint_create_sets_autoscaler_settings(servicer, set_env_client):
+    run_cli_command(
+        [
+            "endpoint",
+            "create",
+            "--name=qwen-chat",
+            "--model=Qwen/Qwen3.6-27B-FP8",
+            "--min-containers=0",
+            "--max-containers=10",
+            "--buffer-containers=1",
+            "--scaleup-window=30",
+            "--scaledown-window=600",
+        ]
+    )
+
+    (request,) = servicer.endpoint_create_requests
+    assert request.autoscaler_settings == api_pb2.AutoscalerSettings(
+        min_containers=0,
+        max_containers=10,
+        buffer_containers=1,
+        scaleup_window=30,
+        scaledown_window=600,
+    )
+
+
+def test_endpoint_create_sets_only_given_autoscaler_settings(servicer, set_env_client):
+    run_cli_command(["endpoint", "create", "--name=qwen-chat", "--model=Qwen/Qwen3.6-27B-FP8", "--max-containers=4"])
+
+    (request,) = servicer.endpoint_create_requests
+    assert request.autoscaler_settings == api_pb2.AutoscalerSettings(max_containers=4)
+
+
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        (["--max-containers=0"], "--max-containers"),
+        (["--min-containers=-1"], "--min-containers"),
+        (["--scaledown-window=0"], "--scaledown-window"),
+        (["--scaledown-window=1"], "--scaledown-window"),
+        (["--scaledown-window=3601"], "--scaledown-window"),
+    ],
+)
+def test_endpoint_create_rejects_invalid_autoscaler_settings(servicer, set_env_client, args, error):
+    res = run_cli_command(
+        ["endpoint", "create", "--name=qwen-chat", "--model=Qwen/Qwen3.6-27B-FP8", *args],
+        expected_exit_code=2,
+    )
+
+    assert error in res.stderr
+    assert servicer.endpoint_create_requests == []
+
+
+_TEST_ENDPOINT_ID = "ep-abcdefghABCDEFGH012345"
+
+
+def _endpoint_info_response(
+    *,
+    dedicated: bool = True,
+    requires_proxy_auth: bool = True,
+    status: api_pb2.EndpointGetInfoResponse.EndpointStatus.ValueType = (
+        api_pb2.EndpointGetInfoResponse.ENDPOINT_STATUS_LIVE
+    ),
+    include_metadata: bool | None = None,
+    volume_id: str = "",
+    model_path: str = "",
+    model_name: str = "",
+) -> api_pb2.EndpointGetInfoResponse:
+    response = api_pb2.EndpointGetInfoResponse(
+        info=api_pb2.EndpointGetInfoResponse.EndpointInfoSummary(
+            name="qwen-chat",
+            repo_id="Qwen/Qwen3.6-27B-FP8",
+            revision="abc123456789",
+            service_url="https://qwen-chat.modal.run",
+            requires_proxy_auth=requires_proxy_auth,
+            serving_mode=(
+                api_pb2.ENDPOINT_SERVING_MODE_DEDICATED if dedicated else api_pb2.ENDPOINT_SERVING_MODE_SHARED
+            ),
+            status=status,
+            volume_id=volume_id,
+            model_path=model_path,
+            model_name=model_name,
+            lifecycle=api_pb2.EndpointLifecycle(
+                status=(
+                    api_pb2.ENDPOINT_LIFECYCLE_STATUS_STOPPED
+                    if status == api_pb2.EndpointGetInfoResponse.ENDPOINT_STATUS_STOPPED
+                    else api_pb2.ENDPOINT_LIFECYCLE_STATUS_ACTIVE
+                ),
+                created_at=1_700_000_000,
+                created_by="test-user",
+                stopped_at=(1_700_000_100 if status == api_pb2.EndpointGetInfoResponse.ENDPOINT_STATUS_STOPPED else 0),
+                stopped_by=("test-user" if status == api_pb2.EndpointGetInfoResponse.ENDPOINT_STATUS_STOPPED else ""),
+                environment_name="main",
+            ),
+        )
+    )
+    if include_metadata is None:
+        include_metadata = dedicated
+    if include_metadata:
+        response.metadata.CopyFrom(
+            api_pb2.EndpointGetInfoResponse.EndpointHandleMetadata(
+                app_id="ap-endpoint",
+                server_id="fu-endpoint-server",
+                environment_name="main",
+            )
+        )
+    return response
+
+
+def _mock_endpoint_client(
+    monkeypatch,
+    *,
+    dedicated: bool = True,
+    requires_proxy_auth: bool = True,
+    status: api_pb2.EndpointGetInfoResponse.EndpointStatus.ValueType = (
+        api_pb2.EndpointGetInfoResponse.ENDPOINT_STATUS_LIVE
+    ),
+    include_metadata: bool | None = None,
+    volume_id: str = "",
+    model_path: str = "",
+    model_name: str = "",
+):
+    client = mock.Mock()
+    client.stub = mock.Mock()
+    client._stub = client.stub
+    client.stub.EndpointGetByName = mock.AsyncMock(
+        return_value=api_pb2.EndpointGetByNameResponse(
+            endpoint_id=_TEST_ENDPOINT_ID,
+            environment_name="main",
+        )
+    )
+    client.stub.EndpointGetInfo = mock.AsyncMock(
+        return_value=_endpoint_info_response(
+            dedicated=dedicated,
+            requires_proxy_auth=requires_proxy_auth,
+            status=status,
+            include_metadata=include_metadata,
+            volume_id=volume_id,
+            model_path=model_path,
+            model_name=model_name,
+        )
+    )
+    monkeypatch.setattr("modal.cli.endpoint._Client.from_env", mock.AsyncMock(return_value=client))
+    return client
+
+
+def test_endpoint_info_displays_name_status_and_lifecycle(set_env_client, monkeypatch):
+    client = _mock_endpoint_client(monkeypatch)
+
+    result = run_cli_command(["endpoint", "info", _TEST_ENDPOINT_ID])
+    assert "Endpoint:" in result.stdout
+    assert "qwen-chat · Dedicated" in result.stdout
+    assert _TEST_ENDPOINT_ID in result.stdout
+    assert "live" in result.stdout
+    assert "Qwen/Qwen3.6-27B-FP8@abc1234" in result.stdout
+    assert "Served From:" not in result.stdout
+    assert "Model name:" not in result.stdout
+    assert "https://qwen-chat.modal.run" in result.stdout
+    assert "Serving mode:" not in result.stdout
+    assert "Revision:" not in result.stdout
+    assert "Authentication:" not in result.stdout
+    assert "Unauthenticated" not in result.stdout
+    assert "Deployment:" not in result.stdout
+    assert "Created:" in result.stdout
+    request = client.stub.EndpointGetInfo.await_args.args[0]
+    assert request.endpoint_id == _TEST_ENDPOINT_ID
+
+    result = run_cli_command(["endpoint", "info", _TEST_ENDPOINT_ID, "--json"])
+    data = json.loads(result.stdout)
+    assert data["name"] == "qwen-chat"
+    assert data["endpoint_id"] == _TEST_ENDPOINT_ID
+    assert data["serving_mode"] == "dedicated"
+    assert data["status"] == "live"
+    assert data["service_url"] == "https://qwen-chat.modal.run"
+    assert data["volume_id"] is None
+    assert data["model_path"] is None
+    assert data["lifecycle"]["created_by"] == "test-user"
+    assert data["app_id"] == "ap-endpoint"
+    assert data["server_id"] == "fu-endpoint-server"
+    assert data["revision"] == "abc123456789"
+    assert data["model_name"] is None
+    client.stub.EndpointGetByName.assert_not_awaited()
+
+
+def test_endpoint_info_displays_model_name(set_env_client, monkeypatch):
+    _mock_endpoint_client(monkeypatch, model_name="qwen-chat")
+
+    result = run_cli_command(["endpoint", "info", _TEST_ENDPOINT_ID])
+
+    assert re.search(r"Model name:\s+qwen-chat", result.stdout)
+    assert "Qwen/Qwen3.6-27B-FP8@abc1234" in result.stdout
+
+    result = run_cli_command(["endpoint", "info", _TEST_ENDPOINT_ID, "--json"])
+    data = json.loads(result.stdout)
+    assert data["model_name"] == "qwen-chat"
+    assert data["repo_id"] == "Qwen/Qwen3.6-27B-FP8"
+
+
+def test_endpoint_info_displays_modal_volume_source(set_env_client, monkeypatch):
+    _mock_endpoint_client(monkeypatch, volume_id="vo-123", model_path="/models/qwen/")
+
+    result = run_cli_command(["endpoint", "info", _TEST_ENDPOINT_ID])
+
+    assert "Model:" in result.stdout
+    assert "Qwen/Qwen3.6-27B-FP8@abc123" in result.stdout
+    assert "Served From:" in result.stdout
+    assert "vo-123:/models/qwen" in result.stdout
+
+    result = run_cli_command(["endpoint", "info", _TEST_ENDPOINT_ID, "--json"])
+    data = json.loads(result.stdout)
+    assert data["volume_id"] == "vo-123"
+    assert data["model_path"] == "/models/qwen/"
+
+
+def test_endpoint_info_displays_modal_volume_root_path(set_env_client, monkeypatch):
+    _mock_endpoint_client(monkeypatch, volume_id="vo-123", model_path="/")
+
+    result = run_cli_command(["endpoint", "info", _TEST_ENDPOINT_ID])
+
+    assert "Served From:" in result.stdout
+    assert "vo-123:/" in result.stdout
+
+    result = run_cli_command(["endpoint", "info", _TEST_ENDPOINT_ID, "--json"])
+    data = json.loads(result.stdout)
+    assert data["volume_id"] == "vo-123"
+    assert data["model_path"] == "/"
+
+
+def test_endpoint_info_resolves_name_without_lifecycle_rpc(set_env_client, monkeypatch):
+    client = _mock_endpoint_client(monkeypatch)
+
+    result = run_cli_command(["endpoint", "info", "qwen-chat"])
+
+    assert "qwen-chat · Dedicated" in result.stdout
+    client.stub.EndpointGetByName.assert_awaited_once()
+    client.stub.EndpointGetInfo.assert_awaited_once_with(api_pb2.EndpointGetInfoRequest(endpoint_id=_TEST_ENDPOINT_ID))
+
+
+def test_endpoint_info_resolves_id_shaped_name(set_env_client, monkeypatch):
+    client = _mock_endpoint_client(monkeypatch)
+    client.stub.EndpointGetInfo.side_effect = [NotFoundError("Endpoint not found"), _endpoint_info_response()]
+
+    result = run_cli_command(["endpoint", "info", _TEST_ENDPOINT_ID])
+
+    assert "qwen-chat · Dedicated" in result.stdout
+    client.stub.EndpointGetByName.assert_awaited_once_with(
+        api_pb2.EndpointGetByNameRequest(name=_TEST_ENDPOINT_ID, environment_name="")
+    )
+    assert client.stub.EndpointGetInfo.await_count == 2
+
+
+def test_endpoint_info_marks_unauthenticated_url(set_env_client, monkeypatch):
+    _mock_endpoint_client(monkeypatch, requires_proxy_auth=False)
+
+    result = run_cli_command(["endpoint", "info", _TEST_ENDPOINT_ID, "--no-color"])
+
+    assert "https://qwen-chat.modal.run · Unauthenticated" in result.stdout
+
+
+def test_endpoint_logs_uses_server_log_runner(set_env_client, monkeypatch):
+    _mock_endpoint_client(monkeypatch)
+    run_server_logs = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.endpoint._run_server_logs", run_server_logs)
+
+    run_cli_command(
+        [
+            "endpoint",
+            "logs",
+            _TEST_ENDPOINT_ID,
+            "--since",
+            "2h",
+            "--tail",
+            "25",
+            "--search",
+            "ready",
+            "--show-server-id",
+        ]
+    )
+
+    run_server_logs.assert_awaited_once_with(
+        "ap-endpoint",
+        "fu-endpoint-server",
+        follow=False,
+        since="2h",
+        until=None,
+        tail=25,
+        search="ready",
+        container_id="",
+        source=None,
+        timestamps=False,
+        show_server_id=True,
+        show_container_id=False,
+    )
+
+
+def test_endpoint_stats_uses_server_stats_runner(set_env_client, monkeypatch):
+    _mock_endpoint_client(monkeypatch)
+    run_server_stats = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.endpoint._run_server_stats", run_server_stats)
+
+    run_cli_command(["endpoint", "stats", _TEST_ENDPOINT_ID, "--since", "2h", "--container-id", "ta-123"])
+
+    run_server_stats.assert_awaited_once()
+    args, kwargs = run_server_stats.await_args
+    assert args[1] == "fu-endpoint-server"
+    assert kwargs["history_duration"] == timedelta(hours=2)
+    assert kwargs["container_id"] == "ta-123"
+    assert kwargs["heading"] == f"Endpoint stats for qwen-chat ({_TEST_ENDPOINT_ID})"
+    assert kwargs["endpoint_id"] == _TEST_ENDPOINT_ID
+
+
+def test_server_stats_relative_since_and_until_share_now():
+    from modal.cli.server import _server_stats_time_range
+
+    since_dt, until_dt, history_duration = _server_stats_time_range("2d", "1d")
+    assert until_dt - since_dt == timedelta(days=1)
+    assert history_duration == timedelta(days=1)
+
+
+def test_endpoint_stats_includes_endpoint_id_in_json_output(set_env_client, monkeypatch):
+    client = _mock_endpoint_client(monkeypatch)
+    since = datetime(2026, 9, 25, 12, tzinfo=timezone.utc)
+    until = datetime(2026, 9, 25, 13, tzinfo=timezone.utc)
+    response = api_pb2.ServerGetTimeRangeStatsResponse()
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+    client.stub.ServerGetTimeRangeStats = mock.AsyncMock(return_value=response)
+
+    result = run_cli_command(
+        [
+            "endpoint",
+            "stats",
+            _TEST_ENDPOINT_ID,
+            "--since",
+            since.isoformat(),
+            "--until",
+            until.isoformat(),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["endpoint_id"] == _TEST_ENDPOINT_ID
+    assert "object_id" not in payload
+    assert "function_id" not in payload
+
+
+@pytest.mark.parametrize("command", ["logs", "stats"])
+def test_shared_endpoint_rejects_server_observability_commands(set_env_client, monkeypatch, command):
+    _mock_endpoint_client(monkeypatch, dedicated=False)
+    run_server_logs = mock.AsyncMock()
+    run_server_stats = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.endpoint._run_server_logs", run_server_logs)
+    monkeypatch.setattr("modal.cli.endpoint._run_server_stats", run_server_stats)
+
+    result = run_cli_command(["endpoint", command, _TEST_ENDPOINT_ID], expected_exit_code=1)
+
+    assert "shared Endpoint" in result.stderr
+    assert f"modal endpoint {command}" in result.stderr
+    run_server_logs.assert_not_awaited()
+    run_server_stats.assert_not_awaited()
+
+
+@pytest.mark.parametrize("command", ["logs", "stats"])
+def test_stopped_endpoint_without_metadata_reports_expired_backing_server(set_env_client, monkeypatch, command):
+    _mock_endpoint_client(
+        monkeypatch,
+        status=api_pb2.EndpointGetInfoResponse.ENDPOINT_STATUS_STOPPED,
+        include_metadata=False,
+    )
+
+    result = run_cli_command(["endpoint", command, _TEST_ENDPOINT_ID], expected_exit_code=1)
+
+    assert f"{command.capitalize()} cannot be retrieved" in result.stderr
+    assert "information about its backing server has expired" in result.stderr
+
+
+@pytest.mark.parametrize("command", ["logs", "stats"])
+def test_endpoint_without_metadata_reports_missing_backing_server(set_env_client, monkeypatch, command):
+    _mock_endpoint_client(
+        monkeypatch,
+        status=api_pb2.EndpointGetInfoResponse.ENDPOINT_STATUS_PROVISIONING,
+        include_metadata=False,
+    )
+
+    result = run_cli_command(["endpoint", command, _TEST_ENDPOINT_ID], expected_exit_code=1)
+
+    assert f"{command.capitalize()} cannot be retrieved" in result.stderr
+    assert "does not have a backing server" in result.stderr
+
+
+def test_endpoint_library(servicer, set_env_client):
+    servicer.endpoint_models = [
+        api_pb2.EndpointModel(
+            base_model_repo_id="z/shared",
+            supported_input_modalities=[api_pb2.ENDPOINT_INPUT_MODALITY_TEXT, api_pb2.ENDPOINT_INPUT_MODALITY_IMAGE],
+            available_serving_modes=[api_pb2.ENDPOINT_SERVING_MODE_SHARED],
+        ),
+        api_pb2.EndpointModel(
+            base_model_repo_id="a/both",
+            supported_input_modalities=[api_pb2.ENDPOINT_INPUT_MODALITY_TEXT],
+            available_serving_modes=[api_pb2.ENDPOINT_SERVING_MODE_DEDICATED, api_pb2.ENDPOINT_SERVING_MODE_SHARED],
+        ),
+        api_pb2.EndpointModel(
+            base_model_repo_id="m/dedicated",
+            available_serving_modes=[api_pb2.ENDPOINT_SERVING_MODE_DEDICATED],
+        ),
+    ]
+    result = run_cli_command(["endpoint", "library", "--json"])
+    rows = json.loads(result.stdout)
+    assert [row["base_model_repo_id"] for row in rows] == ["a/both", "m/dedicated", "z/shared"]
+    assert rows[0] == {
+        "base_model_repo_id": "a/both",
+        "input_modalities": ["text"],
+        "shared": True,
+        "dedicated": True,
+    }
+    assert rows[1]["shared"] is False and rows[1]["dedicated"] is True
+    assert rows[2]["shared"] is True and rows[2]["dedicated"] is False
+    assert rows[2]["input_modalities"] == ["text", "image"]
+
+    result = run_cli_command(["endpoint", "library"])
+    assert "Displaying 3 models" in result.stdout
+    assert "Endpoint-compatible models" not in result.stdout
+    assert "Name" not in result.stdout and "Provider" not in result.stdout
+    assert "Input Modalities" in result.stdout and "Shared" in result.stdout and "Dedicated" in result.stdout
+    assert "Serving Mode" not in result.stdout
+    assert result.stdout.index("a/both") < result.stdout.index("m/dedicated") < result.stdout.index("z/shared")
+    for row in rows:
+        line = next(line for line in result.stdout.splitlines() if row["base_model_repo_id"] in line)
+        assert line.split()[-2:] == ["✓" if row["shared"] else "—", "✓" if row["dedicated"] else "—"]
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_ids"),
+    [
+        (["--input-modality", "text"], ["both", "shared"]),
+        (["--input-modality", "image"], ["dedicated"]),
+        (["--input-modality", "audio"], ["both"]),
+        (["--input-modality", "image", "--input-modality", "audio"], ["both", "dedicated"]),
+        (["--input-modality", "text", "--input-modality", "text"], ["both", "shared"]),
+    ],
+)
+def test_endpoint_library_filters(servicer, set_env_client, flags, expected_ids):
+    servicer.endpoint_models = [
+        api_pb2.EndpointModel(
+            base_model_repo_id="shared",
+            supported_input_modalities=[api_pb2.ENDPOINT_INPUT_MODALITY_TEXT],
+            available_serving_modes=[api_pb2.ENDPOINT_SERVING_MODE_SHARED],
+        ),
+        api_pb2.EndpointModel(
+            base_model_repo_id="dedicated",
+            supported_input_modalities=[api_pb2.ENDPOINT_INPUT_MODALITY_IMAGE],
+            available_serving_modes=[api_pb2.ENDPOINT_SERVING_MODE_DEDICATED],
+        ),
+        api_pb2.EndpointModel(
+            base_model_repo_id="both",
+            supported_input_modalities=[api_pb2.ENDPOINT_INPUT_MODALITY_TEXT, api_pb2.ENDPOINT_INPUT_MODALITY_AUDIO],
+            available_serving_modes=[api_pb2.ENDPOINT_SERVING_MODE_SHARED, api_pb2.ENDPOINT_SERVING_MODE_DEDICATED],
+        ),
+    ]
+    command = ["endpoint", "library", *flags]
+    rows = json.loads(run_cli_command([*command, "--json"]).stdout)
+    assert [row["base_model_repo_id"] for row in rows] == expected_ids
+    result = run_cli_command(command)
+    count = len(expected_ids)
+    assert f"Displaying {count} {'model' if count == 1 else 'models'}" in result.stdout
+    table_ids = [line.split()[0] for line in result.stdout.splitlines() if "↗" in line]
+    assert table_ids == expected_ids
+    if not expected_ids:
+        assert "No endpoint-compatible models match the filters." in result.stdout
+
+
+def test_endpoint_library_invalid_modality():
+    result = run_cli_command(["endpoint", "library", "--input-modality", "video"], expected_exit_code=2)
+    assert "Invalid value for '--input-modality'" in result.stderr
+
+
+def test_endpoint_library_empty(servicer, set_env_client):
+    assert json.loads(run_cli_command(["endpoint", "library", "--json"]).stdout) == []
+    result = run_cli_command(["endpoint", "library"])
+    assert "No endpoint-compatible models" in result.stdout
+    assert "Displaying 0 models" in result.stdout
+
+
+def test_endpoint_library_registry_error(servicer, set_env_client):
+    async def unavailable(_servicer, stream):
+        raise GRPCError(Status.UNAVAILABLE, "Model catalog is unavailable")
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("EndpointGetLibrary", unavailable)
+        result = run_cli_command(["endpoint", "library", "--json"], expected_exit_code=1)
+    assert "Model catalog is unavailable" in str(result.exception)
+    assert result.stdout.strip() != "[]"
+
+
+def test_endpoint_library_rejects_environment():
+    run_cli_command(["endpoint", "library", "--env", "main"], expected_exit_code=2)
+
+
+def _add_endpoint_list_item(
+    servicer,
+    *,
+    endpoint_id: str,
+    name: str,
+    environment_name: str = "main",
+    description: str = "",
+    app_state: api_pb2.AppState.ValueType = api_pb2.APP_STATE_DEPLOYED,
+    provisioning_status: api_pb2.EndpointProvisioningStatus.ValueType = api_pb2.ENDPOINT_PROVISIONING_STATUS_SUCCEEDED,
+    status: str = "live",
+    created_at: float | None = None,
+) -> None:
+    servicer.endpoint_list_items.append(
+        api_pb2.EndpointListItem(
+            endpoint_id=endpoint_id,
+            name=name,
+            description=description,
+            app_state=app_state,
+            provisioning_status=provisioning_status,
+            status=status,
+            metadata=api_pb2.EndpointMetadata(
+                name=name,
+                creation_info=api_pb2.CreationInfo(
+                    created_at=time.time() if created_at is None else created_at,
+                    created_by="test-user",
+                ),
+            ),
+        )
+    )
+    servicer.endpoint_list_item_environments[endpoint_id] = environment_name
+
+
+def test_endpoint_list(servicer, server_url_env, set_env_client):
+    # Inject endpoints directly into the servicer so we can test list without
+    # needing to exercise the full EndpointCreate argument surface.
+    endpoint_id_foo = "ep-0000000000000000000101"
+    endpoint_id_bar = "ep-0000000000000000000102"
+    endpoint_id_other_env = "ep-0000000000000000000103"
+    endpoint_id_stopped = "ep-0000000000000000000104"
+    endpoint_id_initializing = "ep-0000000000000000000105"
+    endpoint_id_failed_initializing = "ep-0000000000000000000106"
+    endpoint_id_stopping = "ep-0000000000000000000107"
+    _add_endpoint_list_item(
+        servicer,
+        endpoint_id=endpoint_id_foo,
+        name="foo-endpoint",
+        description="Foo endpoint",
+    )
+    _add_endpoint_list_item(
+        servicer,
+        endpoint_id=endpoint_id_bar,
+        name="bar-endpoint",
+        provisioning_status=api_pb2.ENDPOINT_PROVISIONING_STATUS_RUNNING,
+        status="provisioning",
+    )
+    _add_endpoint_list_item(
+        servicer,
+        endpoint_id=endpoint_id_other_env,
+        name="other-env-endpoint",
+        environment_name="other-env",
+    )
+    _add_endpoint_list_item(
+        servicer,
+        endpoint_id=endpoint_id_stopped,
+        name="stopped-endpoint",
+        app_state=api_pb2.APP_STATE_STOPPED,
+    )
+    _add_endpoint_list_item(
+        servicer,
+        endpoint_id=endpoint_id_stopping,
+        name="stopping-endpoint",
+        app_state=api_pb2.APP_STATE_STOPPING,
+    )
+    _add_endpoint_list_item(
+        servicer,
+        endpoint_id=endpoint_id_initializing,
+        name="initializing-endpoint",
+        app_state=api_pb2.APP_STATE_INITIALIZING,
+        provisioning_status=api_pb2.ENDPOINT_PROVISIONING_STATUS_SUCCEEDED,
+        status="provisioning",
+    )
+    _add_endpoint_list_item(
+        servicer,
+        endpoint_id=endpoint_id_failed_initializing,
+        name="failed-initializing-endpoint",
+        app_state=api_pb2.APP_STATE_INITIALIZING,
+        provisioning_status=api_pb2.ENDPOINT_PROVISIONING_STATUS_FAILED,
+        status="failed",
+    )
+
+    res = run_cli_command(["endpoint", "list"])
+    assert "foo-endpoint" in res.stdout
+    assert "bar-endpoint" in res.stdout
+    assert "other-env-endpoint" not in res.stdout
+    assert "stopped-endpoint" not in res.stdout
+    assert "stopping-endpoint" not in res.stdout
+    assert endpoint_id_foo in res.stdout
+    assert endpoint_id_bar in res.stdout
+    assert endpoint_id_initializing in res.stdout
+    assert endpoint_id_failed_initializing in res.stdout
+    assert "live" in res.stdout
+    assert "provisioning" in res.stdout
+    assert "failed" in res.stdout
+
+    # JSON output includes both endpoints with expected keys
+    res = run_cli_command(["endpoint", "list", "--json"])
+
+    data = json.loads(res.stdout)
+    names = {item["name"] for item in data}
+    assert names == {"foo-endpoint", "bar-endpoint", "initializing-endpoint", "failed-initializing-endpoint"}
+    foo = next(item for item in data if item["name"] == "foo-endpoint")
+    initializing = next(item for item in data if item["name"] == "initializing-endpoint")
+    failed_initializing = next(item for item in data if item["name"] == "failed-initializing-endpoint")
+    assert foo["status"] == "live"
+    assert initializing["status"] == "provisioning"
+    assert failed_initializing["status"] == "failed"
+
+
+def test_endpoint_list_paginates(servicer, server_url_env, set_env_client):
+    base_time = time.time() - 1000
+    for i in range(101):
+        _add_endpoint_list_item(
+            servicer,
+            endpoint_id=f"ep-{i + 1:022d}",
+            name=f"endpoint-{i:03d}",
+            created_at=base_time + i,
+        )
+
+    res = run_cli_command(["endpoint", "list", "--json"])
+
+    data = json.loads(res.stdout)
+    assert len(data) == 101
+    assert {item["name"] for item in data} == {f"endpoint-{i:03d}" for i in range(101)}
+    assert len(servicer.endpoint_list_requests) == 2
+    assert servicer.endpoint_list_requests[0].pagination.max_objects == 100
+    assert servicer.endpoint_list_requests[1].pagination.created_before < (
+        servicer.endpoint_list_requests[0].pagination.created_before
+    )
+
+
+def test_endpoint_list_uses_empty_environment_without_default(servicer, server_url_env, set_env_client, modal_config):
+    _add_endpoint_list_item(
+        servicer,
+        endpoint_id="ep-0000000000000000000201",
+        name="default-env-endpoint",
+    )
+
+    with modal_config():
+        res = run_cli_command(["endpoint", "list", "--json"])
+
+    data = json.loads(res.stdout)
+    assert [item["name"] for item in data] == ["default-env-endpoint"]
+    (request,) = servicer.endpoint_list_requests
+    assert request.environment_name == ""
+
+
+def _add_endpoint_lifecycle(
+    servicer,
+    *,
+    endpoint_id: str = "ep-aaaaaaaaaaaaaaaaaaaaaa",
+    name: str = "qwen-chat",
+    environment_name: str = "main",
+    status: api_pb2.EndpointLifecycleStatus.ValueType = api_pb2.ENDPOINT_LIFECYCLE_STATUS_ACTIVE,
+) -> None:
+    servicer.endpoint_ids_by_name[environment_name][name] = endpoint_id
+    servicer.endpoint_lifecycles[endpoint_id] = api_pb2.EndpointLifecycle(
+        status=status,
+        created_at=datetime.now().timestamp(),
+        created_by="test-user",
+        environment_name=environment_name,
+    )
+    if status == api_pb2.ENDPOINT_LIFECYCLE_STATUS_STOPPED:
+        servicer.endpoint_lifecycles[endpoint_id].stopped_at = datetime.now().timestamp()
+
+
+def test_endpoint_stop_by_id(servicer, set_env_client):
+    endpoint_id = "ep-aaaaaaaaaaaaaaaaaaaaaa"
+    _add_endpoint_lifecycle(servicer, endpoint_id=endpoint_id)
+    res = run_cli_command(["endpoint", "stop", endpoint_id, "--yes"])
+
+    assert f"Stopped Endpoint {endpoint_id}." in res.stdout
+    assert servicer.endpoint_get_by_name_requests == []
+    (lifecycle_request,) = servicer.endpoint_get_lifecycle_requests
+    assert lifecycle_request.endpoint_id == endpoint_id
+    (request,) = servicer.endpoint_stop_requests
+    assert request.endpoint_id == endpoint_id
+    assert request.source == api_pb2.ENDPOINT_STOP_SOURCE_CLI
+    assert servicer.endpoint_lifecycles[endpoint_id].status == api_pb2.ENDPOINT_LIFECYCLE_STATUS_STOPPED
+    assert servicer.endpoint_lifecycles[endpoint_id].stopped_at > 0
+
+
+def test_endpoint_stop_id_returned_by_create(servicer, set_env_client):
+    run_cli_command(["endpoint", "create", "--name=qwen-chat", "--model=Qwen/Qwen3.6-27B-FP8"])
+
+    endpoint_id = "ep-0000000000000000000001"
+    res = run_cli_command(["endpoint", "stop", endpoint_id, "--yes"])
+
+    assert f"Stopped Endpoint {endpoint_id}." in res.stdout
+    assert servicer.endpoint_get_by_name_requests == []
+    (stop_request,) = servicer.endpoint_stop_requests
+    assert stop_request.endpoint_id == endpoint_id
+
+
+def test_endpoint_stop_by_name(servicer, set_env_client):
+    _add_endpoint_lifecycle(servicer, endpoint_id="ep-bbbbbbbbbbbbbbbbbbbbbb")
+
+    res = run_cli_command(["endpoint", "stop", "qwen-chat", "--env", "main", "--yes"])
+
+    normalized_stdout = " ".join(res.stdout.split())
+    assert "Stopped Endpoint 'qwen-chat' in environment 'main' (ID: ep-bbbbbbbbbbbbbbbbbbbbbb)." in normalized_stdout
+    (get_by_name_request,) = servicer.endpoint_get_by_name_requests
+    assert get_by_name_request.name == "qwen-chat"
+    assert get_by_name_request.environment_name == "main"
+    (lifecycle_request,) = servicer.endpoint_get_lifecycle_requests
+    assert lifecycle_request.endpoint_id == "ep-bbbbbbbbbbbbbbbbbbbbbb"
+    (stop_request,) = servicer.endpoint_stop_requests
+    assert stop_request.endpoint_id == "ep-bbbbbbbbbbbbbbbbbbbbbb"
+    assert stop_request.source == api_pb2.ENDPOINT_STOP_SOURCE_CLI
+
+
+def test_endpoint_stop_by_name_uses_server_default_environment(servicer, set_env_client):
+    _add_endpoint_lifecycle(servicer, endpoint_id="ep-ffffffffffffffffffffff")
+
+    res = run_cli_command(["endpoint", "stop", "qwen-chat", "--yes"])
+
+    normalized_stdout = " ".join(res.stdout.split())
+    assert "Stopped Endpoint 'qwen-chat' in environment 'main' (ID: ep-ffffffffffffffffffffff)." in normalized_stdout
+    (get_by_name_request,) = servicer.endpoint_get_by_name_requests
+    assert get_by_name_request.name == "qwen-chat"
+    assert get_by_name_request.environment_name == ""
+    (stop_request,) = servicer.endpoint_stop_requests
+    assert stop_request.endpoint_id == "ep-ffffffffffffffffffffff"
+
+
+def test_endpoint_stop_ep_prefixed_name_resolves_by_name(servicer, set_env_client):
+    _add_endpoint_lifecycle(servicer, endpoint_id="ep-cccccccccccccccccccccc", name="ep-backup")
+
+    run_cli_command(["endpoint", "stop", "ep-backup", "--env", "main", "--yes"])
+
+    (get_by_name_request,) = servicer.endpoint_get_by_name_requests
+    assert get_by_name_request.name == "ep-backup"
+    (stop_request,) = servicer.endpoint_stop_requests
+    assert stop_request.endpoint_id == "ep-cccccccccccccccccccccc"
+
+
+def test_endpoint_stop_id_shaped_name_falls_back_to_name(servicer, set_env_client):
+    endpoint_name = "ep-dddddddddddddddddddddd"
+    endpoint_id = "ep-cccccccccccccccccccccc"
+    _add_endpoint_lifecycle(servicer, endpoint_id=endpoint_id, name=endpoint_name)
+
+    res = run_cli_command(["endpoint", "stop", endpoint_name, "--env", "main", "--yes"])
+
+    normalized_stdout = " ".join(res.stdout.split())
+    assert f"Stopped Endpoint '{endpoint_name}' in environment 'main' (ID: {endpoint_id})." in normalized_stdout
+    (get_by_name_request,) = servicer.endpoint_get_by_name_requests
+    assert get_by_name_request.name == endpoint_name
+    assert get_by_name_request.environment_name == "main"
+    assert [request.endpoint_id for request in servicer.endpoint_get_lifecycle_requests] == [
+        endpoint_name,
+        endpoint_id,
+    ]
+    (stop_request,) = servicer.endpoint_stop_requests
+    assert stop_request.endpoint_id == endpoint_id
+
+
+def test_endpoint_stop_missing_id_fails_before_confirmation(servicer, set_env_client):
+    endpoint_id = "ep-dddddddddddddddddddddd"
+
+    res = run_cli_command(["endpoint", "stop", endpoint_id], expected_exit_code=1)
+
+    assert f"Endpoint '{endpoint_id}' not found." in res.stderr
+    assert servicer.endpoint_stop_requests == []
+
+
+def test_endpoint_stop_already_stopped_skips_stop_rpc(servicer, set_env_client):
+    endpoint_id = "ep-eeeeeeeeeeeeeeeeeeeeee"
+    _add_endpoint_lifecycle(
+        servicer,
+        endpoint_id=endpoint_id,
+        status=api_pb2.ENDPOINT_LIFECYCLE_STATUS_STOPPED,
+    )
+
+    res = run_cli_command(
+        ["endpoint", "stop", endpoint_id],
+        expected_exit_code=1,
+    )
+
+    assert f"Endpoint {endpoint_id} is already stopped." in res.stderr
+    assert servicer.endpoint_stop_requests == []
+
+
+def test_endpoint_stop_stopped_name_is_not_found(servicer, set_env_client):
+    _add_endpoint_lifecycle(
+        servicer,
+        endpoint_id="ep-ffffffffffffffffffffff",
+        status=api_pb2.ENDPOINT_LIFECYCLE_STATUS_STOPPED,
+    )
+
+    res = run_cli_command(["endpoint", "stop", "qwen-chat", "--env", "main", "--yes"], expected_exit_code=1)
+
+    assert "Endpoint 'qwen-chat' not found in environment 'main'." in res.stderr
+    assert servicer.endpoint_stop_requests == []
+
+
+def test_endpoint_stop_has_no_json_option(servicer, set_env_client):
+    run_cli_command(["endpoint", "stop", "qwen-chat", "--json"], expected_exit_code=2, expected_stderr="No such option")
+
+
+def test_token_identity_from_env(servicer, set_env_client, monkeypatch):
+    # Test that the command shows when credentials are from environment variables
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-from-env")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-from-env")
+
+    res = run_cli_command(["token", "info"])
+    # Check for key parts of the message (may have line wrapping, so check individual words)
+    assert "Using" in res.stdout
+    assert "MODAL_TOKEN_ID and MODAL_TOKEN_SECRET" in res.stdout
+    assert "environment" in res.stdout
+
+
+def test_token_identity_from_oauth_env(servicer, set_env_client, monkeypatch):
+    monkeypatch.delenv("MODAL_TOKEN_ID", raising=False)
+    monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
+    monkeypatch.setenv("MODAL_OAUTH_REFRESH_TOKEN", "refresh-token")
+    monkeypatch.setenv("MODAL_OAUTH_CLIENT_ID", "oc-client-id")
+    monkeypatch.setenv("MODAL_OAUTH_JWT_KEY", "private-key")
+
+    res = run_cli_command(["token", "info"])
+    normalized_output = " ".join(res.stdout.split())
+    assert (
+        "Using MODAL_OAUTH_REFRESH_TOKEN and MODAL_OAUTH_CLIENT_ID and MODAL_OAUTH_JWT_KEY environment variables"
+        in normalized_output
+    )
+
+
+def test_packaged_skill_has_well_formed_frontmatter():
+    content = resources.files("modal").joinpath("skills/modal/SKILL.md").read_text()
+    lines = content.splitlines()
+
+    assert lines and lines[0].strip() == "---", "Modal skill is missing frontmatter."
+    assert any(line.strip() == "---" for line in lines[1:]), "Modal skill has unterminated frontmatter."
+
+
+def test_skills_cli_skeleton():
+    from modal.cli.entry_point import entrypoint_cli
+
+    skills_command = entrypoint_cli.commands["skills"]
+
+    assert getattr(skills_command, "panel") == "Configuration"
+
+    res = run_cli_command(["skills", "install", "--help"])
+    assert "Install Modal skills." in res.stdout
+    assert "--claude" in res.stdout
+    assert "--global" in res.stdout
+    assert "--no-docs" in res.stdout
+
+    res = run_cli_command(["skills", "update", "--help"])
+    assert "Update installed Modal skills." in res.stdout
+    assert "--claude" in res.stdout
+    assert "--global" in res.stdout
+    assert "--no-docs" in res.stdout
+
+
+@pytest.mark.parametrize(
+    ("global_", "claude", "expected_root"),
+    [
+        (False, False, "project/.agents"),
+        (False, True, "project/.claude"),
+        (True, False, "home/.agents"),
+        (True, True, "home/.claude"),
+    ],
+)
+def test_skills_install_paths(tmp_path, monkeypatch, global_, claude, expected_root):
+    from modal_version import __version__
+
+    home_dir = tmp_path / "home"
+    project_dir = tmp_path / "project"
+    home_dir.mkdir()
+    project_dir.mkdir()
+    monkeypatch.chdir(project_dir)
+    monkeypatch.setattr("modal.cli.skills.Path.home", lambda: home_dir)
+
+    args = ["skills", "install", "--no-docs"]
+    if global_:
+        args.append("--global")
+    if claude:
+        args.append("--claude")
+    res = run_cli_command(args)
+
+    packaged_skill = resources.files("modal").joinpath("skills/modal/SKILL.md").read_text()
+    expected_base = tmp_path / expected_root
+    target = expected_base / "skills" / "modal" / "SKILL.md"
+    target_content = target.read_text()
+    # The SDK version is recorded under the frontmatter `metadata` map; the rest of
+    # the packaged skill is installed verbatim.
+    metadata_block = f'metadata:\n  version: "{__version__}"\n'
+    assert metadata_block in target_content
+    assert target_content.replace(metadata_block, "", 1) == packaged_skill
+    assert "Installed Modal skill to" in res.stdout
+
+    roots = [
+        project_dir / ".agents",
+        project_dir / ".claude",
+        home_dir / ".agents",
+        home_dir / ".claude",
+    ]
+    for root in roots:
+        if root != expected_base:
+            assert not root.exists()
+
+
+def test_skills_show():
+    from modal_version import __version__
+
+    res = run_cli_command(["skills", "show"])
+
+    # `show` prints what `install` would write, including the injected version metadata.
+    packaged_skill = resources.files("modal").joinpath("skills/modal/SKILL.md").read_text()
+    metadata_block = f'metadata:\n  version: "{__version__}"\n'
+    assert metadata_block in res.stdout
+    assert res.stdout.replace(metadata_block, "", 1) == packaged_skill
+
+
+def test_skills_install_downloads_docs(tmp_path, monkeypatch):
+    class MockResponse:
+        def __init__(self, text: str):
+            self.text_value = text
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+
+        def raise_for_status(self):
+            pass
+
+        async def text(self):
+            return self.text_value
+
+    class MockSession:
+        def __init__(self):
+            self.responses = {
+                "https://modal.com/llms.txt": (
+                    "## Guide\n"
+                    "\n"
+                    "- [Introduction](https://modal.com/docs/guide)\n"
+                    "- Custom container images\n"
+                    "  - [Defining Images](https://modal.com/docs/guide/images.md)\n"
+                    "- Functions\n"
+                    "  - [Dynamic config](https://modal.com/docs/guide/functions/dynamic-config.md)\n"
+                    "- [Cron](https://modal.com/docs/guide/cron)\n"
+                    "\n"
+                    "## Examples\n"
+                    "\n"
+                    "- [Hello, world](https://modal.com/docs/examples/hello_world.md)\n"
+                    "\n"
+                    "## API Reference\n"
+                    "\n"
+                    "- [`App`](https://modal.com/docs/sdk/py/latest/App.md): The main unit of deployment\n"
+                ),
+                "https://modal.com/docs/examples/hello_world.md": "# Hello world\n",
+                "https://modal.com/docs/guide/images.md": "# Images\n",
+                "https://modal.com/docs/guide/functions/dynamic-config.md": "# Dynamic config\n",
+            }
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+
+        def get(self, url):
+            return MockResponse(self.responses[url])
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("modal.cli.skills._http_session", MockSession)
+
+    run_cli_command(["skills", "install"])
+
+    docs_dir = tmp_path / ".agents" / "skills" / "modal" / "references"
+    # Prose docs (guide/examples) are downloaded from llms.txt; non-`.md` links are not.
+    assert (docs_dir / "examples" / "hello_world.md").read_text() == "# Hello world\n"
+    assert (docs_dir / "guide" / "images.md").read_text() == "# Images\n"
+    assert not (docs_dir / "guide" / "cron.md").exists()
+    # Nested doc paths are preserved on disk rather than flattened.
+    assert (docs_dir / "guide" / "functions" / "dynamic-config.md").read_text() == "# Dynamic config\n"
+
+    # Each prose section gets an index.md mirroring llms.txt: category groupings and
+    # titles preserved, mirrored pages relinked locally. Links to pages we don't
+    # download (section roots, non-`.md` pages) are dropped.
+    guide_index = (docs_dir / "guide" / "index.md").read_text()
+    assert guide_index.startswith("# Guide\n")
+    assert "- Custom container images" in guide_index  # category grouping preserved
+    assert "[Defining Images](./images.md)" in guide_index  # mirrored page relinked locally
+    # Nested page links keep their subpath rather than flattening to the bare filename.
+    assert "[Dynamic config](./functions/dynamic-config.md)" in guide_index
+    assert "Introduction" not in guide_index  # section root not downloaded -> dropped
+    assert "Cron" not in guide_index  # non-`.md` page not downloaded -> dropped
+    assert "modal.com" not in guide_index  # no absolute links left behind
+    assert "[Hello, world](./hello_world.md)" in (docs_dir / "examples" / "index.md").read_text()
+
+    # The API reference is generated locally by introspecting the installed client; the
+    # API Reference section of llms.txt is not mirrored into an index.
+    app_doc = (docs_dir / "api" / "App.md").read_text()
+    assert app_doc.startswith("# App")
+    assert "<script>" not in app_doc  # mdsvex website boilerplate stripped
+    assert not (docs_dir / "api" / "sidebar.json").exists()
+    assert not (docs_dir / "api" / "index.md").exists()
+
+
+def test_skills_install_no_docs_skips_docs_download(tmp_path, monkeypatch):
+    async def fail_docs_download(target_dir):
+        raise AssertionError("docs download should not run")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("modal.cli.skills._download_docs", fail_docs_download)
+
+    run_cli_command(["skills", "install", "--no-docs"])
+
+    target_dir = tmp_path / ".agents" / "skills" / "modal"
+    assert (target_dir / "SKILL.md").exists()
+    assert not (target_dir / "references").exists()
+
+
+def test_skills_install_warns_if_docs_unavailable(tmp_path, monkeypatch):
+    class MockResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+
+        def raise_for_status(self):
+            raise RuntimeError("offline")
+
+        async def text(self):
+            return ""
+
+    class MockSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+
+        def get(self, url):
+            return MockResponse()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("modal.cli.skills._http_session", MockSession)
+    monkeypatch.setattr("modal.cli.skills._generate_api_reference_docs", lambda target_dir: None)
+
+    res = run_cli_command(["skills", "install"])
+
+    target_dir = tmp_path / ".agents" / "skills" / "modal"
+    assert (target_dir / "SKILL.md").exists()
+    assert not (target_dir / "references").exists()
+    assert "Warning: could not download Modal documentation: offline" in res.stderr
+
+
+def test_skills_install_requires_confirmation_before_overwrite(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target_dir = tmp_path / ".agents" / "skills" / "modal"
+    target_dir.mkdir(parents=True)
+    stale_file = target_dir / "old.txt"
+    stale_file.write_text("old")
+
+    res = run_cli_command(["skills", "install"], expected_exit_code=1)
+
+    assert "Rerun with --yes" in str(res.exception)
+    assert stale_file.exists()
+
+    run_cli_command(["skills", "install", "--yes", "--no-docs"])
+
+    assert not stale_file.exists()
+    assert (target_dir / "SKILL.md").exists()
+
+
+def test_skills_install_replaces_symlinked_skill_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target_dir = tmp_path / ".agents" / "skills" / "modal"
+    symlink_dest = tmp_path / "existing-skill"
+    symlink_dest.mkdir()
+    (symlink_dest / "old.txt").write_text("old")
+    target_dir.parent.mkdir(parents=True)
+    target_dir.symlink_to(symlink_dest, target_is_directory=True)
+
+    run_cli_command(["skills", "install", "--yes", "--no-docs"])
+
+    assert not target_dir.is_symlink()
+    assert (target_dir / "SKILL.md").exists()
+    assert (symlink_dest / "old.txt").exists()
+
+
+def test_skills_install_replaces_broken_symlinked_skill_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target_dir = tmp_path / ".agents" / "skills" / "modal"
+    missing_dest = tmp_path / "missing-skill"
+    target_dir.parent.mkdir(parents=True)
+    target_dir.symlink_to(missing_dest, target_is_directory=True)
+
+    run_cli_command(["skills", "install", "--yes", "--no-docs"])
+
+    assert not target_dir.is_symlink()
+    assert (target_dir / "SKILL.md").exists()
+
+
+def test_skills_update_replaces_existing_modal_skill_without_confirmation(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target_dir = tmp_path / ".agents" / "skills" / "modal"
+    target_dir.mkdir(parents=True)
+    (target_dir / "SKILL.md").write_text("---\nname: modal\n---\n\nOld skill\n")
+    stale_file = target_dir / "old.txt"
+    stale_file.write_text("old")
+
+    res = run_cli_command(["skills", "update", "--no-docs"])
+
+    assert "Updated Modal skill to" in res.stdout
+    assert not stale_file.exists()
+    assert "version:" in (target_dir / "SKILL.md").read_text()
+
+
+def test_skills_update_requires_confirmation_for_non_modal_skill(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target_dir = tmp_path / ".agents" / "skills" / "modal"
+    target_dir.mkdir(parents=True)
+    (target_dir / "SKILL.md").write_text("---\nname: other\n---\n\nNot Modal\n")
+
+    res = run_cli_command(["skills", "update", "--no-docs"], expected_exit_code=1)
+
+    assert "Rerun with --yes" in str(res.exception)
+    assert "name: other" in (target_dir / "SKILL.md").read_text()
+
+
+def test_skills_update_requires_confirmation_when_missing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    res = run_cli_command(["skills", "update", "--no-docs"], expected_exit_code=1)
+
+    assert "Rerun with --yes" in str(res.exception)
+    assert not (tmp_path / ".agents").exists()
+
+
+def test_app_setup(servicer, set_env_client, server_url_env, modal_config, mock_webbrowser):
+    servicer.required_creds = {"abc": "xyz"}
+    mock_webbrowser()
+
+    with modal_config() as config_file_path:
+        run_cli_command(["setup", "--profile", "_test"])
+        assert "_test" in toml.load(config_file_path)
+
+
+app_file = Path("app_run_tests") / "default_app.py"
+app_module = "app_run_tests.default_app"
+file_with_entrypoint = Path("app_run_tests") / "local_entrypoint.py"
+
+
+@pytest.mark.parametrize(
+    ("run_command", "expected_exit_code", "expected_output"),
+    [
+        ([f"{app_file}"], 0, ""),
+        ([f"{app_file}::app"], 0, ""),
+        ([f"{app_file}::foo"], 0, ""),
+        ([f"{app_file}::bar"], 1, ""),
+        ([f"{file_with_entrypoint}"], 0, ""),
+        ([f"{file_with_entrypoint}::main"], 0, ""),
+        ([f"{file_with_entrypoint}::app.main"], 0, ""),
+        ([f"{file_with_entrypoint}::foo"], 0, ""),
+    ],
+)
+def test_run(servicer, set_env_client, supports_dir, monkeypatch, run_command, expected_exit_code, expected_output):
+    monkeypatch.chdir(supports_dir)
+    res = run_cli_command(["run"] + run_command, expected_exit_code=expected_exit_code)
+    if expected_output:
+        assert re.search(expected_output, res.stdout) or re.search(expected_output, res.stderr), (
+            "output does not match expected string"
+        )
+
+
+def test_run_errors_without_module_flag(
+    servicer,
+    set_env_client,
+    supports_dir,
+    monkeypatch,
+):
+    monkeypatch.chdir(supports_dir)
+
+    res = run_cli_command(["run", f"{app_module}::foo"], expected_exit_code=1)
+    assert f"-m {app_module}" in str(res.exception)
+
+
+stdin_entrypoint_script = """
+import modal
+
+app = modal.App()
+
+
+@app.function()
+def foo():
+    pass
+
+
+@app.local_entrypoint()
+def main(name: str = "world"):
+    print(f"hello {name}")
+    foo.remote()
+"""
+
+
+def test_run_stdin(servicer, set_env_client):
+    res = run_cli_command(["run", "-q", "-", "--name", "alice"], input=stdin_entrypoint_script)
+    assert "hello alice" in res.stdout
+    assert len(servicer.function_call_inputs) == 1
+    mounted_files = {f for content in servicer.mount_contents.values() for f in content}
+    assert "/root/modal_stdin_app.py" in mounted_files
+
+
+def test_run_stdin_single_function(servicer, set_env_client, supports_dir):
+    source = (supports_dir / "app_run_tests" / "default_app.py").read_text()
+    run_cli_command(["run", "-"], input=source)
+    assert len(servicer.function_call_inputs) == 1
+
+
+def test_run_stdin_ambiguous(servicer, set_env_client, supports_dir):
+    source = (supports_dir / "app_run_tests" / "app_with_multiple_functions.py").read_text()
+    res = run_cli_command(["run", "-"], input=source, expected_exit_code=1)
+    assert "script on stdin" in res.stderr
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_error"),
+    [
+        (["run", "-m", "-"], "can't be combined with the -m flag"),
+        (["run", "-i", "-"], "Interactive mode"),
+        (["deploy", "-"], "does not support reading a script from stdin"),
+    ],
+)
+def test_run_stdin_errors(servicer, set_env_client, args, expected_error):
+    res = run_cli_command(args, input=stdin_entrypoint_script, expected_exit_code=1)
+    assert re.search(expected_error, str(res.exception) + res.stderr)
+
+
+@pytest.mark.parametrize("args", [["run"], ["run", "-q"]])
+def test_run_stdin_without_dash(servicer, set_env_client, monkeypatch, args):
+    monkeypatch.setattr("modal.cli.run._stdin_is_piped", lambda: True)
+    res = run_cli_command(args, input=stdin_entrypoint_script, expected_exit_code=2)
+    assert "pass `-`" in res.stderr
+
+
+def test_run_async(servicer, set_env_client, test_dir):
+    sync_fn = test_dir / "supports" / "app_run_tests" / "local_entrypoint.py"
+    res = run_cli_command(["run", sync_fn.as_posix()])
+    assert "called locally" in res.stdout
+
+    async_fn = test_dir / "supports" / "app_run_tests" / "local_entrypoint_async.py"
+    res = run_cli_command(["run", async_fn.as_posix()])
+    assert "called locally (async)" in res.stdout
+
+
+def test_run_generator(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "generator.py"
+    result = run_cli_command(["run", app_file.as_posix()], expected_exit_code=1)
+    assert "generator functions" in str(result.exception)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 15), reason="lazy imports require Python 3.15+")
+def test_run_with_lazy_imports(servicer, set_env_client, tmp_path):
+    (tmp_path / "lazy_not_imported_locally.py").write_text("raise RuntimeError('imported locally')\n")
+    app_file = tmp_path / "lazy_import_app.py"
+    app_file.write_text(
+        textwrap.dedent(
+            """
+            import modal
+            lazy import json
+            lazy import lazy_not_imported_locally
+            lazy import remote_only_dependency
+
+            app = modal.App()
+
+            @app.function()
+            def foo():
+                return remote_only_dependency.value
+
+            @app.local_entrypoint()
+            def main():
+                print(json.dumps("lazy imports ok"))
+            """
+        )
+    )
+    res = run_cli_command(["run", app_file.as_posix()])
+    assert '"lazy imports ok"' in res.stdout
+
+
+@pytest.mark.skipif(sys.version_info < (3, 15), reason="lazy imports require Python 3.15+")
+def test_lazily_imported_app(servicer, set_env_client, tmp_path):
+    (tmp_path / "lazy_app_definition.py").write_text(
+        textwrap.dedent(
+            """
+            import modal
+
+            app = modal.App()
+
+            @app.local_entrypoint()
+            def main():
+                pass
+            """
+        )
+    )
+    app_file = tmp_path / "lazy_app_reexport.py"
+    app_file.write_text("lazy from lazy_app_definition import app\n")
+    error = f"'app' is imported lazily in '{app_file.as_posix()}'"
+
+    result = run_cli_command(["run", app_file.as_posix()], expected_exit_code=1, expected_stderr=None)
+    assert "file has no entrypoints" in result.stderr
+    assert "change it to a regular import:\n  app" in result.stderr
+
+    run_cli_command(["run", app_file.as_posix() + "::app"], expected_exit_code=1, expected_error=error)
+    run_cli_command(["run", app_file.as_posix() + "::app.main"], expected_exit_code=1, expected_error=error)
+    run_cli_command(["deploy", app_file.as_posix()], expected_exit_code=1, expected_error=error)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 15), reason="lazy imports require Python 3.15+")
+@pytest.mark.parametrize(
+    ("functions", "expect_note"),
+    [
+        ("", True),
+        ("@app.function()\ndef foo(): pass\n@app.function()\ndef bar(): pass\n", False),
+    ],
+)
+def test_run_lazy_imports_note(servicer, set_env_client, tmp_path, functions, expect_note):
+    app_file = tmp_path / "lazy_import_app.py"
+    app_file.write_text(
+        "import modal\nlazy from remote_only_dependency import remote_fn\napp = modal.App()\n" + functions
+    )
+    result = run_cli_command(["run", app_file.as_posix()], expected_exit_code=1, expected_stderr=None)
+    assert ("file has no entrypoints" in result.stderr) == expect_note
+    assert ("change it to a regular import:\n  remote_fn" in result.stderr) == expect_note
+
+
+def test_help_message_unspecified_function(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "app_with_multiple_functions.py"
+    result = run_cli_command(["run", app_file.as_posix()], expected_exit_code=1, expected_stderr=None)
+
+    # should suggest available functions on the app:
+    assert "foo" in result.stderr
+    assert "bar" in result.stderr
+
+    result = run_cli_command(
+        ["run", app_file.as_posix(), "--help"], expected_exit_code=1, expected_stderr=None
+    )  # TODO: help should not return non-zero
+    # help should also available functions on the app:
+    assert "foo" in result.stderr
+    assert "bar" in result.stderr
+
+
+def test_run_states(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "default_app.py"
+    run_cli_command(["run", app_file.as_posix()])
+    assert servicer.app_state_history["ap-1"] == [
+        api_pb2.APP_STATE_INITIALIZING,
+        api_pb2.APP_STATE_EPHEMERAL,
+        api_pb2.APP_STATE_STOPPED,
+    ]
+
+
+def test_run_detach(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "default_app.py"
+    run_cli_command(["run", "--detach", app_file.as_posix()])
+    assert servicer.app_state_history["ap-1"] == [api_pb2.APP_STATE_INITIALIZING, api_pb2.APP_STATE_DETACHED]
+
+
+def test_run_quiet(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "default_app.py"
+    # Just tests that the command runs without error for now (tests end up defaulting to `show_progress=False` anyway,
+    # without a TTY).
+    run_cli_command(["run", "--quiet", app_file.as_posix()])
+
+
+def test_run_quiet_still_shows_errors(servicer, set_env_client, test_dir, monkeypatch):
+    """Test that errors are displayed even when running with --quiet flag."""
+    from io import StringIO
+
+    from modal.__main__ import main
+
+    app_file = test_dir / "supports" / "app_run_tests" / "raises_in_entrypoint.py"
+
+    # Capture stderr
+    stderr_capture = StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr_capture)
+    monkeypatch.setattr(sys, "argv", ["modal", "run", "--quiet", app_file.as_posix()])
+
+    # Run main() and expect it to call sys.exit(1)
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 1
+
+    # The error message should be visible in stderr even in quiet mode
+    stderr_output = stderr_capture.getvalue()
+    assert "This is an error message that should be visible" in stderr_output
+
+
+def test_run_class_hierarchy(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "class_hierarchy.py"
+    run_cli_command(["run", app_file.as_posix() + "::Wrapped.defined_on_base"])
+    run_cli_command(["run", app_file.as_posix() + "::Wrapped.overridden_on_wrapped"])
+
+
+def test_run_write_result(servicer, set_env_client, test_dir):
+    # Note that this test only exercises local entrypoint functions,
+    # because the servicer doesn't appear to mock remote execution faithfully?
+    app_file = (test_dir / "supports" / "app_run_tests" / "returns_data.py").as_posix()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        run_cli_command(["run", "--write-result", result_file := f"{tmpdir}/result.txt", f"{app_file}::returns_str"])
+        with open(result_file) as f:
+            assert f.read() == "Hello!"
+
+        run_cli_command(["run", "-w", result_file := f"{tmpdir}/result.bin", f"{app_file}::returns_bytes"])
+        with open(result_file, "rb") as f:
+            assert f.read().decode("utf8") == "Hello!"
+
+        run_cli_command(
+            ["run", "-w", result_file := f"{tmpdir}/result.bin", f"{app_file}::returns_int"],
+            expected_exit_code=1,
+            expected_error="Function must return str or bytes when using `--write-result`; got int.",
+        )
+
+
+@pytest.mark.parametrize(
+    ["args", "success"],
+    [
+        (["--name=deployment_name", str(app_file)], True),
+        (["--name=deployment_name", app_module], False),
+        (["--name=deployment_name", "-m", app_module], True),
+        (["--name=deployment_name", "-m", app_module, "--staged"], True),
+    ],
+)
+def test_deploy(servicer, set_env_client, supports_dir, monkeypatch, args, success):
+    monkeypatch.chdir(supports_dir)
+    run_cli_command(["deploy"] + args, expected_exit_code=0 if success else 1)
+    if success:
+        assert servicer.app_state_history["ap-1"] == [api_pb2.APP_STATE_INITIALIZING, api_pb2.APP_STATE_DEPLOYED]
+    else:
+        assert api_pb2.APP_STATE_DEPLOYED not in servicer.app_state_history["ap-1"]
+
+
+def test_run_custom_app(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "custom_app.py"
+    res = run_cli_command(["run", app_file.as_posix() + "::app"], expected_exit_code=1, expected_stderr=None)
+    assert "Could not find 'app'" in res.stderr
+    assert "foo / my_app.foo" in res.stderr
+    res = run_cli_command(["run", app_file.as_posix() + "::app.foo"], expected_exit_code=1, expected_stderr=None)
+    assert "Could not find 'app.foo'" in res.stderr
+    assert "foo / my_app.foo" in res.stderr
+
+    run_cli_command(["run", app_file.as_posix() + "::foo"])
+
+
+def test_run_aiofunc(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "async_app.py"
+    run_cli_command(["run", app_file.as_posix()])
+    assert len(servicer.function_call_inputs) == 1
+
+
+def test_run_local_entrypoint(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "local_entrypoint.py"
+
+    res = run_cli_command(["run", app_file.as_posix() + "::app.main"])  # explicit name
+    assert "called locally" in res.stdout
+    assert len(servicer.function_call_inputs) == 2
+
+    res = run_cli_command(["run", app_file.as_posix()])  # only one entry-point, no name needed
+    assert "called locally" in res.stdout
+    assert len(servicer.function_call_inputs) == 4
+
+
+def test_run_local_entrypoint_error(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "local_entrypoint.py"
+    run_cli_command(
+        ["run", "-iq", app_file.as_posix()],
+        expected_exit_code=1,
+        expected_error="To use interactive mode, remove the --quiet flag",
+    )
+
+
+def test_run_function_error(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "default_app.py"
+
+    run_cli_command(
+        ["run", "-iq", app_file.as_posix()],
+        expected_exit_code=1,
+        expected_error="To use interactive mode, remove the --quiet flag",
+    )
+
+
+def test_run_cls_error(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "cls.py"
+
+    run_cli_command(
+        ["run", "-iq", f"{app_file.as_posix()}::AParametrized.some_method", "--x", "42", "--y", "1000"],
+        expected_exit_code=1,
+        expected_error="To use interactive mode, remove the --quiet flag",
+    )
+
+
+def test_run_local_entrypoint_invalid_with_app_run(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "local_entrypoint_invalid.py"
+
+    res = run_cli_command(["run", app_file.as_posix()], expected_exit_code=1)
+    assert "app is already running" in str(res.exception.__cause__).lower()
+    assert "unreachable" not in res.stdout
+    assert len(servicer.function_call_inputs) == 0
+
+
+def test_run_parse_args_entrypoint(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "cli_args.py"
+    res = run_cli_command(["run", app_file.as_posix()], expected_exit_code=1, expected_stderr=None)
+    assert "has multiple possible entrypoints" in res.stderr
+
+    valid_call_args = [
+        (
+            [
+                "run",
+                f"{app_file.as_posix()}::app.dt_arg",
+                "--dt",
+                "2022-10-31",
+            ],
+            "the day is 31",
+        ),
+        (["run", f"{app_file.as_posix()}::dt_arg", "--dt=2022-10-31"], "the day is 31"),
+        (["run", f"{app_file.as_posix()}::int_arg", "--i=200"], "200 <class 'int'>"),
+        (["run", f"{app_file.as_posix()}::default_arg"], "10 <class 'int'>"),
+        (["run", f"{app_file.as_posix()}::profile_arg", "--profile=foo"], "foo"),
+        (["run", f"{app_file.as_posix()}::unannotated_arg", "--i=2022-10-31"], "'2022-10-31' <class 'str'>"),
+        (["run", f"{app_file.as_posix()}::unannotated_default_arg"], "10 <class 'int'>"),
+        (["run", f"{app_file.as_posix()}::optional_arg", "--i=20"], "20 <class 'int'>"),
+        (["run", f"{app_file.as_posix()}::optional_arg"], "None <class 'NoneType'>"),
+        (["run", f"{app_file.as_posix()}::optional_arg_postponed"], "None <class 'NoneType'>"),
+    ]
+    valid_call_args.extend(
+        [
+            (["run", f"{app_file.as_posix()}::optional_arg_pep604", "--i=20"], "20 <class 'int'>"),
+            (["run", f"{app_file.as_posix()}::optional_arg_pep604"], "None <class 'NoneType'>"),
+        ]
+    )
+    for args, expected in valid_call_args:
+        res = run_cli_command(args)
+        assert expected in res.stdout
+        assert len(servicer.function_call_inputs) == 0
+
+    res = run_cli_command(["run", f"{app_file.as_posix()}::unparseable_annot", "--i=20"], expected_exit_code=1)
+    assert "Parameter `i` has unparseable annotation: int | str" in str(res.exception)
+
+    res = run_cli_command(["run", f"{app_file.as_posix()}::unevaluatable_annot", "--i=20"], expected_exit_code=1)
+    assert "Unable to generate command line interface" in str(res.exception)
+    assert "no go" in str(res.exception)
+
+    if sys.version_info <= (3, 10):
+        res = run_cli_command(["run", f"{app_file.as_posix()}::optional_arg_pep604"], expected_exit_code=1)
+        assert "Unable to generate command line interface for app entrypoint" in str(res.exception)
+        assert "unsupported operand" in str(res.exception)
+
+
+def test_run_parse_args_function(servicer, set_env_client, test_dir, recwarn):
+    app_file = test_dir / "supports" / "app_run_tests" / "cli_args.py"
+    res = run_cli_command(["run", app_file.as_posix()], expected_exit_code=1, expected_stderr=None)
+    assert "has multiple possible entrypoints" in res.stderr
+
+    # HACK: all the tests use the same arg, i.
+    @servicer.function_body
+    def print_type(i):
+        print(repr(i), type(i))
+
+    valid_call_args = [
+        (["run", f"{app_file.as_posix()}::int_arg_fn", "--i=200"], "200 <class 'int'>"),
+        (["run", f"{app_file.as_posix()}::ALifecycle.some_method", "--i=hello"], "'hello' <class 'str'>"),
+        (["run", f"{app_file.as_posix()}::ALifecycle.some_method_int", "--i=42"], "42 <class 'int'>"),
+        (["run", f"{app_file.as_posix()}::optional_arg_fn"], "None <class 'NoneType'>"),
+    ]
+    for args, expected in valid_call_args:
+        res = run_cli_command(args)
+        assert expected in res.stdout
+
+    if len(recwarn):
+        print("Unexpected warnings:", [str(w) for w in recwarn])
+    assert len(recwarn) == 0
+
+
+def test_run_literal_args_entrypoint(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "cli_args.py"
+
+    # Test Literal with strings
+    valid_call_args = [
+        (["run", f"{app_file.as_posix()}::literal_str_arg", "--mode=write"], "'write' <class 'str'>"),
+        (["run", f"{app_file.as_posix()}::literal_int_arg", "--level=2"], "2 <class 'int'>"),
+        (["run", f"{app_file.as_posix()}::literal_with_default"], "'dev' <class 'str'>"),
+        (["run", f"{app_file.as_posix()}::literal_with_default", "--mode=prod"], "'prod' <class 'str'>"),
+        (["run", f"{app_file.as_posix()}::literal_int_with_default"], "2 <class 'int'>"),
+        (["run", f"{app_file.as_posix()}::literal_int_with_default", "--level=3"], "3 <class 'int'>"),
+    ]
+    for args, expected in valid_call_args:
+        res = run_cli_command(args)
+        assert expected in res.stdout, f"Expected {expected} in output, got: {res.stdout}"
+        assert len(servicer.function_call_inputs) == 0
+
+    # Test invalid Literal values
+    res = run_cli_command(
+        ["run", f"{app_file.as_posix()}::literal_str_arg", "--mode=invalid"],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "invalid value" in res.stderr.lower()
+
+    res = run_cli_command(
+        ["run", f"{app_file.as_posix()}::literal_int_arg", "--level=99"],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "invalid value" in res.stderr.lower()
+
+
+def test_run_literal_unsupported_types(servicer, set_env_client, test_dir):
+    """Test that Literal types with unsupported types are rejected."""
+    app_file = test_dir / "supports" / "app_run_tests" / "cli_args.py"
+
+    # Boolean literals should be rejected
+    res = run_cli_command(
+        ["run", f"{app_file.as_posix()}::literal_bool_arg", "--val=True"],
+        expected_exit_code=1,
+    )
+    assert "unparseable annotation" in str(res.exception).lower()
+
+    # Mixed type literals (str + int) should be rejected
+    res = run_cli_command(
+        ["run", f"{app_file.as_posix()}::literal_ambiguous_arg", "--val=2"],
+        expected_exit_code=1,
+    )
+    assert "unparseable annotation" in str(res.exception).lower()
+
+
+def test_run_literal_args_function(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "cli_args.py"
+
+    @servicer.function_body
+    def print_type(level):
+        print(repr(level), type(level))
+
+    valid_call_args = [
+        (["run", f"{app_file.as_posix()}::literal_arg_fn", "--level=1"], "1 <class 'int'>"),
+        (["run", f"{app_file.as_posix()}::literal_arg_fn", "--level=2"], "2 <class 'int'>"),
+        (["run", f"{app_file.as_posix()}::literal_arg_fn", "--level=3"], "3 <class 'int'>"),
+    ]
+    for args, expected in valid_call_args:
+        res = run_cli_command(args)
+        assert expected in res.stdout
+
+
+def test_run_user_script_exception(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "raises_error.py"
+    res = run_cli_command(["run", app_file.as_posix()], expected_exit_code=1)
+    assert res.exc_info is not None
+    exc = res.exc_info[1]
+    assert isinstance(exc, _CliUserExecutionError)
+
+    assert exc.user_source == str(app_file.resolve())
+
+
+@pytest.fixture
+def fresh_main_thread_assertion_module(test_dir):
+    modules_to_unload = [n for n in sys.modules.keys() if "main_thread_assertion" in n]
+    assert len(modules_to_unload) <= 1
+    for mod in modules_to_unload:
+        sys.modules.pop(mod)
+    yield test_dir / "supports" / "app_run_tests" / "main_thread_assertion.py"
+
+
+def test_no_user_code_in_synchronicity_run(servicer, set_env_client, test_dir, fresh_main_thread_assertion_module):
+    pytest._did_load_main_thread_assertion = False  # type: ignore
+    run_cli_command(["run", fresh_main_thread_assertion_module.as_posix()])
+    assert pytest._did_load_main_thread_assertion  # type: ignore
+    print()
+
+
+def test_no_user_code_in_synchronicity_deploy(servicer, set_env_client, test_dir, fresh_main_thread_assertion_module):
+    pytest._did_load_main_thread_assertion = False  # type: ignore
+    run_cli_command(["deploy", "--name", "foo", fresh_main_thread_assertion_module.as_posix()])
+    assert pytest._did_load_main_thread_assertion  # type: ignore
+
+
+def test_serve(servicer, set_env_client, server_url_env, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "webhook.py"
+    run_cli_command(["serve", app_file.as_posix(), "--timeout", "1"], expected_exit_code=0)
+
+
+def test_app_descriptions(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "prints_desc_app.py"
+    run_cli_command(["run", "--detach", app_file.as_posix() + "::foo"])
+
+    create_reqs = [s for s in servicer.requests if isinstance(s, api_pb2.AppCreateRequest)]
+    assert len(create_reqs) == 1
+    assert create_reqs[0].app_state == api_pb2.APP_STATE_DETACHED
+    description = create_reqs[0].description
+    assert "prints_desc_app.py::foo" in description
+    assert "run --detach " not in description
+
+    run_cli_command(["serve", "--timeout", "0.0", app_file.as_posix()])
+    create_reqs = [s for s in servicer.requests if isinstance(s, api_pb2.AppCreateRequest)]
+    assert len(create_reqs) == 2
+    description = create_reqs[1].description
+    assert "prints_desc_app.py" in description
+    assert "serve" not in description
+    assert "--timeout 0.0" not in description
+
+
+def test_app_descriptions_with_name(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "prints_desc_app.py"
+    run_cli_command(["run", "--detach", "--name", "named-run-app", app_file.as_posix() + "::foo"])
+    run_cli_command(["serve", "--timeout", "0.0", "--name", "named-serve-app", app_file.as_posix()])
+
+    create_reqs = [s for s in servicer.requests if isinstance(s, api_pb2.AppCreateRequest)]
+    assert len(create_reqs) == 2
+
+    run_description = create_reqs[0].description
+    assert run_description == "named-run-app"
+
+    serve_description = create_reqs[1].description
+    assert serve_description == "named-serve-app"
+
+
+def _mock_function_logs(monkeypatch):
+    client = mock.Mock()
+    client._stub.FunctionGet = mock.AsyncMock(
+        return_value=api_pb2.FunctionGetResponse(
+            function_id="fu-function",
+            handle_metadata=api_pb2.FunctionHandleMetadata(app_id="ap-function-app"),
+        )
+    )
+    client._stub.FunctionGetById = mock.AsyncMock(
+        return_value=api_pb2.FunctionGetByIdResponse(
+            handle_metadata=api_pb2.FunctionHandleMetadata(app_id="ap-function-app")
+        )
+    )
+    monkeypatch.setattr("modal.cli.function._Client.from_env", mock.AsyncMock(return_value=client))
+    return client
+
+
+def _mock_server_logs(monkeypatch):
+    client = mock.Mock()
+    client._stub.FunctionGet = mock.AsyncMock(
+        return_value=api_pb2.FunctionGetResponse(
+            function_id="fu-server",
+            function=api_pb2.FunctionData(is_server=True),
+            handle_metadata=api_pb2.FunctionHandleMetadata(app_id="ap-server-app"),
+        )
+    )
+    client._stub.FunctionGetById = mock.AsyncMock(
+        return_value=api_pb2.FunctionGetByIdResponse(
+            handle_metadata=api_pb2.FunctionHandleMetadata(app_id="ap-server-app"),
+            function=api_pb2.FunctionData(is_server=True),
+        )
+    )
+    monkeypatch.setattr("modal.cli.server._Client.from_env", mock.AsyncMock(return_value=client))
+    return client
+
+
+@pytest.mark.parametrize("command", ["logs", "stats"])
+@pytest.mark.parametrize("object_type", ["function", "server"])
+@pytest.mark.parametrize("identifier", ["fu-test", "my-app/my-object"])
+def test_function_and_server_commands_reject_wrong_type(set_env_client, monkeypatch, command, object_type, identifier):
+    if object_type == "function":
+        _mock_server_logs(monkeypatch)
+        actual_type = "Server"
+    else:
+        _mock_function_logs(monkeypatch)
+        actual_type = "Function"
+
+    result = run_cli_command([object_type, command, identifier], expected_exit_code=2)
+    assert f"'{identifier}' is a {actual_type}." in result.stderr
+    assert f"`modal {actual_type.lower()} {command}`." in result.stderr
+
+
+def test_server_logs_defaults_to_tail(set_env_client, monkeypatch):
+    client = _mock_server_logs(monkeypatch)
+    run_logs = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.server._run_logs_command", run_logs)
+
+    run_cli_command(["server", "logs", "my-app/WebServer"])
+
+    request = client._stub.FunctionGet.await_args.args[0]
+    assert request.app_name == "my-app"
+    assert request.object_tag == "WebServer"
+    assert request.environment_name == ""
+    run_logs.assert_awaited_once()
+    args, kwargs = run_logs.await_args
+    assert args == ("ap-server-app",)
+    assert kwargs["tail"] is None
+    assert kwargs["function_id"] == "fu-server"
+
+
+def test_server_logs_resolves_fu_prefixed_app_name(set_env_client, monkeypatch):
+    client = _mock_server_logs(monkeypatch)
+    run_logs = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.server._run_logs_command", run_logs)
+
+    run_cli_command(["server", "logs", "fu-prefixed-app/WebServer"])
+
+    request = client._stub.FunctionGet.await_args.args[0]
+    assert request.app_name == "fu-prefixed-app"
+    assert request.object_tag == "WebServer"
+    assert request.environment_name == ""
+    assert run_logs.await_args.args == ("ap-server-app",)
+
+
+def test_server_logs_fetches_time_range(set_env_client, monkeypatch):
+    client = _mock_server_logs(monkeypatch)
+    run_logs = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.server._run_logs_command", run_logs)
+
+    run_cli_command(
+        [
+            "server",
+            "logs",
+            "my-app/WebServer",
+            "--since",
+            "2026-08-18T00:00:00+00:00",
+            "--until",
+            "2026-08-18T01:00:00+00:00",
+            "--source",
+            "stderr",
+            "--search",
+            "matching",
+            "--env",
+            "prod",
+        ]
+    )
+
+    request = client._stub.FunctionGet.await_args.args[0]
+    assert request.app_name == "my-app"
+    assert request.object_tag == "WebServer"
+    assert request.environment_name == "prod"
+    run_logs.assert_awaited_once()
+    args, kwargs = run_logs.await_args
+    assert args == ("ap-server-app",)
+    assert kwargs["since"] == "2026-08-18T00:00:00+00:00"
+    assert kwargs["until"] == "2026-08-18T01:00:00+00:00"
+    assert kwargs["function_id"] == "fu-server"
+    assert kwargs["source"] == "stderr"
+    assert kwargs["search"] == "matching"
+
+
+def test_server_logs_follows_with_filters(set_env_client, monkeypatch):
+    _mock_server_logs(monkeypatch)
+    run_logs = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.server._run_logs_command", run_logs)
+
+    run_cli_command(
+        [
+            "server",
+            "logs",
+            "my-app/WebServer",
+            "--follow",
+            "--container",
+            "ta-container",
+            "--source",
+            "system",
+            "--search",
+            "ready",
+        ]
+    )
+
+    run_logs.assert_awaited_once()
+    args, kwargs = run_logs.await_args
+    assert args == ("ap-server-app",)
+    assert kwargs["follow"] is True
+    assert kwargs["function_id"] == "fu-server"
+    assert kwargs["container_id"] == "ta-container"
+    assert kwargs["search"] == "ready"
+
+
+def test_server_logs_shows_server_id(set_env_client, monkeypatch):
+    _mock_server_logs(monkeypatch)
+    run_logs = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.server._run_logs_command", run_logs)
+
+    run_cli_command(["server", "logs", "my-app/WebServer", "--show-server-id"])
+
+    _, kwargs = run_logs.await_args
+    assert kwargs["prefix_fields"] == ["fu"]
+
+    help_text = run_cli_command(["server", "logs", "--help"]).stdout
+    assert "--show-server-id" in help_text
+    assert "--show-function-id" not in help_text
+    assert "--function-call" not in help_text
+
+
+def test_server_logs_requires_app_and_server_names(set_env_client, monkeypatch):
+    client = _mock_server_logs(monkeypatch)
+
+    result = run_cli_command(["server", "logs", "WebServer"], expected_exit_code=2)
+
+    assert "SERVER must be a Function ID (fu-…) or a deployed Server name (APP_NAME/SERVER_NAME)" in result.stderr
+    client._stub.FunctionGet.assert_not_awaited()
+    client._stub.FunctionGetById.assert_not_awaited()
+
+
+def test_function_logs_resolves_name_and_runs_shared_command(set_env_client, monkeypatch):
+    client = _mock_function_logs(monkeypatch)
+    run_logs = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.function._run_logs_command", run_logs)
+
+    run_cli_command(
+        [
+            "function",
+            "logs",
+            "my-app/process",
+            "--since",
+            "2h",
+            "--tail",
+            "25",
+            "--source",
+            "stderr",
+            "--search",
+            "failed",
+            "--function-call",
+            "fc-call",
+            "--container",
+            "ta-container",
+            "--env",
+            "prod",
+        ]
+    )
+
+    request = client._stub.FunctionGet.await_args.args[0]
+    assert request.app_name == "my-app"
+    assert request.object_tag == "process"
+    assert request.environment_name == "prod"
+    run_logs.assert_awaited_once()
+    args, kwargs = run_logs.await_args
+    assert args == ("ap-function-app",)
+    assert kwargs["since"] == "2h"
+    assert kwargs["tail"] == 25
+    assert kwargs["source"] == "stderr"
+    assert kwargs["search"] == "failed"
+    assert kwargs["function_id"] == "fu-function"
+    assert kwargs["function_call_id"] == "fc-call"
+    assert kwargs["container_id"] == "ta-container"
+
+
+def test_function_logs_resolves_fu_prefixed_app_name(set_env_client, monkeypatch):
+    client = _mock_function_logs(monkeypatch)
+    run_logs = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.function._run_logs_command", run_logs)
+
+    run_cli_command(["function", "logs", "fu-prefixed-app/process"])
+
+    request = client._stub.FunctionGet.await_args.args[0]
+    assert request.app_name == "fu-prefixed-app"
+    assert request.object_tag == "process"
+    assert request.environment_name == ""
+    assert run_logs.await_args.args == ("ap-function-app",)
+
+
+def test_function_logs_resolves_app_id_from_function_id(set_env_client, monkeypatch):
+    client = _mock_function_logs(monkeypatch)
+    run_logs = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.function._run_logs_command", run_logs)
+
+    client._stub.FunctionGetById.return_value = api_pb2.FunctionGetByIdResponse(
+        handle_metadata=api_pb2.FunctionHandleMetadata(app_id="ap-from-function-id")
+    )
+
+    run_cli_command(["function", "logs", "fu-123"])
+
+    client._stub.FunctionGet.assert_not_awaited()
+    request = client._stub.FunctionGetById.await_args.args[0]
+    assert request.function_id == "fu-123"
+    run_logs.assert_awaited_once()
+    args, kwargs = run_logs.await_args
+    assert args == ("ap-from-function-id",)
+    assert kwargs["function_id"] == "fu-123"
+
+
+def test_function_logs_prefixes_ids(set_env_client, monkeypatch):
+    _mock_function_logs(monkeypatch)
+    run_logs = mock.AsyncMock()
+    monkeypatch.setattr("modal.cli.function._run_logs_command", run_logs)
+
+    run_cli_command(
+        [
+            "function",
+            "logs",
+            "my-app/process",
+            "--show-function-id",
+            "--show-function-call-id",
+            "--show-container-id",
+        ]
+    )
+
+    _, kwargs = run_logs.await_args
+    assert kwargs["prefix_fields"] == ["fu", "fc", "ta"]
+
+
+def test_function_logs_requires_app_and_function_names(set_env_client, monkeypatch):
+    client = _mock_function_logs(monkeypatch)
+
+    result = run_cli_command(["function", "logs", "process"], expected_exit_code=2)
+
+    assert "FUNCTION must be a Function ID (fu-…) or a deployed Function name (APP_NAME/FUNCTION_NAME)" in result.stderr
+    client._stub.FunctionGet.assert_not_awaited()
+    client._stub.FunctionGetById.assert_not_awaited()
+
+
+def test_function_logs_help(set_env_client):
+    help_text = run_cli_command(["function", "logs", "--help"]).stdout
+    assert "--function-call" in help_text
+    assert "--show-function-id" in help_text
+    assert "--show-function-call-id" in help_text
+
+
+def test_logs(servicer, server_url_env, set_env_client, mock_dir):
+    async def app_done(self, stream):
+        await stream.recv_message()
+        log = api_pb2.TaskLogs(data="hello\n", file_descriptor=api_pb2.FILE_DESCRIPTOR_STDOUT)
+        await stream.send_message(api_pb2.TaskLogsBatch(entry_id="1", items=[log]))
+        await stream.send_message(api_pb2.TaskLogsBatch(app_done=True))
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("AppGetLogs", app_done)
+
+        # TODO Fix the mock servicer to use "real" App IDs so this does not get misconstrued as a name
+        # res = run_cli_command(["app", "logs", "ap-123"])
+        # assert res.stdout == "hello\n"
+
+        with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+            res = run_cli_command(["deploy", "myapp.py", "--name", "my-app", "--stream-logs"])
+            assert res.stdout.rstrip().endswith("hello")
+
+        # Default `app logs` uses the tail path (single AppFetchLogs, no count)
+        now = datetime.now(timezone.utc).timestamp()
+        log = api_pb2.TaskLogs(data="hello\n", file_descriptor=api_pb2.FILE_DESCRIPTOR_STDOUT, timestamp=now)
+        fetch_resp = api_pb2.AppFetchLogsResponse(batches=[api_pb2.TaskLogsBatch(items=[log])])
+
+        async def fetch_handler(self, stream):
+            await stream.recv_message()
+            await stream.send_message(fetch_resp)
+
+        ctx.set_responder("AppFetchLogs", fetch_handler)
+
+        res = run_cli_command(["app", "logs", "my-app"])
+        assert res.stdout.strip() == "hello"
+
+    run_cli_command(
+        ["app", "logs", "does-not-exist"],
+        expected_exit_code=1,
+        expected_error="No App with name 'does-not-exist' found in the 'main' environment.",
+    )
+
+
+def test_logs_spinner_text(servicer, server_url_env, set_env_client, mock_dir):
+    from modal._output.rich import RichOutputManager
+
+    async def app_done(self, stream):
+        await stream.recv_message()
+        await stream.send_message(api_pb2.TaskLogsBatch(app_done=True))
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("AppGetLogs", app_done)
+
+        with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+            run_cli_command(["deploy", "myapp.py", "--name", "my-app"])
+
+        original_show_status_spinner = RichOutputManager.show_status_spinner
+        spinner_texts = []
+
+        def capture_spinner_text(self, status_text="Running app..."):
+            spinner_texts.append(status_text)
+            return original_show_status_spinner(self, status_text)
+
+        with mock.patch.object(RichOutputManager, "show_status_spinner", capture_spinner_text):
+            run_cli_command(["app", "logs", "my-app", "--follow"])
+
+        assert len(spinner_texts) == 1
+        assert "Following logs for" in spinner_texts[0]
+
+
+def test_run_timestamps(servicer, server_url_env, set_env_client, test_dir, monkeypatch):
+    from datetime import timezone
+
+    # Use a known timestamp (2025-01-15 12:00:45 UTC)
+    known_timestamp = 1736942445.0
+
+    # Mock locale_tz to return UTC for predictable timestamp formatting
+    monkeypatch.setattr("modal._utils.time_utils.locale_tz", lambda: timezone.utc)
+
+    async def app_logs_with_timestamp(self, stream):
+        await stream.recv_message()
+        log = api_pb2.TaskLogs(
+            data="test log message\n",
+            file_descriptor=api_pb2.FILE_DESCRIPTOR_STDOUT,
+            timestamp=known_timestamp,
+        )
+        await stream.send_message(api_pb2.TaskLogsBatch(entry_id="1", items=[log]))
+        await stream.send_message(api_pb2.TaskLogsBatch(app_done=True))
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("AppGetLogs", app_logs_with_timestamp)
+
+        app_file = test_dir / "supports" / "app_run_tests" / "default_app.py"
+
+        # Test without --timestamps flag - should not include timestamp
+        res = run_cli_command(["run", app_file.as_posix()])
+        assert "test log message" in res.stdout
+        # The timestamp string format is "YYYY-MM-DD HH:MM:SS+TZ" - check that it's NOT there
+        assert "2025-01-15 12:00:45" not in res.stdout
+
+        # Test with --timestamps flag - should include timestamp prefix
+        res = run_cli_command(["run", "--timestamps", app_file.as_posix()])
+        # Check for the full formatted line: "YYYY-MM-DD HH:MM:SS+00:00 <message>"
+        expected_line = "2025-01-15 12:00:45+00:00 test log message"
+        assert expected_line in res.stdout
+
+
+def test_app_stop(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        # Deploy as a module
+        run_cli_command(["deploy", "-m", "myapp"])
+
+    res = run_cli_command(["app", "list"])
+    assert re.search("my_app .+ deployed", res.stdout)
+
+    run_cli_command(["app", "stop", "my_app", "--yes"])
+
+    # Note that the mock servicer doesn't report "stopped" app statuses
+    # so we just check that it's not reported as deployed
+    res = run_cli_command(["app", "list"])
+    assert not re.search("my_app .+ deployed", res.stdout)
+
+
+def test_nfs_get(set_env_client, servicer):
+    nfs_name = "my-shared-nfs"
+    with pytest.warns(DeprecationError, match="`modal.NetworkFileSystem` is deprecated"):
+        run_cli_command(["nfs", "create", nfs_name])
+    with tempfile.TemporaryDirectory() as tmpdir:
+        upload_path = os.path.join(tmpdir, "upload.txt")
+        with open(upload_path, "w") as f:
+            f.write("foo bar baz")
+            f.flush()
+        with pytest.warns(DeprecationError, match="`modal.NetworkFileSystem` is deprecated"):
+            run_cli_command(["nfs", "put", nfs_name, upload_path, "test.txt"])
+
+        with pytest.warns(DeprecationError, match="`modal.NetworkFileSystem` is deprecated"):
+            run_cli_command(["nfs", "get", nfs_name, "test.txt", tmpdir])
+        with open(os.path.join(tmpdir, "test.txt")) as f:
+            assert f.read() == "foo bar baz"
+
+
+def test_nfs_create_delete(servicer, server_url_env, set_env_client):
+    name = "test-delete-nfs"
+    with pytest.warns(DeprecationError, match="`modal.NetworkFileSystem` is deprecated"):
+        run_cli_command(["nfs", "create", name])
+    assert name in run_cli_command(["nfs", "list"]).stdout
+    with pytest.warns(DeprecationError, match="`modal.NetworkFileSystem` is deprecated"):
+        run_cli_command(["nfs", "delete", "--yes", name])
+    assert name not in run_cli_command(["nfs", "list"]).stdout
+
+
+def test_volume_cli(set_env_client):
+    run_cli_command(["volume", "--help"])
+
+
+def test_volume_get(servicer, set_env_client):
+    vol_name = "my-test-vol"
+    run_cli_command(["volume", "create", vol_name])
+    file_path = "test.txt"
+    file_contents = b"foo bar baz"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        upload_path = os.path.join(tmpdir, "upload.txt")
+        with open(upload_path, "wb") as f:
+            f.write(file_contents)
+            f.flush()
+        run_cli_command(["volume", "put", vol_name, upload_path, file_path])
+
+        run_cli_command(["volume", "get", vol_name, file_path, tmpdir])
+        with open(os.path.join(tmpdir, file_path), "rb") as f:
+            assert f.read() == file_contents
+
+        download_path = os.path.join(tmpdir, "download.txt")
+        run_cli_command(["volume", "get", vol_name, file_path, download_path])
+        with open(download_path, "rb") as f:
+            assert f.read() == file_contents
+
+    with tempfile.TemporaryDirectory() as tmpdir2:
+        run_cli_command(["volume", "get", vol_name, "/", tmpdir2])
+        with open(os.path.join(tmpdir2, file_path), "rb") as f:
+            assert f.read() == file_contents
+
+
+def test_volume_put_force(servicer, set_env_client):
+    vol_name = "my-test-vol"
+    run_cli_command(["volume", "create", vol_name])
+    file_path = "test.txt"
+    file_contents = b"foo bar baz"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        upload_path = os.path.join(tmpdir, "upload.txt")
+        with open(upload_path, "wb") as f:
+            f.write(file_contents)
+            f.flush()
+
+        # File upload
+        run_cli_command(["volume", "put", vol_name, upload_path, file_path])  # Seed the volume
+        with servicer.intercept() as ctx:
+            run_cli_command(
+                ["volume", "put", vol_name, upload_path, file_path], expected_exit_code=2, expected_stderr=None
+            )
+            assert ctx.pop_request("VolumePutFiles").disallow_overwrite_existing_files
+
+            run_cli_command(["volume", "put", vol_name, upload_path, file_path, "--force"])
+            assert not ctx.pop_request("VolumePutFiles").disallow_overwrite_existing_files
+
+        # Dir upload
+        run_cli_command(["volume", "put", vol_name, tmpdir])  # Seed the volume
+        with servicer.intercept() as ctx:
+            run_cli_command(["volume", "put", vol_name, tmpdir], expected_exit_code=2, expected_stderr=None)
+            assert ctx.pop_request("VolumePutFiles").disallow_overwrite_existing_files
+
+            run_cli_command(["volume", "put", vol_name, tmpdir, "--force"])
+            assert not ctx.pop_request("VolumePutFiles").disallow_overwrite_existing_files
+
+
+def test_volume_rm(servicer, set_env_client):
+    vol_name = "my-test-vol"
+    run_cli_command(["volume", "create", vol_name])
+    file_path = "test.txt"
+    file_contents = b"foo bar baz"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        upload_path = os.path.join(tmpdir, "upload.txt")
+        with open(upload_path, "wb") as f:
+            f.write(file_contents)
+            f.flush()
+        run_cli_command(["volume", "put", vol_name, upload_path, file_path])
+
+        run_cli_command(["volume", "get", vol_name, file_path, tmpdir])
+        with open(os.path.join(tmpdir, file_path), "rb") as f:
+            assert f.read() == file_contents
+
+        run_cli_command(["volume", "rm", vol_name, file_path])
+        run_cli_command(["volume", "get", vol_name, file_path], expected_exit_code=1, expected_stderr=None)
+
+
+def test_volume_ls(servicer, set_env_client):
+    vol_name = "my-test-vol"
+    run_cli_command(["volume", "create", vol_name])
+
+    fnames = ["a", "b", "c"]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for fname in fnames:
+            src_path = os.path.join(tmpdir, f"{fname}.txt")
+            with open(src_path, "w") as f:
+                f.write(fname * 5)
+            run_cli_command(["volume", "put", vol_name, src_path, f"data/{fname}.txt"])
+
+    res = run_cli_command(["volume", "ls", vol_name])
+    assert "data" in res.stdout
+
+    res = run_cli_command(["volume", "ls", vol_name, "data"])
+    for fname in fnames:
+        assert f"{fname}.txt" in res.stdout
+
+    res = run_cli_command(["volume", "ls", vol_name, "data", "--json"])
+    res_dict = json.loads(res.stdout)
+    assert len(res_dict) == len(fnames)
+    for entry, fname in zip(res_dict, fnames):
+        assert entry["filename"] == f"data/{fname}.txt"
+        assert entry["type"] == "file"
+        assert entry["size"] == 5
+        created_modified = datetime.fromisoformat(entry["created_modified"])
+        assert created_modified.tzinfo is not None
+        assert created_modified.timestamp() == 1_700_000_000
+
+
+def test_volume_create_delete(servicer, server_url_env, set_env_client):
+    vol_name = "test-delete-vol"
+    run_cli_command(["volume", "create", vol_name])
+    windows_sleep()
+    assert vol_name in run_cli_command(["volume", "list"]).stdout
+    run_cli_command(["volume", "delete", "--yes", vol_name])
+    assert vol_name not in run_cli_command(["volume", "list"]).stdout
+
+
+def test_volume_rename(servicer, server_url_env, set_env_client):
+    old_name, new_name = "foo-vol", "bar-vol"
+    run_cli_command(["volume", "create", old_name])
+    run_cli_command(["volume", "rename", "--yes", old_name, new_name])
+    windows_sleep()
+    assert new_name in run_cli_command(["volume", "list"]).stdout
+    assert old_name not in run_cli_command(["volume", "list"]).stdout
+
+
+@pytest.mark.parametrize("command", [["shell"]])
+@pytest.mark.usefixtures("set_env_client", "mock_shell_pty")
+@skip_windows("modal shell is not supported on Windows.")
+def test_environment_flag(test_dir, servicer, command):
+    @servicer.function_body
+    def nothing(
+        arg=None,
+    ):  # hacky - compatible with both argless modal run and interactive mode which always sends an arg...
+        pass
+
+    app_file = test_dir / "supports" / "app_run_tests" / "app_with_lookups.py"
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "MountGetOrCreate",
+            api_pb2.MountGetOrCreateResponse(
+                mount_id="mo-123",
+                handle_metadata=api_pb2.MountHandleMetadata(content_checksum_sha256_hex="abc123"),
+            ),
+            request_filter=lambda req: (
+                req.deployment_name.startswith("Alingo-Modal-Core-mount")
+                and req.namespace == api_pb2.DEPLOYMENT_NAMESPACE_GLOBAL
+            ),
+        )  # built-in client lookup
+        ctx.add_response(
+            "VolumeGetOrCreate",
+            api_pb2.VolumeGetOrCreateResponse(volume_id="vo-123"),
+            request_filter=lambda req: req.deployment_name == "volume_app" and req.environment_name == "staging",
+        )
+        run_cli_command(command + ["--env=staging", str(app_file)])
+
+    app_create: api_pb2.AppCreateRequest = ctx.pop_request("AppCreate")
+    assert app_create.environment_name == "staging"
+
+
+@pytest.mark.parametrize("command", [["run"], ["deploy"], ["serve", "--timeout=1"], ["shell"]])
+@pytest.mark.usefixtures("set_env_client", "mock_shell_pty")
+@skip_windows("modal shell is not supported on Windows.")
+def test_environment_noflag(test_dir, servicer, command, monkeypatch):
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "some_weird_default_env")
+
+    @servicer.function_body
+    def nothing(
+        arg=None,
+    ):  # hacky - compatible with both argless modal run and interactive mode which always sends an arg...
+        pass
+
+    app_file = test_dir / "supports" / "app_run_tests" / "app_with_lookups.py"
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "MountGetOrCreate",
+            api_pb2.MountGetOrCreateResponse(
+                mount_id="mo-123",
+                handle_metadata=api_pb2.MountHandleMetadata(content_checksum_sha256_hex="abc123"),
+            ),
+            request_filter=lambda req: (
+                req.deployment_name.startswith("Alingo-Modal-Core-mount")
+                and req.namespace == api_pb2.DEPLOYMENT_NAMESPACE_GLOBAL
+            ),
+        )  # built-in client lookup
+        ctx.add_response(
+            "VolumeGetOrCreate",
+            api_pb2.VolumeGetOrCreateResponse(volume_id="vo-123"),
+            request_filter=lambda req: (
+                req.deployment_name == "volume_app" and req.environment_name == "some_weird_default_env"
+            ),
+        )
+        run_cli_command(command + [str(app_file)])
+
+    app_create: api_pb2.AppCreateRequest = ctx.pop_request("AppCreate")
+    assert app_create.environment_name == "some_weird_default_env"
+
+
+def test_cls(servicer, set_env_client, test_dir):
+    app_file = test_dir / "supports" / "app_run_tests" / "cls.py"
+
+    print(run_cli_command(["run", app_file.as_posix(), "--x", "42", "--y", "1000"]))
+    run_cli_command(["run", f"{app_file.as_posix()}::AParametrized.some_method", "--x", "42", "--y", "1000"])
+
+
+def test_profile_list(servicer, modal_config):
+    config = f"""
+    [test-profile]
+    token_id = "ak-abc"
+    token_secret = "as-xyz"
+    server_url = "{servicer.client_addr}"
+
+    [other-profile]
+    token_id = "ak-123"
+    token_secret = "as-789"
+    active = true
+    server_url = "{servicer.client_addr}"
+    """
+
+    with modal_config(config):
+        servicer.required_creds = {"ak-abc": "as-xyz", "ak-123": "as-789"}
+        res = run_cli_command(["profile", "list"])
+        table_rows = res.stdout.split("\n")
+        assert re.search("Profile .+ Workspace", table_rows[1])
+        assert re.search("test-profile .+ test-username", table_rows[3])
+        assert re.search("other-profile .+ test-username", table_rows[4])
+
+        res = run_cli_command(["profile", "list", "--json"])
+        json_data = json.loads(res.stdout)
+        assert json_data[0]["name"] == "test-profile"
+        assert json_data[0]["workspace"] == "test-username"
+        assert json_data[1]["name"] == "other-profile"
+        assert json_data[1]["workspace"] == "test-username"
+
+        orig_env_token_id = os.environ.get("MODAL_TOKEN_ID")
+        orig_env_token_secret = os.environ.get("MODAL_TOKEN_SECRET")
+        os.environ["MODAL_TOKEN_ID"] = "ak-abc"
+        os.environ["MODAL_TOKEN_SECRET"] = "as-xyz"
+        servicer.required_creds = {"ak-abc": "as-xyz"}
+        try:
+            res = run_cli_command(["profile", "list"])
+            assert "Using test-username workspace based on environment variables" in res.stdout
+        finally:
+            if orig_env_token_id:
+                os.environ["MODAL_TOKEN_ID"] = orig_env_token_id
+            else:
+                del os.environ["MODAL_TOKEN_ID"]
+            if orig_env_token_secret:
+                os.environ["MODAL_TOKEN_SECRET"] = orig_env_token_secret
+            else:
+                del os.environ["MODAL_TOKEN_SECRET"]
+
+
+@pytest_asyncio.fixture(scope="function")
+async def decoy_servicer(blob_server):
+    """A second mock server, standing in for whatever `MODAL_SERVER_URL` points at."""
+    async with servicer_factory(blob_server, ("ak-decoy", "as-decoy")) as s:
+        yield s
+
+
+def test_profile_list_does_not_send_profile_tokens_to_env_server_url(
+    servicer, decoy_servicer, modal_config, monkeypatch
+):
+    for env_var in (
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
+        "MODAL_OAUTH_REFRESH_TOKEN",
+        "MODAL_OAUTH_CLIENT_ID",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+    monkeypatch.setenv("MODAL_SERVER_URL", decoy_servicer.client_addr)
+
+    config = f"""
+    [test-profile]
+    token_id = "ak-abc"
+    token_secret = "as-xyz"
+    server_url = "{servicer.client_addr}"
+
+    [other-profile]
+    token_id = "ak-123"
+    token_secret = "as-789"
+    active = true
+    server_url = "{servicer.client_addr}"
+    """
+
+    with modal_config(config):
+        servicer.required_creds = {"ak-abc": "as-xyz", "ak-123": "as-789"}
+        res = run_cli_command(["profile", "list", "--json"])
+
+    # The decoy server received no requests at all, so it never saw any stored token.
+    assert decoy_servicer.last_metadata is None
+    # Each profile was still checked against its own server.
+    assert [(p["name"], p["workspace"]) for p in json.loads(res.stdout)] == [
+        ("test-profile", "test-username"),
+        ("other-profile", "test-username"),
+    ]
+
+
+def _oauth_jwt_key_pem() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+
+def test_profile_list_uses_oauth_env(servicer, server_url_env, modal_config, monkeypatch, credentials):
+    token_id, token_secret = credentials
+    monkeypatch.delenv("MODAL_TOKEN_ID", raising=False)
+    monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
+    monkeypatch.setenv("MODAL_OAUTH_REFRESH_TOKEN", f"{token_id}.{token_secret}")
+    monkeypatch.setenv("MODAL_OAUTH_CLIENT_ID", "oc-client-id")
+    monkeypatch.setenv("MODAL_OAUTH_JWT_KEY", _oauth_jwt_key_pem())
+
+    with modal_config(""):
+        servicer.required_creds = {token_id: token_secret}
+        res = run_cli_command(["profile", "list"])
+
+    normalized_output = " ".join(res.stdout.split())
+    assert "Using test-username workspace based on environment variables" in normalized_output
+
+
+def test_profile_list_uses_oauth_profile(servicer, server_url_env, modal_config, monkeypatch, credentials):
+    token_id, token_secret = credentials
+    for env_var in (
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
+        "MODAL_OAUTH_REFRESH_TOKEN",
+        "MODAL_OAUTH_CLIENT_ID",
+        "MODAL_OAUTH_JWT_KEY",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+    config = f"""
+    [oauth-profile]
+    oauth_refresh_token = "{token_id}.{token_secret}"
+    oauth_client_id = "oc-client-id"
+    oauth_jwt_key = '''{_oauth_jwt_key_pem()}'''
+    active = true
+    server_url = "{servicer.client_addr}"
+    """
+    with modal_config(config):
+        servicer.required_creds = {token_id: token_secret}
+        res = run_cli_command(["profile", "list"])
+
+    assert "test-username" in res.stdout
+
+
+@pytest.mark.parametrize(
+    "credential_env",
+    [
+        {"MODAL_OAUTH_REFRESH_TOKEN": "refresh-token"},
+        {
+            "MODAL_TOKEN_ID": "ak-token",
+            "MODAL_TOKEN_SECRET": "as-secret",
+            "MODAL_OAUTH_REFRESH_TOKEN": "refresh-token",
+            "MODAL_OAUTH_CLIENT_ID": "oc-client-id",
+        },
+    ],
+)
+def test_profile_list_handles_invalid_oauth_env(servicer, server_url_env, modal_config, monkeypatch, credential_env):
+    for env_var in (
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
+        "MODAL_OAUTH_REFRESH_TOKEN",
+        "MODAL_OAUTH_CLIENT_ID",
+        "MODAL_OAUTH_JWT_KEY",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+    for env_var, value in credential_env.items():
+        monkeypatch.setenv(env_var, value)
+
+    config = """
+    [test-profile]
+    token_id = "ak-abc"
+    token_secret = "as-xyz"
+    active = true
+    """
+    with modal_config(config):
+        servicer.required_creds = {"ak-abc": "as-xyz"}
+        res = run_cli_command(["profile", "list"])
+
+    normalized_output = " ".join(res.stdout.split())
+    assert (
+        "Using Unknown (invalid credential configuration) workspace based on environment variables" in normalized_output
+    )
+
+
+def test_global_profile_option(servicer, set_env_client, modal_config, test_dir):
+    with modal_config(
+        """
+        [default]
+        environment = "main"
+
+        [staging]
+        environment = "staging"
+        """
+    ):
+        res = run_cli_command(["profile", "current", "--profile", "staging"])
+        assert res.stdout == "staging\n"
+
+        run_cli_command(
+            [
+                "endpoint",
+                "create",
+                "--model=Qwen/Qwen3.6-27B-FP8",
+                "--profile",
+                "staging",
+            ]
+        )
+
+        app_file = test_dir / "supports" / "app_run_tests" / "local_entrypoint.py"
+        res = run_cli_command(["run", "--profile", "staging", app_file.as_posix()])
+        assert "called locally" in res.stdout
+
+    (request,) = servicer.endpoint_create_requests
+    assert request.environment_name == "staging"
+
+
+def test_global_profile_option_is_shown_in_command_help(monkeypatch):
+    plain_help = run_cli_command(["app", "list", "--help"]).stdout
+    assert "Global options:" not in plain_help
+    assert plain_help.index("--profile TEXT") < plain_help.index("-h, --help")
+
+    monkeypatch.setenv("MODAL_RICH_CLI", "1")
+    rich_help = run_cli_command(["app", "list", "--help"]).stdout
+    assert "Global options" not in rich_help
+    assert rich_help.index("--profile TEXT") < rich_help.index("--help")
+
+
+def test_group_help_omits_options(monkeypatch):
+    plain_help = run_cli_command(["app", "--help"]).stdout
+    assert "Options:" not in plain_help
+    assert "--profile" not in plain_help
+    assert "-h, --help" not in plain_help
+
+    monkeypatch.setenv("MODAL_RICH_CLI", "1")
+    rich_help = run_cli_command(["app", "--help"]).stdout
+    assert "Options" not in rich_help
+    assert "--profile" not in rich_help
+    assert "-h, --help" not in rich_help
+
+
+def test_unknown_global_profile_error(modal_config):
+    with modal_config("[default]"):
+        res = run_cli_command(["app", "list", "--profile", "main"], expected_exit_code=1)
+
+    assert "Modal profile 'main' was not found" in str(res.exception)
+
+
+def test_config_show(servicer, server_url_env, modal_config):
+    config = """
+    [test-profile]
+    token_id = "ak-abc"
+    token_secret = "as-xyz"
+    active = true
+    """
+    with modal_config(config):
+        res = run_cli_command(["config", "show"])
+        assert '"token_id": "ak-abc"' in res.stdout
+        assert '"token_secret": "***"' in res.stdout
+
+
+def test_config_show_redacts_oauth_secrets(servicer, server_url_env, modal_config):
+    config = """
+    [test-profile]
+    oauth_refresh_token = "ak-oauth.as-oauth"
+    oauth_client_id = "oc-client"
+    oauth_jwt_key = "private-key"
+    active = true
+    """
+    with modal_config(config):
+        res = run_cli_command(["config", "show"])
+        assert '"oauth_refresh_token": "***"' in res.stdout
+        assert '"oauth_client_id": "oc-client"' in res.stdout
+        assert '"oauth_jwt_key": "***"' in res.stdout
+
+
+def test_app_list(servicer, mock_dir, set_env_client):
+    res = run_cli_command(["app", "list"])
+    assert "my_app_foo" not in res.stdout
+
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        run_cli_command(["deploy", "myapp.py", "--name", "my_app_foo"])
+
+    res = run_cli_command(["app", "list"])
+    assert "my_app_foo" in res.stdout
+
+    res = run_cli_command(["app", "list", "--json"])
+    assert json.loads(res.stdout)
+
+    run_cli_command(["volume", "create", "my-vol"])
+    res = run_cli_command(["app", "list"])
+    assert "my-vol" not in res.stdout
+
+
+def test_app_list_limit(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        for i in range(10):
+            run_cli_command(["deploy", "myapp.py", "--name", f"my_app_foo{i}"])
+
+    res = run_cli_command(["app", "list", "--limit", "5", "--json"])
+    assert len(json.loads(res.stdout)) == 5
+
+    res = run_cli_command(["app", "list", "--limit", "5"])
+    assert "(5 of 10)" in res.stdout
+    assert all(f"my_app_foo{i}" in res.stdout for i in range(5))
+    assert "my_app_foo6" not in res.stdout
+
+
+def test_app_history(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        run_cli_command(["deploy", "myapp.py", "--name", "my_app_foo"])
+
+    app_id = servicer.deployed_apps.get(("main", "my_app_foo"))
+
+    servicer.app_deployment_history[app_id][-1]["commit_info"] = api_pb2.CommitInfo(
+        vcs="git", branch="main", commit_hash="abc123"
+    )
+
+    # app should be deployed once it exists
+    res = run_cli_command(["app", "history", "my_app_foo"])
+    assert "v1" in res.stdout, res.stdout
+
+    res = run_cli_command(["app", "history", "my_app_foo", "--json"])
+    assert json.loads(res.stdout)
+
+    # re-deploying an app should result in a new row in the history table
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        run_cli_command(["deploy", "myapp.py", "--name", "my_app_foo"])
+
+    servicer.app_deployment_history[app_id][-1]["commit_info"] = api_pb2.CommitInfo(
+        vcs="git", branch="main", commit_hash="def456", dirty=True
+    )
+
+    res = run_cli_command(["app", "history", "my_app_foo"])
+    assert "v1" in res.stdout
+    assert "v2" in res.stdout, f"{res.stdout=}"
+    assert "abc123" in res.stdout
+    assert "def456*" in res.stdout
+
+    # can't fetch history for stopped apps
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        run_cli_command(["app", "stop", "my_app_foo", "--yes"])
+
+    res = run_cli_command(["app", "history", "my_app_foo", "--json"], expected_exit_code=1)
+
+
+app_file_with_function = """
+import modal
+
+app = modal.App("my_app", include_source=False)
+
+@app.function()
+def square(x):
+    return x ** 2
+"""
+
+
+def _run_app_stats_cli(servicer, response, *options, identifier="my-app"):
+    with servicer.intercept() as ctx:
+        if identifier == "my-app":
+            ctx.add_response(
+                "AppGetByDeploymentName",
+                api_pb2.AppGetByDeploymentNameResponse(app_id="ap-aaaaaaaaaaaaaaaaaaaaaa", environment_name="other"),
+            )
+        ctx.add_response("AppGetTimeRangeStats", response)
+        result = run_cli_command(["app", "stats", identifier, *options])
+    return result, ctx
+
+
+def test_app_stats_cli(servicer, set_env_client, app_stats_response, monkeypatch):
+    result, ctx = _run_app_stats_cli(
+        servicer,
+        app_stats_response,
+        "--since",
+        "2026-10-19T12:00:00+00:00",
+        "--until",
+        "2026-10-19T13:00:00+00:00",
+        "--env",
+        "other",
+        "--no-color",
+    )
+    # assert len(calls) == 1
+    assert ctx.get_requests("AppGetInfo") == ctx.get_requests("AppGetLifecycle") == []
+    assert ctx.get_requests("AppGetOrCreate") == []
+    lookup = ctx.pop_request("AppGetByDeploymentName")
+    assert lookup.name == "my-app" and lookup.environment_name == "other"
+    request = ctx.pop_request("AppGetTimeRangeStats")
+    assert request.app_id == "ap-aaaaaaaaaaaaaaaaaaaaaa"
+    assert request.since == app_stats_response.since and request.until == app_stats_response.until
+    output = result.stdout
+    assert "my-app · deployed" in output and "(v42)" in output
+    assert "2026-10-19 12:00:00 – 2026-10-19 13:00:00 UTC" in output
+    assert "2 deployments" in output
+    assert "FUNCTIONS" in output and "SERVERS" in output and "containers" in output
+    assert "errors" in output
+    assert re.search(r"embed\s+60\s+5\.0%\s+4\s+1", output)
+    assert re.search(r"reindex\s+0\s+—\s+0\s+3", output)
+    assert re.search(r"Total\s+80\s+6\.2%\s+6\s+7", output)
+    assert re.search(r"gateway\s+80\s+2\.5%\s+3\s+1", output)
+    assert "2 live as of 2026-10-19 13:00:00 UTC · 5 finished" in output
+    assert "\x1b[" not in output
+    assert "spillover" not in output.lower()
+    lines = output.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith(("FUNCTIONS", "SERVERS")):
+            assert "─" not in lines[i + 1]
+        if line.startswith("Total"):
+            assert set(lines[i - 1]) == {"─"}
+            assert len(lines[i - 1]) == len(line)
+
+
+def test_app_stats_cli_stopped_app_by_name(servicer, set_env_client, app_stats_response):
+    response = app_stats_response
+    response.lifecycle.app_state = api_pb2.APP_STATE_STOPPED
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "AppGetByDeploymentName",
+            api_pb2.AppGetByDeploymentNameResponse(previous_app_id="ap-stopped", environment_name="other"),
+        )
+        ctx.add_response("AppGetTimeRangeStats", response)
+        result = run_cli_command(["app", "stats", "stopped-app", "--env", "other", "--no-color"])
+    assert "stopped-app · stopped" in result.stdout
+    assert ctx.pop_request("AppGetByDeploymentName").environment_name == "other"
+    assert ctx.pop_request("AppGetTimeRangeStats").app_id == "ap-stopped"
+    assert ctx.get_requests("AppGetOrCreate") == ctx.get_requests("AppGetLifecycle") == []
+
+
+def test_app_stats_cli_missing_app_by_name(servicer, set_env_client):
+    with servicer.intercept() as ctx:
+        ctx.add_response("AppGetByDeploymentName", api_pb2.AppGetByDeploymentNameResponse(environment_name="other"))
+        result = run_cli_command(["app", "stats", "missing-app", "--env", "other"], expected_exit_code=1)
+    assert isinstance(result.exception, NotFoundError)
+    assert "No App with name 'missing-app'" in str(result.exception)
+    assert ctx.get_requests("AppGetTimeRangeStats") == ctx.get_requests("AppGetOrCreate") == []
+
+
+def test_app_stats_cli_class_name_and_zero_calls(servicer, set_env_client, app_stats_response):
+    response = app_stats_response
+    response.functions.by_name.clear()
+    response.functions.total.Clear()
+    response.functions.total.containers.container_errors = 1
+    response.functions.by_name["MyCls.*"].CopyFrom(
+        api_pb2.AppFunctionStats(
+            object_id="fu-class",
+            counts=api_pb2.AppFunctionCounts(containers=api_pb2.AppContainerCounts(container_errors=1)),
+        )
+    )
+    result, _ = _run_app_stats_cli(servicer, response, "--no-color")
+    section = result.stdout.split("FUNCTIONS")[1].split("SERVERS")[0]
+    assert re.search(r"MyCls\.\*\s+0\s+—\s+0\s+1", section)
+    assert not re.search(r"(?m)^Total\s+\d", section)
+    assert "— failed" not in result.stdout
+
+
+@pytest.mark.parametrize("name", ["MyCls.*", "a_long_function_name", "関数"])
+def test_app_stats_cli_column_alignment(servicer, set_env_client, app_stats_response, name):
+    from rich.cells import cell_len
+
+    response = app_stats_response
+    function = api_pb2.AppFunctionStats()
+    function.CopyFrom(response.functions.by_name["embed"])
+    del response.functions.by_name["embed"]
+    response.functions.by_name[name].CopyFrom(function)
+    server = api_pb2.AppServerStats()
+    server.CopyFrom(response.servers.by_name["gateway"])
+    del response.servers.by_name["gateway"]
+    response.servers.by_name["FileServer"].CopyFrom(server)
+    response.servers.by_name["FileServer"].counts.requests.total = 1_234_567_890
+    response.servers.by_name["FileServer"].counts.requests.ok = 1_234_567_888
+    response.servers.total.CopyFrom(response.servers.by_name["FileServer"].counts)
+    result, _ = _run_app_stats_cli(servicer, response, "--no-color")
+    lines = result.stdout.splitlines()
+    functions = next(line for line in lines if line.startswith("FUNCTIONS"))
+    servers = next(line for line in lines if line.startswith("SERVERS"))
+    for label in ("failed", "containers", "errors"):
+        assert functions.index(label) == servers.index(label)
+    assert functions.index("calls") + len("calls") == servers.index("requests") + len("requests")
+    function_line = next(line for line in lines if line.startswith(name))
+    server_line = next(line for line in lines if line.startswith("FileServer"))
+    function_count_end = cell_len(function_line[: function_line.index("60") + 2])
+    server_count_end = cell_len(server_line[: server_line.index("1,234,567,890") + len("1,234,567,890")])
+    assert function_count_end == server_count_end
+    sandbox_line = next(line for line in lines if line.startswith("SANDBOXES"))
+    name_width = max(cell_len(n) for n in ["SANDBOXES", name, "ingest", "reindex", "FileServer"])
+    assert sandbox_line.index("2 live") == name_width + 4
+
+
+@pytest.mark.parametrize("deployment_count", [None, 0, 1])
+@pytest.mark.parametrize("stopped", [False, True])
+def test_app_stats_cli_json(servicer, set_env_client, app_stats_response, deployment_count, stopped, monkeypatch):
+    monkeypatch.setattr("modal._utils.time_utils.locale_tz", lambda: timezone(timedelta(hours=-4)))
+    response = app_stats_response
+    if stopped:
+        response.lifecycle.deployed_at = 0
+        response.lifecycle.stopped_at = response.until.seconds
+        response.lifecycle.stopped_by = "stopper"
+    response.ClearField("deployment_count")
+    if deployment_count is not None:
+        response.deployment_count = deployment_count
+    response.functions.by_name["ingest"].counts.calls.CopyFrom(
+        api_pb2.AppCallCounts(total=2**60 - 59, succeeded=2**60 - 61, failed=2)
+    )
+    response.functions.total.calls.CopyFrom(api_pb2.AppCallCounts(total=2**60 + 1, succeeded=2**60 - 4, failed=5))
+    result, ctx = _run_app_stats_cli(servicer, response, "--json", identifier="ap-aaaaaaaaaaaaaaaaaaaaaa")
+    data = json.loads(result.stdout)
+    assert data["app_id"] == "ap-aaaaaaaaaaaaaaaaaaaaaa"
+    assert data["since"] == "2026-10-19T12:00:00+00:00"
+    assert data["until"] == "2026-10-19T13:00:00+00:00"
+    assert data["functions"]["total"] == {
+        "calls": {"total": 2**60 + 1, "succeeded": 2**60 - 4, "failed": 5},
+        "containers": {"errors": 7, "total": 6},
+    }
+    assert data["functions"]["by_name"]["embed"] == {
+        "object_id": "fu-embed",
+        "counts": {
+            "calls": {"total": 60, "succeeded": 57, "failed": 3},
+            "containers": {"errors": 1, "total": 4},
+        },
+    }
+    assert data["servers"]["total"] == {
+        "requests": {"total": 80, "ok": 78, "failed": 2},
+        "containers": {"errors": 1, "total": 3},
+    }
+    assert data["servers"]["by_name"]["gateway"] == {
+        "object_id": "fu-gateway",
+        "counts": {
+            "requests": {"total": 80, "ok": 78, "failed": 2},
+            "containers": {"errors": 1, "total": 3},
+        },
+    }
+    assert '"function_id"' not in result.stdout
+    assert data["sandboxes"] == {"total": 7, "finished": 5, "live": 2}
+    assert data["lifecycle"] == {
+        "state": "deployed",
+        "version": 42,
+        "created_at": "2026-10-16 08:00:00-04:00",
+        "created_by": "creator",
+        "deployed_at": None if stopped else "2026-10-17 08:00:00-04:00",
+        "deployed_by": "publisher",
+        "stopped_at": "2026-10-19 09:00:00-04:00" if stopped else None,
+        "stopped_by": "stopper" if stopped else None,
+    }
+    assert set(data) == {
+        "app_id",
+        "since",
+        "until",
+        "lifecycle",
+        "functions",
+        "servers",
+        "sandboxes",
+        "deployment_count",
+    }
+    assert data["deployment_count"] == deployment_count
+    assert "%" not in result.stdout
+    assert ctx.get_requests("AppGetInfo") == ctx.get_requests("AppGetLifecycle") == []
+    assert ctx.get_requests("AppGetByDeploymentName") == ctx.get_requests("AppGetOrCreate") == []
+
+
+@pytest.mark.parametrize(
+    "state", [api_pb2.APP_STATE_EPHEMERAL, api_pb2.APP_STATE_DETACHED, api_pb2.APP_STATE_DETACHED_DISCONNECTED]
+)
+def test_app_stats_cli_run_header(servicer, set_env_client, app_stats_response, state):
+    response = app_stats_response
+    response.lifecycle.app_state = state
+    response.ClearField("deployment_count")
+    result, _ = _run_app_stats_cli(servicer, response)
+    assert "my-app · running" in result.stdout
+    assert "v42" not in result.stdout and "deployment" not in result.stdout
+    assert "2026-10-19 12:00:00 – 2026-10-19 13:00:00 UTC" in result.stdout
+    assert "2 live · 5 finished" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "state,label",
+    [
+        (api_pb2.APP_STATE_STOPPED, "stopped"),
+        (api_pb2.APP_STATE_STOPPING, "stopping"),
+        (api_pb2.APP_STATE_DISABLED, "disabled"),
+        (api_pb2.APP_STATE_INITIALIZING, "initializing"),
+    ],
+)
+def test_app_stats_cli_other_lifecycle_states(servicer, set_env_client, app_stats_response, state, label):
+    app_stats_response.lifecycle.app_state = state
+    result, _ = _run_app_stats_cli(servicer, app_stats_response)
+    assert f"my-app · {label}" in result.stdout
+
+
+@pytest.mark.parametrize("servers", ["single", "multiple", "zero"])
+def test_app_stats_cli_server_footer(servicer, set_env_client, app_stats_response, servers):
+    response = app_stats_response
+    if servers in ("single", "multiple"):
+        response.servers.total.CopyFrom(response.servers.by_name["gateway"].counts)
+        if servers == "multiple":
+            response.servers.by_name["idle"].object_id = "fu-idle"
+    else:
+        response.servers.by_name.clear()
+        response.servers.total.Clear()
+    result, _ = _run_app_stats_cli(servicer, response, "--no-color")
+    if servers == "zero":
+        assert "SERVERS" not in result.stdout
+        assert "SANDBOXES" in result.stdout
+        return
+    section = result.stdout.split("SERVERS")[1].split("SANDBOXES")[0]
+    lines = section.splitlines()
+    assert bool(re.search(r"(?m)^Total\s+\d", section)) == (servers == "multiple")
+    if servers == "multiple":
+        index = next(i for i, line in enumerate(lines) if line.startswith("Total"))
+        assert set(lines[index - 1]) == {"─"}
+        assert len(lines[index - 1]) == len(lines[index])
+
+
+@pytest.mark.parametrize("single", [False, True])
+def test_app_stats_cli_function_footer(servicer, set_env_client, app_stats_response, single):
+    response = app_stats_response
+    if single:
+        del response.functions.by_name["ingest"]
+        del response.functions.by_name["reindex"]
+    total, succeeded, failed, errors, active = (60, 57, 3, 1, 4) if single else (80, 75, 5, 7, 6)
+    response.functions.total.CopyFrom(
+        api_pb2.AppFunctionCounts(
+            calls=api_pb2.AppCallCounts(total=total, succeeded=succeeded, failed=failed),
+            containers=api_pb2.AppContainerCounts(container_errors=errors, container_active_count=active),
+        )
+    )
+    result, _ = _run_app_stats_cli(servicer, response, "--no-color")
+    section = result.stdout.split("FUNCTIONS")[1].split("SERVERS")[0]
+    show_total = not single
+    assert bool(re.search(r"(?m)^Total\s+\d", section)) == show_total
+    assert ("─" in section) == show_total
+
+
+@pytest.mark.parametrize("count", [0, 1])
+def test_app_stats_cli_deployment_pluralization(servicer, set_env_client, app_stats_response, count):
+    app_stats_response.deployment_count = count
+    result, _ = _run_app_stats_cli(servicer, app_stats_response)
+    assert f"{count} deployment" in result.stdout
+    assert ("1 deployments" if count else "0 deployment ·") not in result.stdout
+    if count == 0:
+        assert "0 deployments" in result.stdout
+    else:
+        assert "1 deployments" not in result.stdout
+
+
+def test_app_stats_cli_relative_window(servicer, set_env_client, app_stats_response):
+    _, ctx = _run_app_stats_cli(servicer, app_stats_response, "--since", "5h", "--until", "2h", "--json")
+    request = ctx.pop_request("AppGetTimeRangeStats")
+    assert request.until.ToDatetime(tzinfo=timezone.utc) - request.since.ToDatetime(tzinfo=timezone.utc) == timedelta(
+        hours=3
+    )
+
+
+@pytest.mark.parametrize("options", [["--since", "bad"], ["--until", "bad"], ["--since", "1h", "--until", "2h"]])
+def test_app_stats_cli_invalid_window(set_env_client, options):
+    run_cli_command(["app", "stats", "my-app", *options], expected_exit_code=2)
+
+
+@pytest.mark.parametrize("failed,total", [(0, 100), (4, 100), (5, 100), (10, 100), (0, 0)])
+def test_app_stats_cli_failure_percentage(servicer, set_env_client, app_stats_response, failed, total):
+    response = app_stats_response
+    response.servers.by_name["gateway"].counts.requests.CopyFrom(
+        api_pb2.AppRequestCounts(total=total, ok=total - failed, failed=failed)
+    )
+    response.servers.total.CopyFrom(response.servers.by_name["gateway"].counts)
+    result, _ = _run_app_stats_cli(servicer, response, "--no-color")
+    server_line = next(line for line in result.stdout.splitlines() if "gateway" in line)
+    assert "⚠" not in result.stdout
+    if total:
+        assert f"{failed / total:.1%}" in server_line
+    if total == 0:
+        assert "—" in server_line
+
+
+def test_app_stats_cli_no_functions(servicer, set_env_client, app_stats_response):
+    response = app_stats_response
+    response.functions.by_name.clear()
+    response.functions.total.Clear()
+    result, _ = _run_app_stats_cli(servicer, response, "--no-color")
+    assert "FUNCTIONS" not in result.stdout
+    assert "SERVERS" in result.stdout
+    assert "SANDBOXES" in result.stdout
+
+
+@pytest.mark.parametrize("section", ["functions", "servers"])
+@pytest.mark.parametrize("data", ["none", "traffic", "container_errors", "active_containers"])
+def test_app_stats_cli_section_presence(servicer, set_env_client, app_stats_response, section, data):
+    response = app_stats_response
+    group = getattr(response, section)
+    group.total.Clear()
+    for row in group.by_name.values():
+        row.counts.Clear()
+    traffic = group.total.calls if section == "functions" else group.total.requests
+    if data == "traffic":
+        traffic.total = 1
+        if section == "functions":
+            traffic.succeeded = 1
+        else:
+            traffic.ok = 1
+    group.total.containers.container_errors = 1 if data == "container_errors" else 0
+    group.total.containers.container_active_count = 1 if data == "active_containers" else 0
+    next(iter(group.by_name.values())).counts.CopyFrom(group.total)
+    result, _ = _run_app_stats_cli(servicer, response, "--no-color")
+    assert (section.upper() in result.stdout) == (data != "none")
+
+
+def test_app_stats_cli_ninety_minute_window(servicer, set_env_client, app_stats_response):
+    response = app_stats_response
+    response.until.FromDatetime(datetime(2026, 10, 19, 13, 30, tzinfo=timezone.utc))
+    result, _ = _run_app_stats_cli(
+        servicer, response, "--since", "2026-10-19T12:00:00+00:00", "--until", "2026-10-19T13:30:00+00:00", "--no-color"
+    )
+    assert "2026-10-19 12:00:00 – 2026-10-19 13:30:00 UTC" in result.stdout
+    assert "Duration" not in result.stdout
+
+
+def test_app_stats_cli_empty_app(servicer, set_env_client, app_stats_response):
+    response = api_pb2.AppGetTimeRangeStatsResponse(
+        since=app_stats_response.since,
+        until=app_stats_response.until,
+        lifecycle=app_stats_response.lifecycle,
+        deployment_count=0,
+    )
+    result, _ = _run_app_stats_cli(servicer, response, "--no-color")
+    assert "Total" not in result.stdout
+    assert "FUNCTIONS" not in result.stdout
+    assert "SERVERS" not in result.stdout
+    assert "─" not in result.stdout
+    assert "0 live · 0 finished" in result.stdout
+    assert "0 deployments" in result.stdout
+    assert "⚠" not in result.stdout
+
+
+def test_app_info(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": app_file_with_function}):
+        run_cli_command(["deploy", "myapp.py", "--name", "my_app_foo"])
+
+    app_id = servicer.deployed_apps.get(("main", "my_app_foo"))
+
+    # Look up by name
+    with servicer.intercept() as ctx:
+        res = run_cli_command(["app", "info", "my_app_foo"])
+    request = ctx.pop_request("AppGetInfo")
+    assert request.app_id == app_id
+    assert "my_app_foo" in res.stdout
+    assert app_id in res.stdout
+    assert "deployed" in res.stdout
+    assert "Lifecycle" not in res.stdout
+    assert "Created" in res.stdout
+    assert "Deployment:" in res.stdout
+    assert "v1" in res.stdout
+    assert res.stdout.index("Created") < res.stdout.index("Functions")
+    assert "Functions" in res.stdout
+    assert "square" in res.stdout, res.stdout
+    assert "Servers" not in res.stdout  # omitted when the App has none
+
+    # JSON output is a single object covering every section, so that it can be piped
+    res = run_cli_command(["app", "info", "my_app_foo", "--json"])
+    data = json.loads(res.stdout)
+    assert data["description"] == "my_app_foo"
+    assert data["app_id"] == app_id
+    assert data["lifecycle"]["state"] == "deployed"
+    assert data["lifecycle"]["version"] == 1
+    assert data["lifecycle"]["created_at"] is not None
+    assert data["lifecycle"]["stopped_at"] is None
+    assert data["functions"] == {"square": {"id": "fu-1", "summary": {}}}
+    assert data["servers"] == {}
+
+    res = run_cli_command(["app", "info", "does-not-exist"], expected_exit_code=1)
+
+    # App IDs are validated by the shared resolver before fetching info.
+    with servicer.intercept() as ctx:
+        run_cli_command(["app", "info", "ap-abcdefghABCDEFGH012345"], expected_exit_code=1)
+    request = ctx.pop_request("AppGetLifecycle")
+    assert request.app_id == "ap-abcdefghABCDEFGH012345"
+
+
+@pytest.mark.parametrize("authenticated", [False, True])
+@pytest.mark.parametrize("secondary_gpus", [[], ["A100", "L4"]])
+def test_app_info_summaries(servicer, set_env_client, authenticated, secondary_gpus):
+    servicer.app_state_history["ap-abcdefghABCDEFGH012345"] = [api_pb2.APP_STATE_STOPPED]
+    summary = api_pb2.AppGetInfoResponse.FunctionInfoSummary
+    response = api_pb2.AppGetInfoResponse(
+        info=api_pb2.AppHandleMetadata(
+            app_id="ap-abcdefghABCDEFGH012345",
+            description="my-app",
+            lifecycle=api_pb2.AppLifecycle(
+                app_state=api_pb2.APP_STATE_STOPPED,
+                created_at=1700000000,
+                deployed_at=1700000100,
+                stopped_at=1700000200,
+                version=17,
+            ),
+            functions={"z_missing": "fu-missing", "alpha": "fu-cpu", "MyClass.*": "fu-gpu"},
+            servers={"LongNamedFileServer": "fu-server"},
+        ),
+        function_info_summaries={
+            "fu-cpu": summary(schedule=api_pb2.Schedule(period=api_pb2.Schedule.Period(minutes=15))),
+            "fu-gpu": summary(
+                gpu_config=[api_pb2.GPUConfig(gpu_type=gpu_type, count=2) for gpu_type in ["H100", *secondary_gpus]],
+                schedule=api_pb2.Schedule(cron=api_pb2.Schedule.Cron(cron_string="0 0 * * *", timezone="UTC")),
+                web_function=True,
+            ),
+            "fu-server": summary(requires_proxy_auth=authenticated, is_sessioned=True),
+        },
+    )
+    with servicer.intercept() as ctx:
+        ctx.add_response("AppGetInfo", response)
+        result = run_cli_command(["app", "info", "ap-abcdefghABCDEFGH012345"])
+        assert len(ctx.get_requests("AppGetInfo")) == 1
+        assert len(ctx.get_requests("AppGetLifecycle")) == 1
+        assert not ctx.get_requests("FunctionGetById")
+    rendered = result.stdout
+    assert "CPU · Every 15 minutes" in rendered
+    alternatives = " (2 × A100 GPU, 2 × L4 GPU)" if secondary_gpus else ""
+    assert f"2 × H100 GPU{alternatives} · Web Function" in rendered
+    assert "0 0 * * * (UTC)" in rendered
+    assert "Every 15 minutes" in rendered
+    if authenticated:
+        assert "Unauthenticated" not in rendered
+        assert "CPU · Sessioned\n" in rendered
+    else:
+        assert "CPU · Sessioned · Unauthenticated" in rendered
+    assert rendered.count("Sessioned") == 1
+    assert " · Auth" not in rendered
+    assert "No auth" not in rendered
+    assert rendered.count("Web Function") == 1
+    assert "URL:" not in rendered
+    id_lines = [line for line in rendered.splitlines() if "fu-" in line]
+    assert len(id_lines) == 4
+    assert len({line.index("fu-") for line in id_lines}) == 1
+    assert "\n\n  alpha" in rendered
+    assert rendered.index("Stopped:") < rendered.index("Functions (3):") < rendered.index("Servers (1):")
+    assert rendered.index("MyClass.*") < rendered.index("alpha") < rendered.index("z_missing")
+    assert "fu-missing" in rendered
+    assert "\x1b[" not in rendered
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("AppGetInfo", response)
+        result = run_cli_command(["app", "info", "ap-abcdefghABCDEFGH012345", "--json"])
+    data = json.loads(result.stdout)
+    assert "function_info_summaries" not in data
+    assert data["functions"]["MyClass.*"]["id"] == "fu-gpu"
+    assert data["functions"]["MyClass.*"]["summary"]["gpu_config"] == [
+        {"gpu_type": gpu_type, "count": 2} for gpu_type in ["H100", *secondary_gpus]
+    ]
+    assert data["functions"]["MyClass.*"]["summary"]["web_function"] is True
+    assert data["functions"]["z_missing"] == {"id": "fu-missing", "summary": {}}
+    server = data["servers"]["LongNamedFileServer"]
+    assert server["id"] == "fu-server"
+    assert not server["summary"].get("web_function", False)
+    assert server["summary"]["authenticated"] is authenticated
+    assert server["summary"]["is_sessioned"] is True
+    assert "is_sessioned" not in data["functions"]["alpha"]["summary"]
+    assert "authenticated" not in data["functions"]["alpha"]["summary"]
+
+
+def test_app_info_with_servers(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": app_file_with_function}):
+        run_cli_command(["deploy", "myapp.py", "--name", "my_app_foo"])
+
+    app_id = servicer.deployed_apps.get(("main", "my_app_foo"))
+    # The mock servicer can't classify servers from a definition, so say so directly.
+    servicer.app_servers[app_id] = {"square": "fu-1"}
+
+    res = run_cli_command(["app", "info", "my_app_foo"])
+    assert "Servers" in res.stdout
+    assert "square" in res.stdout
+    assert "Functions" not in res.stdout  # omitted when every Function is a server
+
+    res = run_cli_command(["app", "info", "my_app_foo", "--json"])
+    data = json.loads(res.stdout)
+    assert data["functions"] == {}
+    assert data["servers"] == {"square": {"id": "fu-1", "summary": {}}}
+
+
+def test_app_rollback(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        # Deploy multiple times
+        for _ in range(4):
+            run_cli_command(["deploy", "myapp.py", "--name", "my_app"])
+    run_cli_command(["app", "rollback", "my_app"])
+    app_id = servicer.deployed_apps.get(("main", "my_app"))
+    assert servicer.app_deployment_history[app_id][-1]["rollback_version"] == 3
+
+    run_cli_command(["app", "rollback", "my_app", "v2"])
+    app_id = servicer.deployed_apps.get(("main", "my_app"))
+    assert servicer.app_deployment_history[app_id][-1]["rollback_version"] == 2
+
+    run_cli_command(["app", "rollback", "my_app", "2"], expected_exit_code=2)
+
+
+def _record_future_deployment(servicer, app_id: str, version: int) -> None:
+    """Add a deployment to an App's history that is newer than the currently deployed version."""
+    latest = servicer.app_deployment_history[app_id][-1]
+    servicer.app_deployment_history[app_id].append({**latest, "version": version, "tag": f"deploy{version}"})
+
+
+def test_app_rollback_relative_to_live_version(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        for _ in range(3):
+            run_cli_command(["deploy", "myapp.py", "--name", "my_app"])
+    app_id = servicer.deployed_apps[("main", "my_app")]
+    _record_future_deployment(servicer, app_id, version=5)
+
+    # Relative versions resolve against the live version (v3), not the newest staged row (v5),
+    # but the new deployment still lands above everything in history.
+    run_cli_command(["app", "rollback", "my_app"])
+    assert servicer.app_deployment_history[app_id][-1]["rollback_version"] == 2
+    assert servicer.app_deployment_history[app_id][-1]["version"] == 6
+
+
+@pytest.mark.parametrize("version", ["v5", "5"])
+def test_app_promote(servicer, mock_dir, set_env_client, version):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        run_cli_command(["deploy", "myapp.py", "--name", "my_app"])
+    app_id = servicer.deployed_apps[("main", "my_app")]
+    _record_future_deployment(servicer, app_id, version=5)
+
+    with servicer.intercept() as ctx:
+        res = run_cli_command(["app", "promote", "my_app", version])
+
+    (request,) = ctx.get_requests("AppPromote")
+    assert request.app_id == app_id
+    assert request.version == 5
+
+    assert "Promoted App to v5" in res.stdout
+    assert "http://test.modal.com/foo/bar" in res.stdout
+
+    # The promotion is recorded as a new deployment above every version in history
+    assert servicer.app_deployment_history[app_id][-1]["version"] == 6
+    assert servicer.app_deployment_history[app_id][-1]["rollback_version"] == 5
+
+
+@pytest.mark.parametrize("version", ["v0", "0", "v", "latest", "-1", "v5.1", "5x"])
+def test_app_promote_invalid_version(servicer, mock_dir, set_env_client, version):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        run_cli_command(["deploy", "myapp.py", "--name", "my_app"])
+
+    with servicer.intercept() as ctx:
+        run_cli_command(["app", "promote", "my_app", version], expected_exit_code=2)
+
+    # Version specifiers are validated before we hit the server
+    assert not ctx.get_requests("AppPromote")
+
+
+def test_app_promote_requires_version(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        run_cli_command(["deploy", "myapp.py", "--name", "my_app"])
+
+    run_cli_command(["app", "promote", "my_app"], expected_exit_code=2)
+
+
+def test_app_promote_not_deployed(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        run_cli_command(["deploy", "myapp.py", "--name", "my_app"])
+    app_id = servicer.deployed_apps[("main", "my_app")]
+    _record_future_deployment(servicer, app_id, version=5)
+    servicer.app_state_history[app_id].append(api_pb2.APP_STATE_STOPPED)
+
+    with servicer.intercept() as ctx:
+        run_cli_command(
+            ["app", "promote", "my_app", "v5"], expected_exit_code=1, expected_error="App .* is not deployed"
+        )
+
+    assert not ctx.get_requests("AppPromote")
+
+
+def test_app_promote_version_not_newer(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        for _ in range(2):
+            run_cli_command(["deploy", "myapp.py", "--name", "my_app"])
+
+    # v1 and v2 exist in the App history, but the App already serves v2
+    for version in ["v1", "v2"]:
+        run_cli_command(
+            ["app", "promote", "my_app", version],
+            expected_exit_code=1,
+            expected_error="must be newer than the current App version",
+        )
+
+
+def test_app_promote_version_not_in_history(servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        run_cli_command(["deploy", "myapp.py", "--name", "my_app"])
+
+    run_cli_command(
+        ["app", "promote", "my_app", "v100"],
+        expected_exit_code=1,
+        expected_error="not found in App history",
+    )
+
+
+def test_dict_create_list_delete(servicer, server_url_env, set_env_client):
+    run_cli_command(["dict", "create", "foo-dict"])
+    run_cli_command(["dict", "create", "bar-dict"])
+    windows_sleep()
+    res = run_cli_command(["dict", "list"])
+    assert "foo-dict" in res.stdout
+    assert "bar-dict" in res.stdout
+
+    run_cli_command(["dict", "delete", "bar-dict", "--yes"])
+    res = run_cli_command(["dict", "list"])
+    assert "foo-dict" in res.stdout
+    assert "bar-dict" not in res.stdout
+
+
+def test_dict_show_get_clear(servicer, server_url_env, set_env_client):
+    # Kind of hacky to be modifying the attributes on the servicer like this
+    key = ("baz-dict", os.environ.get("MODAL_ENVIRONMENT", "main"))
+    dict_id = "di-abc123"
+    servicer.deployed_dicts[key] = dict_id
+    servicer.dicts[dict_id] = {
+        dumps("a", protocol=PICKLE_PROTOCOL): dumps(123, protocol=PICKLE_PROTOCOL),
+        dumps("b", protocol=PICKLE_PROTOCOL): dumps("blah", protocol=PICKLE_PROTOCOL),
+    }
+
+    res = run_cli_command(["dict", "items", "baz-dict"])
+    assert re.search(r" Key .+ Value", res.stdout)
+    assert re.search(r" a .+ 123 ", res.stdout)
+    assert re.search(r" b .+ blah ", res.stdout)
+
+    res = run_cli_command(["dict", "items", "baz-dict", "1"])
+    assert re.search(r"\.\.\. .+ \.\.\.", res.stdout)
+    assert "blah" not in res.stdout
+
+    res = run_cli_command(["dict", "items", "baz-dict", "2"])
+    assert "..." not in res.stdout
+
+    res = run_cli_command(["dict", "items", "baz-dict", "--json"])
+    assert '"key": "a"' in res.stdout
+    assert '"value": 123' in res.stdout
+    assert "..." not in res.stdout
+
+    assert run_cli_command(["dict", "get", "baz-dict", "a"]).stdout == "123\n"
+    assert run_cli_command(["dict", "get", "baz-dict", "b"]).stdout == "blah\n"
+
+    res = run_cli_command(["dict", "clear", "baz-dict", "--yes"])
+    assert servicer.dicts[dict_id] == {}
+
+
+def test_queue_create_list_delete(servicer, server_url_env, set_env_client):
+    run_cli_command(["queue", "create", "foo-queue"])
+    run_cli_command(["queue", "create", "bar-queue"])
+    windows_sleep()
+    res = run_cli_command(["queue", "list"])
+    assert "foo-queue" in res.stdout
+    assert "bar-queue" in res.stdout
+
+    res = run_cli_command(["queue", "list", "--json"])
+    for entry in json.loads(res.stdout):
+        assert entry["partitions"] == 0
+        assert entry["total_size"] == 0
+        assert entry["total_size_truncated"] is False
+
+    run_cli_command(["queue", "delete", "bar-queue", "--yes"])
+
+    res = run_cli_command(["queue", "list"])
+    assert "foo-queue" in res.stdout
+    assert "bar-queue" not in res.stdout
+
+
+@pytest.mark.parametrize(
+    ("num_items", "expected_table_size", "expected_json_size", "expected_truncated"),
+    [
+        (99_999, "99999", 99_999, False),
+        (100_000, ">=100000", 100_000, True),
+        (150_000, ">=100000", 100_000, True),
+    ],
+)
+def test_queue_list_total_size_limit(
+    servicer, server_url_env, set_env_client, num_items, expected_table_size, expected_json_size, expected_truncated
+):
+    run_cli_command(["queue", "create", "big-queue"])
+    windows_sleep()
+    servicer.queue = {b"": [b"x"] * num_items}
+
+    res = run_cli_command(["queue", "list"])
+    assert expected_table_size in res.stdout
+
+    res = run_cli_command(["queue", "list", "--json"])
+    (entry,) = json.loads(res.stdout)
+    assert entry["partitions"] == 1
+    assert entry["total_size"] == expected_json_size
+    assert entry["total_size_truncated"] is expected_truncated
+
+
+def test_queue_peek_len_clear(servicer, server_url_env, set_env_client):
+    # Kind of hacky to be modifying the attributes on the servicer like this
+    name = "queue-who"
+    key = (name, os.environ.get("MODAL_ENVIRONMENT", "main"))
+    queue_id = "qu-abc123"
+    servicer.deployed_queues[key] = queue_id
+    servicer.queue = {b"": [dumps("a"), dumps("b"), dumps("c")], b"alt": [dumps("x"), dumps("y")]}
+
+    assert run_cli_command(["queue", "peek", name]).stdout == "a\n"
+    assert run_cli_command(["queue", "peek", name, "-p", "alt"]).stdout == "x\n"
+    assert run_cli_command(["queue", "peek", name, "3"]).stdout == "a\nb\nc\n"
+    assert run_cli_command(["queue", "peek", name, "3", "--partition", "alt"]).stdout == "x\ny\n"
+
+    assert run_cli_command(["queue", "len", name]).stdout == "3\n"
+    assert run_cli_command(["queue", "len", name, "--partition", "alt"]).stdout == "2\n"
+    assert run_cli_command(["queue", "len", name, "--total"]).stdout == "5\n"
+
+    run_cli_command(["queue", "clear", name, "--yes"])
+    assert run_cli_command(["queue", "len", name]).stdout == "0\n"
+    assert run_cli_command(["queue", "peek", name, "--partition", "alt"]).stdout == "x\n"
+
+    run_cli_command(["queue", "clear", name, "--all", "--yes"])
+    assert run_cli_command(["queue", "len", name, "--total"]).stdout == "0\n"
+    assert run_cli_command(["queue", "peek", name, "--partition", "alt"]).stdout == ""
+
+
+@pytest.mark.parametrize("name", [".main", "_main", "'-main'", "main/main", "main:main", "main_-123.", "main.dev"])
+def test_create_environment_name_invalid(servicer, set_env_client, name):
+    assert isinstance(
+        run_cli_command(
+            ["environment", "create", name],
+            1,
+        ).exception,
+        InvalidError,
+    )
+
+
+@pytest.mark.parametrize("name", ["main", "main_-123", "m"])
+def test_create_environment_name_valid(servicer, set_env_client, name):
+    assert (
+        "Environment created"
+        in run_cli_command(
+            ["environment", "create", name],
+            0,
+        ).stdout
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_role_str"),
+    [
+        (["--restricted"], None),
+        (["--restricted", "--default-role", "contributor"], "contributor"),
+        (["--restricted", "--default-role", "viewer"], "viewer"),
+        (["--restricted", "--default-role", "no-access"], "no-access"),
+        (["--restricted", "--default-role", "custom-role"], "custom-role"),
+    ],
+)
+def test_create_restricted_environment_default_role(servicer, set_env_client, args, expected_role_str):
+    with servicer.intercept() as ctx:
+        assert (
+            "Restricted Environment created"
+            in run_cli_command(
+                ["environment", "create", "restricted-env", *args],
+                0,
+            ).stdout
+        )
+        (req,) = ctx.get_requests("EnvironmentCreate")
+        assert req.default_member_role_str == (expected_role_str or "")
+        assert not req.HasField("default_member_role")
+
+
+def test_create_environment_default_role_requires_restricted(servicer, set_env_client):
+    with servicer.intercept() as ctx:
+        result = run_cli_command(
+            ["environment", "create", "new-env", "--default-role", "viewer"],
+            1,
+            expected_error="Default member role can only be set for a Restricted environment.",
+        )
+    assert isinstance(result.exception, InvalidError)
+    (request,) = ctx.get_requests("EnvironmentCreate")
+    assert request.default_member_role_str == "viewer"
+    assert not request.is_managed
+    assert "new-env" not in servicer.environments
+
+
+def test_create_public_environment(servicer, set_env_client):
+    with servicer.intercept() as ctx:
+        assert (
+            "Public Environment created"
+            in run_cli_command(
+                ["environment", "create", "public-env", "--public"],
+                0,
+            ).stdout
+        )
+        (req,) = ctx.get_requests("EnvironmentCreate")
+        assert req.name == "public-env"
+        assert req.environment_type == api_pb2.ENVIRONMENT_TYPE_PUBLIC
+
+
+@pytest.mark.parametrize(("name", "set_name"), (("main", "main/main"), ("main", "'-main'"), ("main", "main.dev")))
+def test_update_environment_name_invalid(servicer, set_env_client, name, set_name):
+    assert isinstance(
+        run_cli_command(
+            ["environment", "update", name, "--set-name", set_name],
+            1,
+        ).exception,
+        InvalidError,
+    )
+
+
+@pytest.mark.parametrize(("name", "set_name"), (("main", "main_-123"), ("main:main", "main2"), ("old.env", "old.env")))
+def test_update_environment_name_valid(servicer, set_env_client, name, set_name):
+    assert (
+        "Environment updated"
+        in run_cli_command(
+            ["environment", "update", name, "--set-name", set_name],
+            0,
+        ).stdout
+    )
+
+
+def test_environment_list(servicer, set_env_client):
+    run_cli_command(["environment", "create", "main"])
+    run_cli_command(["environment", "create", "dev"])
+    res = run_cli_command(["environment", "list", "--json"])
+    assert "main" in res.stdout
+    assert "dev" in res.stdout
+    json_data = json.loads(res.stdout)
+    assert json_data[0]["name"] == "main"
+    assert json_data[0]["active"] == "True"
+    assert json_data[1]["name"] == "dev"
+    assert json_data[1]["active"] == "False"
+
+
+def test_call_update_environment_suffix(servicer, set_env_client):
+    run_cli_command(["environment", "update", "main", "--set-web-suffix", "_"])
+
+
+@pytest.mark.parametrize("version", ["2025.06", ""])
+def test_update_environment_image_builder_version(servicer, set_env_client, version):
+    with servicer.intercept() as ctx:
+        run_cli_command(["environment", "update", "main", "--set-image-builder-version", version])
+    (req,) = ctx.get_requests("EnvironmentUpdate")
+    assert req.HasField("image_builder_version")
+    assert req.image_builder_version == version
+    assert not req.HasField("name")
+    assert not req.HasField("web_suffix")
+
+
+def test_update_environment_requires_property(servicer, set_env_client):
+    run_cli_command(["environment", "update", "main"], 2, expected_stderr="--set-image-builder-version")
+
+
+def test_environment_list_image_builder_version(servicer, set_env_client):
+    run_cli_command(["environment", "create", "dev"])
+    run_cli_command(["environment", "update", "dev", "--set-image-builder-version", "2025.06"])
+    rows = {row["name"]: row for row in json.loads(run_cli_command(["environment", "list", "--json"]).stdout)}
+    assert rows["main"]["image_builder_version"] is None
+    assert rows["dev"]["image_builder_version"] == "2025.06"
+
+    run_cli_command(["environment", "update", "dev", "--set-image-builder-version", ""])
+    rows = {row["name"]: row for row in json.loads(run_cli_command(["environment", "list", "--json"]).stdout)}
+    assert rows["dev"]["image_builder_version"] is None
+
+
+def test_environment_roles_list_cli(servicer, set_env_client):
+    roles = json.loads(run_cli_command(["environment", "roles", "list", "main", "--json"]).stdout)
+    assert roles["users"]["alice"] == "contributor"
+    assert roles["service_users"]["ops-bot"] == "contributor"
+    # Non-JSON output renders the roles in a table, tagging service users.
+    table = run_cli_command(["environment", "roles", "list", "main"]).stdout
+    assert "alice" in table
+    assert "ops-bot (service user)" in table
+
+
+def test_environment_roles_list_cli_excludes_default(servicer, set_env_client):
+    response = api_pb2.EnvironmentGetRolesResponse(
+        principal_roles=[
+            api_pb2.EnvironmentGetRolesResponse.Principal(
+                user_id="us-alice",
+                user_name="alice",
+                role=api_pb2.ENVIRONMENT_ROLE_VIEWER,
+                role_str="viewer",
+                has_role_assignment=False,
+            ),
+            api_pb2.EnvironmentGetRolesResponse.Principal(
+                user_id="us-bob",
+                user_name="bob",
+                role=api_pb2.ENVIRONMENT_ROLE_VIEWER,
+                role_str="viewer",
+                has_role_assignment=True,
+            ),
+            api_pb2.EnvironmentGetRolesResponse.Principal(
+                service_user_id="sv-bot",
+                service_user_name="implicit-bot",
+                role=api_pb2.ENVIRONMENT_ROLE_NO_ACCESS,
+                role_str="no-access",
+                has_role_assignment=False,
+            ),
+            api_pb2.EnvironmentGetRolesResponse.Principal(
+                service_user_id="sv-assigned-bot",
+                service_user_name="assigned-bot",
+                role=api_pb2.ENVIRONMENT_ROLE_NO_ACCESS,
+                role_str="no-access",
+                has_role_assignment=True,
+            ),
+        ],
+    )
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("EnvironmentGetRoles", response)
+        ctx.add_response("EnvironmentGetRoles", response)
+        table = run_cli_command(["environment", "roles", "list", "main", "--exclude-default"]).stdout
+        roles = json.loads(
+            run_cli_command(["environment", "roles", "list", "main", "--exclude-default", "--json"]).stdout
+        )
+
+    assert "alice" not in table
+    assert "bob" in table
+    assert "implicit-bot (service user)" not in table
+    assert "assigned-bot (service user)" in table
+    assert roles == {"users": {"bob": "viewer"}, "service_users": {"assigned-bot": "no-access"}}
+
+    help_output = run_cli_command(["environment", "roles", "list", "--help"]).stdout
+    help_text = " ".join(help_output.split())
+    assert help_output.index("--exclude-default") < help_output.index("--json")
+    assert "Only list roles that are directly assigned" in help_text
+
+
+def test_environment_roles_update_cli(servicer, set_env_client):
+    run_cli_command(["environment", "roles", "update", "main", "alice", "--role", "no-access"])
+    run_cli_command(["environment", "roles", "update", "main", "ops-bot", "--role", "viewer", "--service-user"])
+    roles = json.loads(run_cli_command(["environment", "roles", "list", "main", "--json"]).stdout)
+    assert roles["users"]["alice"] == "no-access"
+    assert roles["service_users"]["ops-bot"] == "viewer"
+
+
+def test_environment_members_cli_deprecated(servicer, set_env_client):
+    # `members` is a deprecated alias for `roles`: it warns but still behaves identically.
+    with pytest.warns(DeprecationError, match="deprecated"):
+        run_cli_command(["environment", "members", "update", "main", "bob", "--role", "viewer"])
+    with pytest.warns(DeprecationError, match="deprecated"):
+        res = run_cli_command(["environment", "members", "list", "main", "--json"])
+    roles = json.loads(res.stdout)
+    assert roles["users"]["bob"] == "viewer"
+
+
+def _run_subprocess(cli_cmd: list[str]) -> helpers.PopenWithCtrlC:
+    p = helpers.PopenWithCtrlC(
+        [sys.executable, "-m", "modal"] + cli_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf8"
+    )
+    return p
+
+
+@pytest.mark.timeout(10)
+@skip_windows("console_ctrl.send_ctrl_c is unreliable on Windows CI.")
+def test_keyboard_interrupt_during_app_load(servicer, server_url_env, token_env, supports_dir):
+    ctx: InterceptionContext
+    creating_function = threading.Event()
+
+    async def stalling_function_create(servicer, req):
+        creating_function.set()
+        await asyncio.sleep(10)
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("FunctionCreate", stalling_function_create)
+
+        p = _run_subprocess(["run", f"{supports_dir / 'hello.py'}::hello"])
+        creating_function.wait()
+        p.send_ctrl_c()
+        out, err = p.communicate(timeout=5)
+        print(out)
+        assert "Traceback" not in err
+        assert "Aborting app initialization..." in out
+
+
+@pytest.mark.timeout(10)
+@skip_windows("console_ctrl.send_ctrl_c is unreliable on Windows CI.")
+def test_keyboard_interrupt_during_app_run(servicer, server_url_env, token_env, supports_dir):
+    ctx: InterceptionContext
+    waiting_for_output = threading.Event()
+
+    async def stalling_function_get_output(servicer, req):
+        waiting_for_output.set()
+        await asyncio.sleep(10)
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("FunctionGetOutputs", stalling_function_get_output)
+
+        p = _run_subprocess(["run", f"{supports_dir / 'hello.py'}::hello"])
+        waiting_for_output.wait()
+        p.send_ctrl_c()
+        out, err = p.communicate(timeout=5)
+        assert "App aborted. View run at https://modaltest.com/apps/ap-123" in out
+        assert "Traceback" not in err
+
+
+@pytest.mark.timeout(30)
+@skip_windows("console_ctrl.send_ctrl_c is unreliable on Windows CI.")
+def test_keyboard_interrupt_during_app_run_detach(servicer, server_url_env, token_env, supports_dir):
+    ctx: InterceptionContext
+    waiting_for_output = threading.Event()
+
+    async def stalling_function_get_output(servicer, req):
+        waiting_for_output.set()
+        await asyncio.sleep(10)
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("FunctionGetOutputs", stalling_function_get_output)
+
+        p = _run_subprocess(["run", "--detach", f"{supports_dir / 'hello.py'}::hello"])
+        waiting_for_output.wait()
+        p.send_ctrl_c()
+        out, err = p.communicate(timeout=5)
+        print(out)
+        assert "Shutting down Modal client." in out
+        assert "track its progress" in out
+        assert "modal app stop" in out
+        assert "modal app logs" in out
+        assert "Traceback" not in err
+
+
+def test_container_stop(servicer, set_env_client):
+    running_task_info = api_pb2.TaskGetInfoResponse(
+        app_id="ap-123", info=api_pb2.TaskInfo(id="ta-123", started_at=1700000000.0)
+    )
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("TaskGetInfo", running_task_info)
+        ctx.add_response("TaskGetInfo", running_task_info)
+        run_cli_command(["container", "stop", "ta-123", "--yes"])
+        run_cli_command(["container", "stop", "ta-123", "--graceful", "--yes"])
+
+    first_request, second_request = ctx.get_requests("ContainerStop")
+    assert first_request.task_id == "ta-123"
+    assert not first_request.graceful
+    assert second_request.task_id == "ta-123"
+    assert second_request.graceful
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_container_exec(servicer, set_env_client):
+    # Test non-PTY path: runs the command and waits for exit
+    with servicer.task_command_router.intercept() as tcr_ctx:
+        run_cli_command(["container", "exec", "--no-pty", "ta-123", "echo", "Hello World"])
+
+    (req,) = tcr_ctx.get_requests("TaskExecStart")
+    assert list(req.command_args) == ["echo", "Hello World"]
+    assert req.task_id == "ta-123"
+    assert not req.HasField("pty_info")
+
+
+@skip_windows("modal shell is not supported on Windows.")
+def test_container_exec_with_pty(servicer, set_env_client, mock_shell_pty):
+    """Verify that --pty passes PTY info and attach works for a quick command."""
+    fake_stdin, captured_out = mock_shell_pty
+    fake_stdin.clear()
+    fake_stdin.extend([b"exit\n"])
+
+    # Use a command that produces output immediately so on_connect is set quickly
+    with servicer.task_command_router.intercept() as tcr_ctx:
+        run_cli_command(["container", "exec", "--pty", "ta-123", "echo", "Hello World"])
+
+    (req,) = tcr_ctx.get_requests("TaskExecStart")
+    assert list(req.command_args) == ["echo", "Hello World"]
+    assert req.task_id == "ta-123"
+    assert req.pty_info.enabled is True
+    # Verify output was captured through the attach path
+    output_data = b"".join(data for _, data in captured_out)
+    assert b"Hello World" in output_data
+
+
+def test_can_run_all_listed_functions_with_includes(supports_on_path, monkeypatch, set_env_client):
+    monkeypatch.setenv("TERM", "dumb")  # prevents looking at ansi escape sequences
+
+    res = run_cli_command(["run", "-m", "multifile_project.main"], expected_exit_code=1)
+    print("err", res.stderr)
+    # there are no runnables directly in the target module, so references need to go via the app
+    func_listing = res.stderr.split("has the following options:\n")[1].split("\n\n")[0]
+
+    listed_runnables = set(re.findall(r"\b[\w.]+\b", func_listing))
+
+    expected_runnables = {
+        "app.a_func",
+        "app.b_func",
+        "app.c_func",
+        "app.main_function",
+        "main_function",
+        "Cls.method_on_other_app_class",
+        "other_app.Cls.method_on_other_app_class",
+    }
+    assert listed_runnables == expected_runnables
+
+    for runnable in expected_runnables:
+        assert runnable in res.stderr
+        run_cli_command(["run", "-m", f"multifile_project.main::{runnable}"], expected_exit_code=0)
+
+
+def test_run_file_with_global_lookups(servicer, set_env_client, supports_dir):
+    # having module-global Function/Cls objects from .from_name constructors shouldn't
+    # cause issues, and they shouldn't be runnable via CLI (for now)
+    with servicer.intercept() as ctx:
+        run_cli_command(["run", str(supports_dir / "app_run_tests" / "file_with_global_lookups.py")])
+
+    (req,) = ctx.get_requests("FunctionCreate")
+    assert req.function.function_name == "local_f"
+    assert len(ctx.get_requests("FunctionMap")) == 1
+    assert len(ctx.get_requests("FunctionGet")) == 0
+
+
+def test_run_auto_infer_prefer_target_module(servicer, supports_dir, set_env_client, monkeypatch):
+    monkeypatch.syspath_prepend(supports_dir / "app_run_tests")
+    res = run_cli_command(["run", "-m", "multifile.util"])
+    assert "ran util\nmain func" in res.stdout
+
+
+@pytest.mark.parametrize("func", ["va_entrypoint", "va_function", "VaClass.va_method"])
+def test_cli_run_variadic_args(servicer, set_env_client, test_dir, func):
+    app_file = test_dir / "supports" / "app_run_tests" / "variadic_args.py"
+
+    @servicer.function_body
+    def print_args(*args):
+        print(f"args: {args}")
+
+    res = run_cli_command(["run", f"{app_file.as_posix()}::{func}"])
+    assert "args: ()" in res.stdout
+
+    res = run_cli_command(["run", f"{app_file.as_posix()}::{func}", "abc", "--foo=123", "--bar=456"])
+    assert "args: ('abc', '--foo=123', '--bar=456')" in res.stdout
+
+    run_cli_command(["run", f"{app_file.as_posix()}::{func}_invalid", "--foo=123"], expected_exit_code=1)
+
+
+def test_server_warnings(servicer, set_env_client, supports_dir):
+    res = run_cli_command(["run", f"{supports_dir / 'app_run_tests' / 'uses_experimental_options.py'}::gets_warning"])
+    assert "You have been warned!" in res.stdout
+
+
+def test_run_with_options(servicer, set_env_client, supports_dir):
+    app_file = supports_dir / "app_run_tests" / "uses_with_options.py"
+    run_cli_command(["run", f"{app_file.as_posix()}::C_with_gpu.f"])
+
+
+def test_dashboard_workspace_url(servicer, set_env_client, mock_webbrowser):
+    """Test that modal dashboard (without object ID) calls WorkspaceDashboardUrlGet RPC."""
+    mock_browser = mock_webbrowser()
+
+    # Run the dashboard command without an object ID
+    result = run_cli_command(["dashboard"])
+
+    # Check that the output contains the URL returned by the mock servicer
+    assert "https://modal.com/apps/main" in result.stdout
+    assert "Opening dashboard in your web browser" in result.stdout
+
+    # Verify that the browser was opened
+    assert mock_browser.open_new_tab.call_count == 1
+    assert mock_browser.open_new_tab.call_args[0][0] == "https://modal.com/apps/main"
+
+
+def test_dashboard_object_id(servicer, set_env_client, mock_webbrowser):
+    """Test that modal dashboard with object ID constructs URL directly."""
+    mock_browser = mock_webbrowser()
+
+    # Run the dashboard command with an object ID
+    result = run_cli_command(["dashboard", "fu-abc123"])
+
+    # Check that the output contains the constructed URL
+    assert "https://modal.com/id/fu-abc123" in result.stdout
+    assert "Opening dashboard in your web browser" in result.stdout
+
+    # Verify that the browser was opened
+    assert mock_browser.open_new_tab.call_count == 1
+    assert mock_browser.open_new_tab.call_args[0][0] == "https://modal.com/id/fu-abc123"
+
+
+def test_dashboard_browser_fails(servicer, set_env_client, mock_webbrowser):
+    """Test that modal dashboard handles browser open failure gracefully."""
+    mock_webbrowser(success=False)
+
+    # Run the dashboard command
+    result = run_cli_command(["dashboard", "ap-xyz789"])
+
+    # Check that the failure message is displayed
+    assert "Could not open web browser automatically" in result.stdout
+    assert "Please open this URL in your browser" in result.stdout
+    assert "https://modal.com/id/ap-xyz789" in result.stdout
+
+
+def test_billing_report(servicer, set_env_client):
+    # Test default table output with daily resolution
+    res = run_cli_command(["billing", "report", "--start", "2025-01-01"])
+    assert "ap-123" in res.stdout
+    assert "app1" in res.stdout
+    assert "test" in res.stdout
+    assert "100.123456" in res.stdout
+    # Daily resolution should show date only (YYYY-MM-DD)
+    assert "2025-01-01" in res.stdout
+    # Should NOT include time component in table for daily resolution
+    assert "2025-01-01T00:00:00" not in res.stdout
+
+    # Test hourly resolution - should include time without seconds
+    res = run_cli_command(["billing", "report", "--start", "2025-01-01", "-r", "h"])
+    assert "2025-01-01T00:00" in res.stdout
+    # Should NOT include seconds in table for hourly resolution
+    assert "2025-01-01T00:00:00" not in res.stdout
+
+    # Test JSON output - should include full ISO format
+    res = run_cli_command(["billing", "report", "--start", "2025-01-01", "--json"])
+    json_data = json.loads(res.stdout)
+    assert len(json_data) == 2
+    assert json_data[0]["object_id"] == "ap-123"
+    assert json_data[0]["description"] == "app1"
+    assert json_data[0]["environment"] == "main"
+    assert json_data[0]["cost"] == "100.123456"
+    # JSON output should have full ISO format
+    assert "2025-01-01T00:00:00" in json_data[0]["interval_start"]
+
+    # Test CSV output
+    res = run_cli_command(["billing", "report", "--start", "2025-01-01", "--csv"])
+    assert "Object ID,Description,Environment,Interval Start,Cost" in res.stdout
+    assert "ap-123,app1,test," in res.stdout
+    # CSV output should have full ISO format
+    assert "2025-01-01T00:00:00" in res.stdout
+
+    # Test with tag names
+    res = run_cli_command(["billing", "report", "--start", "2025-01-01", "--tag-names", "team,project"])
+    assert "ap-123" in res.stdout
+    # Tags column should be present (may be JSON formatted)
+    assert "team" in res.stdout or "eng" in res.stdout
+
+    # Test --show-resources
+    res = run_cli_command(["billing", "report", "--start", "2025-01-01", "--show-resources"])
+    assert "ap-123" in res.stdout
+    assert "CPU" in res.stdout
+    assert "Memory" in res.stdout
+
+    # Test mutually exclusive output options
+    res = run_cli_command(
+        ["billing", "report", "--start", "2025-01-01", "--json", "--csv"],
+        expected_exit_code=2,
+        expected_stderr="mutually exclusive",
+    )
+
+    # Test invalid resolution
+    res = run_cli_command(
+        ["billing", "report", "--start", "2025-01-01", "-r", "x"],
+        expected_exit_code=2,
+        expected_stderr="Resolution must be",
+    )
+
+    # Test relative date parsing
+    res = run_cli_command(["billing", "report", "--start", "yesterday"])
+    assert "ap-123" in res.stdout
+
+    res = run_cli_command(["billing", "report", "--start", "7 days ago"])
+    assert "ap-123" in res.stdout
+
+    res = run_cli_command(["billing", "report", "--start", "2 weeks ago"])
+    assert "ap-123" in res.stdout
+
+    res = run_cli_command(["billing", "report", "--start", "1 month ago"])
+    assert "ap-123" in res.stdout
+
+    # Test --for convenience option
+    res = run_cli_command(["billing", "report", "--for", "today"])
+    assert "ap-123" in res.stdout
+
+    res = run_cli_command(["billing", "report", "--for", "last week"])
+    assert "ap-123" in res.stdout
+
+    # Test --for with --start is mutually exclusive
+    res = run_cli_command(
+        ["billing", "report", "--for", "today", "--start", "2025-01-01"],
+        expected_exit_code=2,
+        expected_stderr="mutually exclusive",
+    )
+
+    # Test --for with --end is mutually exclusive
+    res = run_cli_command(
+        ["billing", "report", "--for", "today", "--end", "2025-01-01"],
+        expected_exit_code=2,
+        expected_stderr="mutually exclusive",
+    )
+
+    # Test invalid --for value
+    res = run_cli_command(
+        ["billing", "report", "--for", "next year"],
+        expected_exit_code=2,
+        expected_stderr="Unrecognized range",
+    )
+
+    # Test invalid date format
+    res = run_cli_command(
+        ["billing", "report", "--start", "not-a-date"],
+        expected_exit_code=2,
+        expected_stderr="Invalid date format",
+    )
+
+    # Test --tz with daily resolution is rejected (default resolution is daily)
+    res = run_cli_command(
+        ["billing", "report", "--start", "2025-01-01", "--tz", "America/New_York"],
+        expected_exit_code=2,
+        expected_stderr="requires hourly resolution",
+    )
+
+    # Test --tz with explicit daily resolution is also rejected
+    res = run_cli_command(
+        ["billing", "report", "--start", "2025-01-01", "-r", "d", "--tz", "5"],
+        expected_exit_code=2,
+        expected_stderr="requires hourly resolution",
+    )
+
+    # Test --tz with IANA timezone and hourly resolution
+    res = run_cli_command(["billing", "report", "--start", "2025-01-01", "-r", "h", "--tz", "America/New_York"])
+    assert "ap-123" in res.stdout
+    # UTC midnight (2025-01-01T00:00) should be displayed as 2024-12-31T19:00 in America/New_York (EST = UTC-5)
+    assert "2024-12-31T19:00" in res.stdout
+
+    # Test --tz local with --for and hourly resolution
+    res = run_cli_command(["billing", "report", "--for", "today", "-r", "h", "--tz", "local"])
+    assert "ap-123" in res.stdout
+
+    # Test --tz with integer offset and hourly resolution
+    res = run_cli_command(["billing", "report", "--for", "last month", "-r", "h", "--tz", "5"])
+    assert "ap-123" in res.stdout
+    # UTC midnight should be displayed as 05:00 with +5 offset
+    assert "2025-01-01T05:00" in res.stdout
+
+    # Test --tz with invalid timezone
+    res = run_cli_command(
+        ["billing", "report", "--start", "2025-01-01", "-r", "h", "--tz", "Not/A/Timezone"],
+        expected_exit_code=2,
+        expected_stderr="Unknown timezone",
+    )
+
+
+def test_billing_summary(servicer, set_env_client):
+    _ = run_cli_command(
+        ["billing", "summary", "--for", "2025-01-01"],
+        expected_exit_code=2,
+        expected_stderr="Unrecognized range:",
+    )
+
+    _ = run_cli_command(
+        ["billing", "summary", "--for", "2025-01-02"],
+        expected_exit_code=2,
+        expected_stderr="Unrecognized range:",
+    )
+
+    _ = run_cli_command(
+        ["billing", "summary", "--for", "1 month ago"],
+        expected_exit_code=2,
+        expected_stderr="Unrecognized range:",
+    )
+
+    _ = run_cli_command(
+        ["billing", "summary", "--for", "last week"],
+        expected_exit_code=2,
+        expected_stderr="Unrecognized range:",
+    )
+
+    res = run_cli_command(["billing", "summary"])
+    assert "Metered Cost" in res.stdout
+    assert "Free Storage" in res.stdout
+    assert "Network Egress Allowance" in res.stdout
+    assert "Reservation Adjustment" in res.stdout
+    assert "Billed Cost" in res.stdout
+    assert "Deployed Apps" in res.stdout
+    assert "Ephemeral Apps" in res.stdout
+    assert "Notebooks" in res.stdout
+    assert "Volumes" in res.stdout
+
+    res = run_cli_command(["billing", "summary", "--for", "2025-01"])
+    assert "Metered Cost" in res.stdout
+    assert "Free Storage" in res.stdout
+    assert "Network Egress Allowance" in res.stdout
+    assert "Reservation Adjustment" in res.stdout
+    assert "Billed Cost" in res.stdout
+    assert "Deployed Apps" in res.stdout
+    assert "Ephemeral Apps" in res.stdout
+    assert "Notebooks" in res.stdout
+    assert "Volumes" in res.stdout
+
+    res = run_cli_command(["billing", "summary", "--json"])
+    data = json.loads(res.stdout)
+    assert data["adjustments"]["network_egress_allowance"] == "-0.5"
+
+
+def test_environment_billing_summary(servicer, set_env_client):
+    _ = run_cli_command(
+        ["environment", "billing", "summary", "--for", "2025-01-01"],
+        expected_exit_code=2,
+        expected_stderr="Unrecognized range:",
+    )
+
+    _ = run_cli_command(
+        ["environment", "billing", "summary", "--for", "2025-01-02"],
+        expected_exit_code=2,
+        expected_stderr="Unrecognized range:",
+    )
+
+    _ = run_cli_command(
+        ["environment", "billing", "summary", "--for", "1 month ago"],
+        expected_exit_code=2,
+        expected_stderr="Unrecognized range:",
+    )
+
+    _ = run_cli_command(
+        ["environment", "billing", "summary", "--for", "last week"],
+        expected_exit_code=2,
+        expected_stderr="Unrecognized range:",
+    )
+
+    _ = run_cli_command(
+        ["environment", "billing", "summary", "does-not-exist"],
+        expected_exit_code=2,
+        expected_stderr="not found",
+    )
+
+    res = run_cli_command(["environment", "billing", "summary"])
+    assert "Metered Cost" in res.stdout
+    assert "Deployed Apps" in res.stdout
+    assert "Ephemeral Apps" in res.stdout
+    assert "Notebooks" in res.stdout
+    assert "Volumes" in res.stdout
+
+    res = run_cli_command(["environment", "billing", "summary", "--for", "2025-01"])
+    assert "Metered Cost" in res.stdout
+    assert "Deployed Apps" in res.stdout
+    assert "Ephemeral Apps" in res.stdout
+    assert "Notebooks" in res.stdout
+    assert "Volumes" in res.stdout
+
+
+def test_environment_billing_report(servicer, set_env_client):
+    # Test default table output with daily resolution
+    res = run_cli_command(["environment", "billing", "report", "--start", "2025-01-01"])
+
+    assert "ap-123" in res.stdout
+    assert "app1" in res.stdout
+    assert "main" in res.stdout
+    assert "100.123456" in res.stdout
+    # Daily resolution should show date only (YYYY-MM-DD)
+    assert "2025-01-01" in res.stdout
+    # Should NOT include time component in table for daily resolution
+    assert "2025-01-01T00:00:00" not in res.stdout
+
+    # Test with tag names
+    res = run_cli_command(
+        ["environment", "billing", "report", "main", "--start", "2025-01-01", "--tag-names", "team,project"]
+    )
+    assert "ap-123" in res.stdout
+    # Tags column should be present (may be JSON formatted)
+    assert "team" in res.stdout or "eng" in res.stdout
+
+    # test environment does not exist
+
+    res = run_cli_command(
+        ["environment", "billing", "report", "does-not-exist", "--start", "2025-01-01"], expected_exit_code=1
+    )
+    assert str(res.exception) == "Environment 'does-not-exist' not found"
+
+
+def test_billing_rates(servicer, set_env_client):
+    # check normal table output
+    _ = run_cli_command(["billing", "rates"])
+
+    # check keys in json
+    output = run_cli_command(["billing", "rates", "--json"])
+    json.loads(output.stdout)
+
+
+@pytest.mark.parametrize("cmd", ["rollover", "rollback"])
+def test_recreate_strategy(cmd, servicer, mock_dir, set_env_client, monkeypatch):
+    monkeypatch.setattr(modal.runner, "WAIT_FOR_CONTAINER_STOP_SLEEP_INTERVAL", 0.01)
+    task_list_calls = 0
+
+    async def task_list(servicer, stream):
+        nonlocal task_list_calls
+        await stream.recv_message()
+
+        if task_list_calls <= 1:
+            resp = api_pb2.TaskListResponse(
+                tasks=[
+                    api_pb2.TaskStats(task_id="ta-123", enqueued_at=123),
+                    api_pb2.TaskStats(task_id="ta-321", enqueued_at=321),
+                ]
+            )
+        elif task_list_calls == 2:
+            resp = api_pb2.TaskListResponse(tasks=[api_pb2.TaskStats(task_id="ta-123", enqueued_at=123)])
+        else:
+            resp = api_pb2.TaskListResponse(tasks=[])
+
+        task_list_calls += 1
+        await stream.send_message(resp)
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("TaskList", task_list)
+
+        with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+            # Deploy twice so that there is an earlier version for `rollback` to target
+            run_cli_command(["deploy", "myapp.py"])
+            run_cli_command(["deploy", "myapp.py"])
+
+        res = run_cli_command(["app", cmd, "my_app", "--strategy", "recreate"])
+        assert "View Deployment" in res.stdout
+        assert task_list_calls == 4
+
+    task_ids = set(servicer.container_stop_ids)
+    assert task_ids == {"ta-123", "ta-321"}
+
+
+@pytest.mark.parametrize("cmd", ["rollover", "rollback"])
+def test_rolling_strategy(cmd, servicer, mock_dir, set_env_client):
+    with mock_dir({"myapp.py": dummy_app_file, "other_module.py": dummy_other_module_file}):
+        # Deploy twice so that there is an earlier version for `rollback` to target
+        run_cli_command(["deploy", "myapp.py"])
+        run_cli_command(["deploy", "myapp.py"])
+
+    res = run_cli_command(["app", cmd, "my_app"])
+    assert "View Deployment" in res.stdout
+    assert not servicer.task_list_calls
+
+
+def test_short_help_fits_max_help_width():
+    import click
+    from rich.console import Console
+
+    from modal.cli._help import _HELP_PADDING, _MAX_HELP_WIDTH, build_command_table
+    from modal.cli.entry_point import entrypoint_cli
+
+    # Oversized scratch console so measurement isn't clipped by our own width.
+    console = Console(width=10_000)
+    offenders: list[str] = []
+    budget = _MAX_HELP_WIDTH - _HELP_PADDING * 2
+
+    def check(group: click.Group, path: str) -> None:
+        visible = [(name, sub) for name, sub in group.commands.items() if not sub.hidden]
+        if not visible:
+            return
+        name_width = max(len(name) for name, _ in visible)
+        for name, sub in visible:
+            full_path = f"{path} {name}" if path else name
+            # Use a generous limit so an explicit short_help longer than our
+            # budget isn't silently clipped before we measure it.
+            short = sub.get_short_help_str(limit=1000)
+            # Build a probe row using the same configuration --help would use
+            # and ask Rich how wide it wants to be.
+            probe = build_command_table(name_width)
+            probe.add_row(name, short)
+            required = console.measure(probe).maximum
+            if required > budget:
+                offenders.append(f"{full_path}: row needs {required} chars, max {budget}")
+            if isinstance(sub, click.Group):
+                check(sub, full_path)
+
+    check(entrypoint_cli, "modal")
+    assert not offenders, "short help would wrap in --help:\n" + "\n".join(offenders)
+
+
+def test_commands_with_required_arguments_show_help_with_no_args():
+    import click
+
+    from modal.cli.entry_point import entrypoint_cli
+
+    offenders: list[str] = []
+
+    def check(command: click.Command, path: str) -> None:
+        required_args = [param.name for param in command.params if isinstance(param, click.Argument) and param.required]
+        if required_args and getattr(command, "no_args_is_help", False) is not True:
+            offenders.append(f"{path}: required arguments {', '.join(required_args)}")
+
+        if isinstance(command, click.Group):
+            for name, subcommand in command.commands.items():
+                check(subcommand, f"{path} {name}")
+
+    check(entrypoint_cli, "modal")
+    assert not offenders, "commands with required arguments need no_args_is_help=True:\n" + "\n".join(offenders)
+
+
+def _stats_distribution(unit: str, p50: float, p90: float, p99: float) -> api_pb2.StatsPercentileDistribution:
+    return api_pb2.StatsPercentileDistribution(
+        unit=unit,
+        percentiles=[
+            api_pb2.StatsPercentile(percentile_basis_points=5000, value=p50),
+            api_pb2.StatsPercentile(percentile_basis_points=9000, value=p90),
+            api_pb2.StatsPercentile(percentile_basis_points=9900, value=p99),
+        ],
+    )
+
+
+def test_function_calls_cli(servicer, set_env_client, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "160")
+    enqueued_at = datetime(2026, 9, 15, 12, 0, 0, 123000, tzinfo=timezone.utc)
+    started_at = enqueued_at + timedelta(seconds=1)
+    response = api_pb2.FunctionCallFetchResponse()
+    completed = response.function_call_inputs.add(
+        function_call_id="fc-1",
+        container_id="ta-123",
+        execution_time_seconds=2.5,
+        status=api_pb2.FUNCTION_CALL_INPUT_STATUS_SUCCESS,
+    )
+    completed.enqueued_at.FromDatetime(enqueued_at)
+    completed.started_at.FromDatetime(started_at)
+    pending = response.function_call_inputs.add(
+        function_call_id="fc-2",
+        status=api_pb2.FUNCTION_CALL_INPUT_STATUS_PENDING,
+    )
+    pending.enqueued_at.FromDatetime(enqueued_at - timedelta(seconds=1))
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGet", api_pb2.FunctionGetResponse(function_id="fu-test"))
+        ctx.add_response("FunctionCallFetch", response)
+        result = run_cli_command(
+            [
+                "function",
+                "calls",
+                "my-app/my-function",
+                "--tail",
+                "500",
+                "--all-variants",
+                "--show-function-call-id",
+            ]
+        )
+
+    request = ctx.pop_request("FunctionCallFetch")
+    assert request.function_id == "fu-test"
+    assert request.tail.count == 500
+    assert request.all_variants
+    assert "Function calls for fu-test · all variants" in result.stdout
+    assert result.stdout.count("2026-09-") == 1
+    assert "fc-1" in result.stdout
+    assert "fc-2" in result.stdout
+    assert "ta-123" in result.stdout
+    assert "Queuing (s)" in result.stdout
+    assert "Execution (s)" in result.stdout
+    assert "1.00" in result.stdout
+    assert "2.50" in result.stdout
+    assert "Success" in result.stdout
+    assert "Pending" in result.stdout
+    assert "Displaying 2 rows" in result.stdout
+    output_lines = result.stdout.splitlines()
+    title_line = next(i for i, line in enumerate(output_lines) if "Function calls for fu-test" in line)
+    assert output_lines[title_line].startswith("Function calls for fu-test")
+    assert output_lines[title_line + 1] == "Displaying 2 rows"
+    completed_row = next(line for line in result.stdout.splitlines() if "ta-123" in line)
+    assert "│" not in completed_row
+    assert not {"╭", "╰", "│"} & set(result.stdout)
+    assert "─" in result.stdout
+
+
+def test_function_calls_cli_shows_method_if_all_rows_have_it(servicer, set_env_client, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "160")
+    response = api_pb2.FunctionCallFetchResponse(
+        function_call_inputs=[
+            api_pb2.FunctionCallInputInfo(
+                function_call_id="fc-first",
+                service_method_name="foo",
+                status=api_pb2.FUNCTION_CALL_INPUT_STATUS_SUCCESS,
+            ),
+            api_pb2.FunctionCallInputInfo(
+                function_call_id="fc-second",
+                service_method_name="bar",
+                status=api_pb2.FUNCTION_CALL_INPUT_STATUS_PENDING,
+            ),
+        ]
+    )
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGet", api_pb2.FunctionGetResponse(function_id="fu-test"))
+        ctx.add_response("FunctionCallFetch", response)
+        result = run_cli_command(["function", "calls", "my-app/my-function"])
+
+    assert "Method" in result.stdout
+    assert "foo" in result.stdout
+    assert "bar" in result.stdout
+
+
+def test_function_calls_cli_hides_method_if_any_row_is_missing_it(servicer, set_env_client):
+    response = api_pb2.FunctionCallFetchResponse(
+        function_call_inputs=[
+            api_pb2.FunctionCallInputInfo(
+                function_call_id="fc-method",
+                service_method_name="method_name",
+                status=api_pb2.FUNCTION_CALL_INPUT_STATUS_SUCCESS,
+            ),
+            api_pb2.FunctionCallInputInfo(
+                function_call_id="fc-no-method",
+                status=api_pb2.FUNCTION_CALL_INPUT_STATUS_PENDING,
+            ),
+        ]
+    )
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGet", api_pb2.FunctionGetResponse(function_id="fu-test"))
+        ctx.add_response("FunctionCallFetch", response)
+        result = run_cli_command(["function", "calls", "my-app/my-function"])
+
+    assert "Method" not in result.stdout
+    assert "method_name" not in result.stdout
+
+
+def test_function_calls_cli_hides_function_call_id_by_default(servicer, set_env_client):
+    response = api_pb2.FunctionCallFetchResponse(
+        function_call_inputs=[
+            api_pb2.FunctionCallInputInfo(
+                function_call_id="fc-hidden",
+                container_id="ta-123",
+                status=api_pb2.FUNCTION_CALL_INPUT_STATUS_RUNNING,
+            )
+        ]
+    )
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGet", api_pb2.FunctionGetResponse(function_id="fu-test"))
+        ctx.add_response("FunctionCallFetch", response)
+        result = run_cli_command(["function", "calls", "my-app/my-function"])
+
+    assert "Function Call ID" not in result.stdout
+    assert "fc-hidden" not in result.stdout
+    assert "ta-123" in result.stdout
+
+
+def test_server_requests_cli(servicer, set_env_client, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "160")
+    timestamp = datetime(2026, 9, 15, 12, 0, 0, 123000, tzinfo=timezone.utc)
+    response = api_pb2.ServerRequestFetchResponse()
+    request_info = response.requests.add(
+        route="/v1/responses",
+        container_id="ta-123",
+        duration_seconds=1.25,
+        status=200,
+    )
+    request_info.timestamp.FromDatetime(timestamp)
+    next_request = response.requests.add(
+        route="/health",
+        container_id="ta-456",
+        duration_seconds=0.01,
+        status=500,
+    )
+    next_request.timestamp.FromDatetime(timestamp - timedelta(seconds=1))
+
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(
+                function_id="fu-server",
+                function=api_pb2.FunctionData(is_server=True),
+            ),
+        )
+        ctx.add_response("ServerRequestFetch", response)
+        result = run_cli_command(
+            [
+                "server",
+                "requests",
+                "my-app/my-server",
+                "--tail",
+                "500",
+            ]
+        )
+
+    request = ctx.pop_request("ServerRequestFetch")
+    assert request.function_id == "fu-server"
+    assert request.tail.count == 500
+    assert "Server requests for fu-server" in result.stdout
+    assert result.stdout.count("2026-09-15") == 1
+    assert "/v1/responses" in result.stdout
+    assert "ta-123" in result.stdout
+    assert "Duration (s)" in result.stdout
+    assert "1.25" in result.stdout
+    assert "200" in result.stdout
+    assert "Displaying 2 rows" in result.stdout
+    output_lines = result.stdout.splitlines()
+    title_line = next(i for i, line in enumerate(output_lines) if "Server requests for fu-server" in line)
+    assert output_lines[title_line].startswith("Server requests for fu-server")
+    assert output_lines[title_line + 1] == "Displaying 2 rows"
+    request_row = next(line for line in result.stdout.splitlines() if "ta-123" in line)
+    assert "│" not in request_row
+    assert not {"╭", "╰", "│"} & set(result.stdout)
+    assert "─" in result.stdout
+
+
+@pytest.mark.parametrize("is_server", [False, True])
+@pytest.mark.parametrize("mode", ["range", "until", "empty", "dense"])
+def test_invocation_cli_fetch_range(servicer, set_env_client, is_server, mode):
+    base = datetime(2026, 9, 15, 12, tzinfo=timezone.utc)
+    command = ["server", "requests"] if is_server else ["function", "calls"]
+    count_rpc = "ServerCountRequests" if is_server else "FunctionCallCount"
+    fetch_rpc = "ServerRequestFetch" if is_server else "FunctionCallFetch"
+    count_type = api_pb2.ServerCountRequestsResponse if is_server else api_pb2.FunctionCallCountResponse
+    fetch_type = api_pb2.ServerRequestFetchResponse if is_server else api_pb2.FunctionCallFetchResponse
+    command += ["my-app/my-object", "--json", "--until", (base + timedelta(seconds=7)).isoformat()]
+    if mode != "until":
+        command += ["--since", (base + timedelta(seconds=1)).isoformat()]
+    if not is_server:
+        command += ["--all-variants"]
+
+    counted = count_type()
+    for offset in (0, 2, 4, 6):
+        bucket = counted.buckets.add(count=0 if mode == "empty" else (20_001 if mode == "dense" else 2000))
+        bucket.bucket_start_at.FromDatetime(base + timedelta(seconds=offset))
+
+    async def fetch(self, stream):
+        request = await stream.recv_message()
+        start = request.range.since.ToDatetime(tzinfo=timezone.utc)
+        # Complete later intervals first to verify output order.
+        await asyncio.sleep(0.001 * (7 - (start - base).total_seconds()))
+        response = fetch_type()
+        for i in range(3):
+            if is_server:
+                request_info = cast(api_pb2.ServerRequestFetchResponse, response).requests.add(
+                    route=f"/{start.second}-{i}", status=200
+                )
+                request_info.timestamp.FromDatetime(start + timedelta(microseconds=i))
+            else:
+                call = cast(api_pb2.FunctionCallFetchResponse, response).function_call_inputs.add(
+                    function_call_id=f"fc-{start.second}-{i}"
+                )
+                call.enqueued_at.FromDatetime(start + timedelta(microseconds=i))
+        await stream.send_message(response)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(function_id="fu-test", function=api_pb2.FunctionData(is_server=is_server)),
+        )
+        ctx.add_response(count_rpc, counted)
+        ctx.set_responder(fetch_rpc, fetch)
+        result = run_cli_command(command, expected_exit_code=2 if mode == "dense" else 0)
+
+    count_request = ctx.pop_request(count_rpc)
+    assert count_request.function_id == "fu-test"
+    assert count_request.until.ToDatetime(tzinfo=timezone.utc) == base + timedelta(seconds=7)
+    expected_since = (
+        base + timedelta(seconds=7) - timedelta(hours=1) if mode == "until" else base + timedelta(seconds=1)
+    )
+    assert count_request.since.ToDatetime(tzinfo=timezone.utc) == expected_since
+    if not is_server:
+        assert count_request.all_variants
+    fetch_requests = ctx.get_requests(fetch_rpc)
+    if mode in ("empty", "dense"):
+        assert fetch_requests == []
+        if mode == "empty":
+            assert json.loads(result.stdout) == []
+        else:
+            assert "Too many inputs" in result.stderr or "Too many requests" in result.stderr
+        return
+    assert fetch_requests
+    for request in fetch_requests:
+        assert request.WhichOneof("query_oneof") == "range"
+        assert request.range.limit == 20_000
+        assert request.range.since.ToDatetime(tzinfo=timezone.utc) >= expected_since
+        assert request.range.until.ToDatetime(tzinfo=timezone.utc) <= base + timedelta(seconds=7)
+        if not is_server:
+            assert request.all_variants
+    key = "route" if is_server else "function_call_id"
+    identifiers = [item[key] for item in json.loads(result.stdout)]
+    prefix = "/" if is_server else "fc-"
+    assert len(fetch_requests) == 4
+    offsets = (0, 2, 4, 6) if mode == "until" else (1, 2, 4, 6)
+    assert identifiers == [f"{prefix}{offset}-{i}" for offset in offsets for i in range(3)]
+
+
+@pytest.mark.parametrize("command", [["function", "calls", "fu-test"], ["server", "requests", "fu-test"]])
+@pytest.mark.parametrize(
+    "args,message",
+    [
+        (["--tail", "10", "--since", "30m"], "--tail cannot be combined with --since or --until"),
+        (["--tail", "10", "--until", "1h"], "--tail cannot be combined with --since or --until"),
+        (
+            ["--tail", "10", "--since", "2h", "--until", "1h"],
+            "--tail cannot be combined with --since or --until",
+        ),
+        (["--since", "2026-09-15T12:00:00.123456+00:00"], "--since must have whole-second precision"),
+        (["--until", "2026-09-15T12:00:00.001+00:00"], "--until must have whole-second precision"),
+        (["--since", "invalid"], "Invalid time format"),
+        (["--until", "invalid"], "Invalid time format"),
+        (["--since", "2026-09-16", "--until", "2026-09-15"], "--since must be before --until"),
+        (["--since", "2026-08-01T00:00:00+00:00", "--until", "2026-09-01T00:00:01+00:00"], "cannot exceed 7 days"),
+    ],
+)
+def test_invocation_cli_validates_range(command, args, message):
+    result = run_cli_command(command + args, expected_exit_code=2)
+    assert message in result.stderr
+
+
+@pytest.mark.parametrize("is_server", [False, True])
+def test_invocation_cli_refines_dense_ranges(servicer, set_env_client, is_server):
+    base = datetime(2026, 9, 15, 12, tzinfo=timezone.utc)
+    count_rpc = "ServerCountRequests" if is_server else "FunctionCallCount"
+    fetch_rpc = "ServerRequestFetch" if is_server else "FunctionCallFetch"
+    count_type = api_pb2.ServerCountRequestsResponse if is_server else api_pb2.FunctionCallCountResponse
+    fetch_type = api_pb2.ServerRequestFetchResponse if is_server else api_pb2.FunctionCallFetchResponse
+
+    async def count(self, stream):
+        request = await stream.recv_message()
+        response = count_type()
+        offsets = [0] if request.bucket_secs == 60 else [0, 30]
+        for offset in offsets:
+            bucket = response.buckets.add(count=20_001 if len(offsets) == 1 else 10_001)
+            bucket.bucket_start_at.FromDatetime(base + timedelta(seconds=offset))
+        await stream.send_message(response)
+
+    async def fetch(self, stream):
+        await stream.recv_message()
+        await stream.send_message(fetch_type())
+
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGetById", api_pb2.FunctionGetByIdResponse(function=api_pb2.FunctionData(is_server=is_server))
+        )
+        ctx.set_responder(count_rpc, count)
+        ctx.set_responder(fetch_rpc, fetch)
+        command = ["server", "requests"] if is_server else ["function", "calls"]
+        result = run_cli_command(
+            command
+            + ["fu-test", "--since", base.isoformat(), "--until", (base + timedelta(hours=1)).isoformat(), "--json"]
+        )
+    assert json.loads(result.stdout) == []
+    assert [request.bucket_secs for request in ctx.get_requests(count_rpc)] == [60, 30]
+    assert len(ctx.get_requests(fetch_rpc)) == 2
+
+
+@pytest.mark.parametrize("is_server", [False, True])
+def test_invocation_cli_relative_range(servicer, set_env_client, is_server):
+    count_rpc = "ServerCountRequests" if is_server else "FunctionCallCount"
+    response = api_pb2.ServerCountRequestsResponse() if is_server else api_pb2.FunctionCallCountResponse()
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGetById", api_pb2.FunctionGetByIdResponse(function=api_pb2.FunctionData(is_server=is_server))
+        )
+        ctx.add_response(count_rpc, response)
+        command = ["server", "requests"] if is_server else ["function", "calls"]
+        result = run_cli_command(command + ["fu-test", "--since", "2h", "--until", "1h", "--json"])
+    assert json.loads(result.stdout) == []
+    request = ctx.pop_request(count_rpc)
+    duration = request.until.ToDatetime(tzinfo=timezone.utc) - request.since.ToDatetime(tzinfo=timezone.utc)
+    assert duration.total_seconds() == 3600
+    assert request.since.nanos == request.until.nanos == 0
+
+
+@pytest.mark.parametrize("is_server", [False, True])
+@pytest.mark.parametrize("since", [None, "2026-09-15T08:30:00-04:00"])
+def test_invocation_cli_fetch_range_heading(servicer, set_env_client, monkeypatch, is_server, since):
+    monkeypatch.setenv("COLUMNS", "160")
+    count_rpc = "ServerCountRequests" if is_server else "FunctionCallCount"
+    response = api_pb2.ServerCountRequestsResponse() if is_server else api_pb2.FunctionCallCountResponse()
+    command = ["server", "requests"] if is_server else ["function", "calls"]
+    command += ["fu-test", "--until", "2026-09-15T10:00:00-04:00"]
+    if since is not None:
+        command += ["--since", since]
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGetById", api_pb2.FunctionGetByIdResponse(function=api_pb2.FunctionData(is_server=is_server))
+        )
+        ctx.add_response(count_rpc, response)
+        result = run_cli_command(command)
+    request = ctx.pop_request(count_rpc)
+    start = request.since.ToJsonString()
+    end = request.until.ToJsonString()
+    assert start == ("2026-09-15T13:00:00Z" if since is None else "2026-09-15T12:30:00Z")
+    assert end == "2026-09-15T14:00:00Z"
+    label = "Server requests" if is_server else "Function calls"
+    start_label = "2026-09-15 13:00:00" if since is None else "2026-09-15 12:30:00"
+    assert f"[{start_label}, 2026-09-15 14:00:00) UTC" in result.stdout
+
+
+@pytest.mark.parametrize("is_server", [False, True])
+def test_invocation_cli_accepts_max_range(servicer, set_env_client, is_server):
+    count_rpc = "ServerCountRequests" if is_server else "FunctionCallCount"
+    response = api_pb2.ServerCountRequestsResponse() if is_server else api_pb2.FunctionCallCountResponse()
+    command = ["server", "requests"] if is_server else ["function", "calls"]
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGetById", api_pb2.FunctionGetByIdResponse(function=api_pb2.FunctionData(is_server=is_server))
+        )
+        ctx.add_response(count_rpc, response)
+        result = run_cli_command(
+            command
+            + ["fu-test", "--since", "2026-08-01T00:00:00+00:00", "--until", "2026-08-08T00:00:00+00:00", "--json"]
+        )
+    assert json.loads(result.stdout) == []
+    request = ctx.pop_request(count_rpc)
+    assert request.until.seconds - request.since.seconds == 7 * 86400
+
+
+def test_invocation_status_styles():
+    from modal.cli.function import _function_call_status_cell
+    from modal.cli.server import _server_request_status_cell
+
+    assert _function_call_status_cell(api_pb2.FUNCTION_CALL_INPUT_STATUS_PENDING).style == "yellow"
+    assert _function_call_status_cell(api_pb2.FUNCTION_CALL_INPUT_STATUS_FAILURE).style == "red"
+    assert _function_call_status_cell(api_pb2.FUNCTION_CALL_INPUT_STATUS_TIMEOUT).style == "red"
+    assert _function_call_status_cell(api_pb2.FUNCTION_CALL_INPUT_STATUS_RUNNING).style == "green"
+    assert not _function_call_status_cell(api_pb2.FUNCTION_CALL_INPUT_STATUS_SUCCESS).style
+    assert _server_request_status_cell(500).style == "red"
+    assert not _server_request_status_cell(200).style
+
+
+def test_function_calls_json(servicer, set_env_client):
+    enqueued_at = datetime(2026, 9, 15, 12, tzinfo=timezone.utc)
+    response = api_pb2.FunctionCallFetchResponse()
+    call = response.function_call_inputs.add(
+        function_call_id="fc-123",
+        status=api_pb2.FUNCTION_CALL_INPUT_STATUS_RUNNING,
+    )
+    call.enqueued_at.FromDatetime(enqueued_at)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGet", api_pb2.FunctionGetResponse(function_id="fu-test"))
+        ctx.add_response("FunctionCallFetch", response)
+        result = run_cli_command(["function", "calls", "my-app/my-function", "--json"])
+
+    assert json.loads(result.stdout) == [
+        {
+            "function_call_id": "fc-123",
+            "service_method_name": None,
+            "enqueued_at": "2026-09-15T12:00:00Z",
+            "started_at": None,
+            "container_id": None,
+            "startup_time_seconds": None,
+            "execution_time_seconds": None,
+            "status": "running",
+        }
+    ]
+
+
+@pytest.mark.parametrize("command", [["function", "calls", "fu-test"], ["server", "requests", "fu-test"]])
+@pytest.mark.parametrize("tail", [0, 1001])
+def test_invocation_cli_validates_tail(command, tail):
+    command.extend(["--tail", str(tail)])
+    result = run_cli_command(command, expected_exit_code=2)
+    assert "1<=x<=1000" in result.stderr
+
+
+def test_function_stats_cli(servicer, set_env_client):
+    since = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 18, 13, tzinfo=timezone.utc)
+    response = api_pb2.FunctionGetTimeRangeStatsResponse(
+        input_success_count=1284,
+        input_failure_count=17,
+        input_timeout_count=3,
+        input_running_at_end_count=4,
+        input_percentile_stats={
+            "Execution time (s)": _stats_distribution("seconds", 0.0003, 0.0008, 0.0016),
+            "End-to-end latency (s)": _stats_distribution("seconds", 4.881, 19.816, 28.403),
+        },
+        container_total_count=1234,
+        container_started_count=23,
+        container_error_count=1,
+        container_creating_at_end_count=1,
+        container_percentile_stats={
+            "Startup time (s)": _stats_distribution("seconds", 2.060, 2.338, 2.701),
+            "CPU Usage (cores)": _stats_distribution("cores", 0.014, 0.023, 0.041),
+            "Memory Usage (GiB)": _stats_distribution("GiB", 0.046, 0.047, 0.049),
+        },
+        variant_count=4,
+    )
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGet", api_pb2.FunctionGetResponse(function_id="fu-test"))
+        ctx.add_response("FunctionGetTimeRangeStats", response)
+        result = run_cli_command(
+            [
+                "function",
+                "stats",
+                "my-app/my-function",
+                "--since",
+                since.isoformat(),
+                "--until",
+                until.isoformat(),
+                "--all-variants",
+            ]
+        )
+
+    request = ctx.pop_request("FunctionGetTimeRangeStats")
+    assert request.function_id == "fu-test"
+    assert request.rollup
+    assert request.since.ToDatetime(tzinfo=timezone.utc) == since
+    assert request.until.ToDatetime(tzinfo=timezone.utc) == until
+    assert "Function stats for fu-test · all variants (4 variants)" in result.stdout
+    assert "Function stats for my-app/my-function" not in result.stdout
+    assert "Inputs" in result.stdout
+    assert "1,308 total (4 running)" in result.stdout
+    assert ctx.get_requests("FunctionGetCurrentStats") == []
+    assert "1,284 succeeded (98.5%)" in result.stdout
+    assert "17 failed (1.3%)" in result.stdout
+    assert "3 timed out (0.2%)" in result.stdout
+    assert "Containers" in result.stdout
+    assert "1,234 Total (1 creating)" in result.stdout
+    assert "23 started · 1 errored" in result.stdout
+    assert "23 started (" not in result.stdout
+    assert "1 errored (" not in result.stdout
+    assert "Execution time (s)" in result.stdout
+    assert "0.00" in result.stdout
+    assert "End-to-end latency (s)" in result.stdout
+    assert "28.40" in result.stdout
+    assert "Startup time (s)" in result.stdout
+    assert "CPU Usage (cores)" in result.stdout
+    assert "0.01" in result.stdout
+    assert "Memory Usage (GiB)" in result.stdout
+    assert "0.05" in result.stdout
+    assert "GPU utilization" not in result.stdout
+    assert result.stdout.index("Execution time (s)") < result.stdout.index("End-to-end latency (s)")
+    assert result.stdout.index("Startup time (s)") < result.stdout.index("CPU Usage (cores)")
+    assert result.stdout.index("CPU Usage (cores)") < result.stdout.index("Memory Usage (GiB)")
+
+
+@pytest.mark.parametrize("live_count", [0, 17])
+def test_function_stats_cli_json_uses_object_id(servicer, set_env_client, live_count):
+    servicer.app_functions["fu-test"] = api_pb2.FunctionData(is_server=False)
+    since = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 18, 13, tzinfo=timezone.utc)
+    response = api_pb2.FunctionGetTimeRangeStatsResponse(container_total_count=live_count)
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGetTimeRangeStats", response)
+        result = run_cli_command(
+            [
+                "function",
+                "stats",
+                "fu-test",
+                "--since",
+                since.isoformat(),
+                "--until",
+                until.isoformat(),
+                "--json",
+            ]
+        )
+
+    payload = json.loads(result.stdout)
+    assert payload["object_id"] == "fu-test"
+    assert payload["container_total_count"] == live_count
+    assert "function_id" not in payload
+
+
+def _run_variants_cli_with_ctx(
+    servicer,
+    variant_infos: list[api_pb2.FunctionVariantInfo],
+    args: list[str] = [],
+    handle_metadata: api_pb2.FunctionHandleMetadata | None = None,
+    ordered_by_task_count: bool = False,
+):
+    """Run `modal function variants` and return its result alongside the intercepted requests."""
+    # Widen the console so that the options of one variant are rendered on a single line.
+    with mock.patch.dict(os.environ, {"COLUMNS": "200"}), servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(
+                function_id="fu-test", handle_metadata=handle_metadata or api_pb2.FunctionHandleMetadata()
+            ),
+        )
+        ctx.add_response(
+            "FunctionListVariants",
+            api_pb2.FunctionListVariantsResponse(infos=variant_infos, ordered_by_task_count=ordered_by_task_count),
+        )
+        result = run_cli_command(["function", "variants", "my-app/my-function", *args])
+    return result, ctx
+
+
+def _run_variants_cli(
+    servicer,
+    variant_infos: list[api_pb2.FunctionVariantInfo],
+    args: list[str] = [],
+    handle_metadata: api_pb2.FunctionHandleMetadata | None = None,
+    ordered_by_task_count: bool = False,
+):
+    result, _ = _run_variants_cli_with_ctx(servicer, variant_infos, args, handle_metadata, ordered_by_task_count)
+    return result
+
+
+def _s3_mount() -> api_pb2.CloudBucketMount:
+    return api_pb2.CloudBucketMount(
+        mount_path="/bucket",
+        bucket_name="my-bucket",
+        bucket_type=api_pb2.CloudBucketMount.BucketType.S3,
+        key_prefix="logs/",
+        read_only=True,
+    )
+
+
+def test_function_variants_cli(servicer, set_env_client):
+    variant_infos = [
+        api_pb2.FunctionVariantInfo(
+            function_id="fu-variant-1",
+            function_options=api_pb2.FunctionOptions(
+                resources=api_pb2.Resources(milli_cpu=4000),
+                cloud_bucket_mounts=[_s3_mount()],
+                retry_policy=api_pb2.FunctionRetryPolicy(retries=3),
+            ),
+        ),
+        api_pb2.FunctionVariantInfo(function_id="fu-variant-2", function_options=api_pb2.FunctionOptions()),
+    ]
+
+    result = _run_variants_cli(servicer, variant_infos)
+
+    assert "Variants of fu-test" in result.stdout
+    # The retry count is the only part of a retry policy that the table shows.
+    assert "cpu=4.0, cloud_bucket_mounts={/bucket: s3://my-bucket/logs/ (ro)}, retries=3" in result.stdout
+    assert "fu-variant-2" in result.stdout
+    # A variant that overrides nothing has no parameters column and an empty options cell.
+    assert "Parameters" not in result.stdout
+
+
+def test_function_variants_cli_bucket_mount_formats(servicer, set_env_client):
+    variant_infos = [
+        api_pb2.FunctionVariantInfo(
+            function_id="fu-variant",
+            function_options=api_pb2.FunctionOptions(
+                cloud_bucket_mounts=[
+                    api_pb2.CloudBucketMount(
+                        mount_path="/r2", bucket_name="other", bucket_type=api_pb2.CloudBucketMount.BucketType.R2
+                    ),
+                    api_pb2.CloudBucketMount(
+                        mount_path="/gcp",
+                        bucket_name="gcp-bucket",
+                        bucket_type=api_pb2.CloudBucketMount.BucketType.GCP,
+                        key_prefix="data/",
+                    ),
+                ]
+            ),
+        ),
+    ]
+
+    result = _run_variants_cli(servicer, variant_infos)
+
+    assert "cloud_bucket_mounts={/r2: r2://other, /gcp: gcp://gcp-bucket/data/}" in result.stdout
+
+
+def test_function_variants_cli_volume_mount_options(servicer, set_env_client):
+    """A volume mounted with `.with_mount_options()` shows what it changed, not just the volume."""
+    variant_infos = [
+        api_pb2.FunctionVariantInfo(
+            function_id="fu-variant",
+            function_options=api_pb2.FunctionOptions(
+                volume_mounts=[
+                    api_pb2.VolumeMount(mount_path="/a", volume_id="vo-1"),
+                    api_pb2.VolumeMount(mount_path="/b", volume_id="vo-2", read_only=True),
+                    api_pb2.VolumeMount(mount_path="/c", volume_id="vo-3", sub_path="sub"),
+                    api_pb2.VolumeMount(mount_path="/d", volume_id="vo-4", read_only=True, sub_path="sub"),
+                ]
+            ),
+        ),
+    ]
+
+    result = _run_variants_cli(servicer, variant_infos)
+
+    assert "volumes={/a: vo-1, /b: vo-2 (ro), /c: vo-3:sub, /d: vo-4:sub (ro)}" in result.stdout
+
+
+def test_function_variants_cli_truncates_long_options(servicer, set_env_client):
+    variant_infos = [
+        api_pb2.FunctionVariantInfo(
+            function_id="fu-variant",
+            function_options=api_pb2.FunctionOptions(
+                cloud_bucket_mounts=[
+                    api_pb2.CloudBucketMount(mount_path=f"/bucket-{i}", bucket_name=f"bucket-{i}") for i in range(10)
+                ]
+            ),
+        ),
+    ]
+
+    result = _run_variants_cli(servicer, variant_infos)
+
+    assert "\u2026" in result.stdout
+
+
+def test_function_variants_cli_parameters(servicer, set_env_client):
+    variant_infos = [
+        api_pb2.FunctionVariantInfo(
+            function_id="fu-variant",
+            serialized_params=serialize_proto_params({"x": 42, "name": "foo", "blob": b"0" * 2048}),
+        ),
+        api_pb2.FunctionVariantInfo(function_id="fu-undecodable", serialized_params=b"not-a-parameter-set"),
+    ]
+    # A Function that carries metadata for its methods serves a Cls, whose variants are parameterized.
+    handle_metadata = api_pb2.FunctionHandleMetadata(
+        method_handle_metadata={"my_method": api_pb2.FunctionHandleMetadata()}
+    )
+
+    result = _run_variants_cli(servicer, variant_infos, handle_metadata=handle_metadata)
+
+    assert "Parameters" in result.stdout
+    # A bytes parameter is rendered as its size rather than its contents.
+    assert "x=42, name='foo', blob=<bytes: 2.0 KiB>" in result.stdout
+    assert "unavailable" in result.stdout
+
+
+def test_function_variants_cli_json(servicer, set_env_client):
+    variant_infos = [
+        api_pb2.FunctionVariantInfo(
+            function_id="fu-variant",
+            function_options=api_pb2.FunctionOptions(
+                resources=api_pb2.Resources(milli_cpu=2000, milli_cpu_max=4000, memory_mb=2048),
+                cloud_bucket_mounts=[_s3_mount()],
+                volume_mounts=[api_pb2.VolumeMount(mount_path="/vol", volume_id="vo-123")],
+                retry_policy=api_pb2.FunctionRetryPolicy(retries=3, backoff_coefficient=2.0, initial_delay_ms=1000),
+                max_concurrent_inputs=100,
+                target_concurrent_inputs=50,
+                concurrency_limit=10,
+            ),
+        ),
+    ]
+
+    result = _run_variants_cli(servicer, variant_infos, args=["--json"])
+
+    assert json.loads(result.stdout) == [
+        {
+            "function_id": "fu-variant",
+            "options": {
+                "cpu": [2.0, 4.0],
+                "memory": 2048,
+                "volumes": {"/vol": {"name": None, "volume_id": "vo-123", "read_only": False, "sub_path": None}},
+                "cloud_bucket_mounts": {
+                    "/bucket": {
+                        "bucket_name": "my-bucket",
+                        "bucket_type": "s3",
+                        "read_only": True,
+                        "key_prefix": "logs/",
+                    }
+                },
+                "retries": {
+                    "max_retries": 3,
+                    "backoff_coefficient": 2.0,
+                    "initial_delay": 1.0,
+                    "max_delay": 60.0,
+                },
+                "max_containers": 10,
+                "max_inputs": 100,
+                "target_inputs": 50,
+            },
+        }
+    ]
+
+
+def _variant_infos(count: int) -> list[api_pb2.FunctionVariantInfo]:
+    return [api_pb2.FunctionVariantInfo(function_id=f"fu-variant-{i}") for i in range(count)]
+
+
+def _unwrapped(text: str) -> str:
+    """Collapse whitespace so assertions survive the table title wrapping to the table's width."""
+    return " ".join(text.split())
+
+
+def test_function_variants_cli_defaults_to_busiest(servicer, set_env_client):
+    """Without a limit the command asks for the busiest variants, and says so, since the ordering
+    is not otherwise visible in the table."""
+    result, ctx = _run_variants_cli_with_ctx(servicer, _variant_infos(2), ordered_by_task_count=True)
+
+    (request,) = ctx.get_requests("FunctionListVariants")
+    assert request.limit == 200
+    assert "Variants of fu-test · 2 busiest" in _unwrapped(result.stdout)
+
+
+def test_function_variants_cli_limit_zero_lists_everything(servicer, set_env_client):
+    """`--limit 0` asks for every variant, and the title stops claiming the listing is ordered."""
+    result, ctx = _run_variants_cli_with_ctx(servicer, _variant_infos(2), args=["--limit", "0"])
+
+    (request,) = ctx.get_requests("FunctionListVariants")
+    assert request.limit == 0
+    assert "2 newest" in _unwrapped(result.stdout)
+    assert "busiest" not in result.stdout
+
+
+def test_function_variants_cli_large_limit_is_unordered(servicer, set_env_client):
+    """The title follows what the server reports, not the limit that was asked for: a listing the
+    server did not rank must not be called busiest, however large the limit."""
+    result, ctx = _run_variants_cli_with_ctx(servicer, _variant_infos(2), args=["--limit", "201"])
+
+    (request,) = ctx.get_requests("FunctionListVariants")
+    assert request.limit == 201
+    assert "2 newest" in _unwrapped(result.stdout)
+    assert "busiest" not in result.stdout
+
+
+def test_function_variants_cli_title_follows_the_server(servicer, set_env_client):
+    """The client no longer decides which listings are ranked: a limit the server would not rank
+    today still titles the table busiest when the server says it ordered by task count."""
+    result = _run_variants_cli(servicer, _variant_infos(2), args=["--limit", "201"], ordered_by_task_count=True)
+
+    assert "2 busiest" in _unwrapped(result.stdout)
+
+
+def test_function_variants_cli_lists_the_family_of_a_variant(servicer, set_env_client):
+    """A variant has no variants of its own, so naming one lists the family it belongs to."""
+    handle_metadata = api_pb2.FunctionHandleMetadata(base_function_id="fu-base")
+    result, ctx = _run_variants_cli_with_ctx(servicer, _variant_infos(2), handle_metadata=handle_metadata)
+
+    (request,) = ctx.get_requests("FunctionListVariants")
+    assert request.function_id == "fu-base"
+    assert "Variants of fu-base" in _unwrapped(result.stdout)
+
+
+def test_function_variants_cli_empty_listing_names_the_base(servicer, set_env_client):
+    """The Function reported as having no variants is the one that was listed."""
+    handle_metadata = api_pb2.FunctionHandleMetadata(base_function_id="fu-base")
+    result = _run_variants_cli(servicer, [], handle_metadata=handle_metadata)
+
+    assert "No variants found for fu-base." in _unwrapped(result.stdout)
+
+
+def test_function_variants_cli_reports_truncation(servicer, set_env_client):
+    """A full page is indistinguishable from a complete listing, so say how to get the rest."""
+    result = _run_variants_cli(servicer, _variant_infos(2), args=["--limit", "2"])
+    assert "use --limit 0 to list every variant" in _unwrapped(result.stdout)
+
+    result = _run_variants_cli(servicer, _variant_infos(2), args=["--limit", "3"])
+    assert "use --limit 0" not in _unwrapped(result.stdout)
+
+
+def test_function_variants_cli_rejects_negative_limit(set_env_client):
+    """A negative limit is caught before any request goes out."""
+    result = run_cli_command(
+        ["function", "variants", "my-app/my-function", "--limit", "-1"],
+        expected_exit_code=2,
+    )
+    assert "--limit cannot be negative" in result.stderr
+
+
+def test_function_variants_cli_rejects_server(set_env_client, monkeypatch):
+    client = mock.Mock()
+    client._stub.FunctionGetById = mock.AsyncMock(
+        return_value=api_pb2.FunctionGetByIdResponse(function=api_pb2.FunctionData(is_server=True))
+    )
+    monkeypatch.setattr("modal.cli.function._Client.from_env", mock.AsyncMock(return_value=client))
+
+    result = run_cli_command(
+        ["function", "variants", "fu-server"],
+        expected_exit_code=2,
+    )
+
+    assert "'fu-server' is a Server." in result.stderr
+    client._stub.FunctionListVariants.assert_not_called()
+
+
+@pytest.mark.parametrize("reason", [None, 0, api_pb2.FunctionLookupError.REASON_CLASS_NAME_USED])
+def test_function_stats_cli_class_lookup_error_details(servicer, set_env_client, reason):
+    message = "Lookup failed" if reason == 1 else "Object 'MyClass' is a Class, not a Function."
+
+    async def fail_lookup(servicer, stream):
+        await stream.recv_message()
+        details = [] if reason is None else [api_pb2.FunctionLookupError(reason=reason)]
+        raise GRPCError(Status.NOT_FOUND, message, details=details)
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("FunctionGet", fail_lookup)
+        result = run_cli_command(["function", "stats", "app/MyClass"], expected_exit_code=1)
+
+    assert isinstance(result.exception, NotFoundError)
+    if reason == api_pb2.FunctionLookupError.REASON_CLASS_NAME_USED:
+        assert "modal function stats 'app/MyClass.*'" in str(result.exception)
+    else:
+        assert str(result.exception) == message
+        assert "app/MyClass.*" not in str(result.exception)
+
+
+def test_function_stats_cli_resolves_fu_prefixed_app_name(servicer, set_env_client):
+    since = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 18, 13, tzinfo=timezone.utc)
+    response = api_pb2.FunctionGetTimeRangeStatsResponse()
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGet", api_pb2.FunctionGetResponse(function_id="fu-resolved"))
+        ctx.add_response("FunctionGetTimeRangeStats", response)
+        run_cli_command(
+            [
+                "function",
+                "stats",
+                "fu-prefixed-app/my-function",
+                "--since",
+                since.isoformat(),
+                "--until",
+                until.isoformat(),
+            ]
+        )
+
+    request = ctx.pop_request("FunctionGet")
+    assert request.app_name == "fu-prefixed-app"
+    assert request.object_tag == "my-function"
+    assert ctx.pop_request("FunctionGetTimeRangeStats").function_id == "fu-resolved"
+
+
+def test_function_stats_cli_filters_by_container(servicer, set_env_client):
+    servicer.app_functions["fu-test"] = api_pb2.FunctionData(is_server=False)
+    since = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 18, 13, tzinfo=timezone.utc)
+    response = api_pb2.FunctionGetTimeRangeStatsResponse()
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGetTimeRangeStats", response)
+        run_cli_command(
+            [
+                "function",
+                "stats",
+                "fu-test",
+                "--since",
+                since.isoformat(),
+                "--until",
+                until.isoformat(),
+                "--container",
+                "ta-01M1CY4EK24B8MM10ZD2H7VE2R",
+            ]
+        )
+
+    request = ctx.pop_request("FunctionGetTimeRangeStats")
+    assert request.HasField("container_id")
+    assert request.container_id == "ta-01M1CY4EK24B8MM10ZD2H7VE2R"
+
+
+def test_function_stats_cli_renders_server_defined_percentile_metrics(servicer, set_env_client):
+    servicer.app_functions["fu-test"] = api_pb2.FunctionData(is_server=False)
+    since = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 18, 13, tzinfo=timezone.utc)
+    response = api_pb2.FunctionGetTimeRangeStatsResponse(
+        input_percentile_stats={
+            "Queue time (s)": _stats_distribution("seconds", 1.234, 2.345, 3.456),
+        },
+        container_percentile_stats={
+            "Disk Usage (GiB)": _stats_distribution("GiB", 4.567, 5.678, 6.789),
+            "GPU Utilization (%)": _stats_distribution("percent", 12.34, 56.78, 91.23),
+        },
+    )
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGetTimeRangeStats", response)
+        result = run_cli_command(
+            [
+                "function",
+                "stats",
+                "fu-test",
+                "--since",
+                since.isoformat(),
+                "--until",
+                until.isoformat(),
+            ]
+        )
+
+    assert "Queue time (s)" in result.stdout
+    assert "Queue time (s) (seconds)" not in result.stdout
+    assert "1.23" in result.stdout
+    assert "2.35" in result.stdout
+    assert "3.46" in result.stdout
+    assert "Disk Usage (GiB)" in result.stdout
+    assert "4.57" in result.stdout
+    assert "5.68" in result.stdout
+    assert "6.79" in result.stdout
+    assert "GPU Utilization (%)" in result.stdout
+    assert "12.34" in result.stdout
+    assert "56.78" in result.stdout
+    assert "91.23" in result.stdout
+    assert result.stdout.index("GPU Utilization (%)") < result.stdout.index("Disk Usage (GiB)")
+
+
+def test_server_stats_cli(servicer, set_env_client):
+    since = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 18, 13, tzinfo=timezone.utc)
+    response = api_pb2.ServerGetTimeRangeStatsResponse(
+        request_count=1284,
+        request_count_by_status_code=[
+            api_pb2.ServerGetTimeRangeStatsResponse.ServerStatusCodeCount(status_code=200, count=1241),
+            api_pb2.ServerGetTimeRangeStatsResponse.ServerStatusCodeCount(status_code=400, count=37),
+            api_pb2.ServerGetTimeRangeStatsResponse.ServerStatusCodeCount(status_code=500, count=6),
+        ],
+        request_rate_per_second=0.3566666667,
+        container_total_count=2345,
+        container_started_count=3,
+        container_error_count=2,
+        container_creating_at_end_count=1,
+        request_percentile_stats={
+            "Request latency 2xx (s)": _stats_distribution("seconds", 1.180, 3.510, 5.020),
+            "Request latency 5xx (s)": _stats_distribution("seconds", 0.500, 1.500, 2.500),
+        },
+        container_percentile_stats={
+            "Startup time (s)": _stats_distribution("seconds", 5.484, 7.130, 8.210),
+            "CPU usage (cores)": _stats_distribution("cores", 0.350, 0.720, 0.910),
+            "Memory usage (GiB)": _stats_distribution("GiB", 0.480, 0.830, 0.940),
+            "GPU utilization (%)": _stats_distribution("percentage", 91.0, 99.0, 100.0),
+        },
+        inference=api_pb2.ServerGetTimeRangeStatsResponse.ServerInferenceStats(
+            engine=api_pb2.LLM_ENGINE_SGLANG,
+            status=api_pb2.SERVER_INFERENCE_STATS_STATUS_AVAILABLE,
+            percentile_stats={
+                "time_to_first_token": _stats_distribution("seconds", 0.121, 0.317, 0.421),
+                "inter_token_latency": _stats_distribution("seconds", 0.024, 0.041, 0.068),
+                "end_to_end_latency": _stats_distribution("seconds", 1.150, 3.980, 7.210),
+            },
+            scalar_stats={
+                "input_tokens_per_second": 2428.0,
+                "cached_input_tokens_per_second": 622.0,
+                "output_tokens_per_second": 585.0,
+            },
+        ),
+    )
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(function_id="fu-server", function=api_pb2.FunctionData(is_server=True)),
+        )
+        ctx.add_response("ServerGetTimeRangeStats", response)
+        result = run_cli_command(
+            [
+                "server",
+                "stats",
+                "my-app/my-server",
+                "--since",
+                since.isoformat(),
+                "--until",
+                until.isoformat(),
+            ]
+        )
+
+    function_get_request = ctx.pop_request("FunctionGet")
+    assert function_get_request.app_name == "my-app"
+    assert function_get_request.object_tag == "my-server"
+    request = ctx.pop_request("ServerGetTimeRangeStats")
+    assert request.function_id == "fu-server"
+    assert request.since.ToDatetime(tzinfo=timezone.utc) == since
+    assert request.until.ToDatetime(tzinfo=timezone.utc) == until
+    assert "Server stats for fu-server" in result.stdout
+    assert "1,284 total (0.36 req/s)" in result.stdout
+    assert "2xx: 1,241 · 4xx: 37 · 5xx: 6" in result.stdout
+    assert "Request latency 2xx (s)" in result.stdout
+    assert "Request latency 5xx (s)" in result.stdout
+    assert "2,345 Total (1 creating)" in result.stdout
+    assert "3 started · 2 errored" in result.stdout
+    assert "3 started (" not in result.stdout
+    assert "2 errored (" not in result.stdout
+    assert "Startup time (s)" in result.stdout
+    assert "CPU usage (cores)" in result.stdout
+    assert "Memory usage (GiB)" in result.stdout
+    assert "GPU utilization (%)" in result.stdout
+    assert "Inference · SGLang" in result.stdout
+    assert "Inference · SGLang\n  Input 2,428 tok/s · Cached input 622 tok/s · Output 585 tok/s" in result.stdout
+    assert "Time to first token (ms)" in result.stdout
+    assert "121" in result.stdout
+    assert "317" in result.stdout
+    assert "Inter-token latency (ms)" in result.stdout
+    assert "24" in result.stdout
+    assert "41" in result.stdout
+    assert "End-to-end latency (s)" in result.stdout
+    assert "1.15" in result.stdout
+    assert "3.98" in result.stdout
+    assert "input_tokens_per_second" not in result.stdout
+    assert "cached_input_tokens_per_second" not in result.stdout
+    assert "output_tokens_per_second" not in result.stdout
+
+
+@pytest.mark.parametrize("live_count", [0, 17])
+def test_server_stats_cli_json(servicer, set_env_client, live_count):
+    servicer.app_functions["fu-server"] = api_pb2.FunctionData(is_server=True)
+    since = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 18, 13, tzinfo=timezone.utc)
+    response = api_pb2.ServerGetTimeRangeStatsResponse(
+        request_count=1,
+        request_count_by_status_code=[
+            api_pb2.ServerGetTimeRangeStatsResponse.ServerStatusCodeCount(status_code=200, count=1)
+        ],
+        request_rate_per_second=1 / 3600,
+        container_total_count=live_count,
+        container_started_count=4,
+        container_error_count=5,
+        container_creating_at_end_count=6,
+        request_percentile_stats={
+            "Request latency 2xx (s)": _stats_distribution("seconds", 1.0, 2.0, 3.0),
+        },
+        inference=api_pb2.ServerGetTimeRangeStatsResponse.ServerInferenceStats(
+            engine=api_pb2.LLM_ENGINE_VLLM,
+            status=api_pb2.SERVER_INFERENCE_STATS_STATUS_NO_DATA,
+        ),
+    )
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("ServerGetTimeRangeStats", response)
+        result = run_cli_command(
+            [
+                "server",
+                "stats",
+                "fu-server",
+                "--since",
+                since.isoformat(),
+                "--until",
+                until.isoformat(),
+                "--json",
+            ]
+        )
+
+    payload = json.loads(result.stdout)
+    assert payload["object_id"] == "fu-server"
+    assert payload["request_count_by_status_code"] == {"2xx": 1}
+    assert payload["container_total_count"] == live_count
+    assert payload["container_started_count"] == 4
+    assert payload["container_error_count"] == 5
+    assert payload["container_creating_at_end_count"] == 6
+    assert payload["request_percentile_stats"]["Request latency 2xx (s)"]["percentiles"] == {
+        "p50": 1.0,
+        "p90": 2.0,
+        "p99": 3.0,
+    }
+    assert payload["inference"] == {
+        "engine": "vllm",
+        "status": "no_data",
+        "percentile_stats": {},
+        "scalar_stats": {},
+    }
+
+
+def test_server_stats_cli_json_preserves_unknown_inference_enums(servicer, set_env_client):
+    servicer.app_functions["fu-server"] = api_pb2.FunctionData(is_server=True)
+    since = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 18, 13, tzinfo=timezone.utc)
+    response = api_pb2.ServerGetTimeRangeStatsResponse(
+        inference=api_pb2.ServerGetTimeRangeStatsResponse.ServerInferenceStats(
+            engine=cast(api_pb2.LLMEngine.ValueType, 123),
+            status=cast(api_pb2.ServerInferenceStatsStatus.ValueType, 456),
+        )
+    )
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("ServerGetTimeRangeStats", response)
+        result = run_cli_command(
+            [
+                "server",
+                "stats",
+                "fu-server",
+                "--since",
+                since.isoformat(),
+                "--until",
+                until.isoformat(),
+                "--json",
+            ]
+        )
+
+    assert json.loads(result.stdout)["inference"] == {
+        "engine": "unrecognized",
+        "status": "unrecognized",
+        "percentile_stats": {},
+        "scalar_stats": {},
+    }
+
+
+def test_server_stats_cli_filters_by_container(servicer, set_env_client):
+    servicer.app_functions["fu-server"] = api_pb2.FunctionData(is_server=True)
+    since = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 18, 13, tzinfo=timezone.utc)
+    response = api_pb2.ServerGetTimeRangeStatsResponse()
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("ServerGetTimeRangeStats", response)
+        run_cli_command(
+            [
+                "server",
+                "stats",
+                "fu-server",
+                "--since",
+                since.isoformat(),
+                "--until",
+                until.isoformat(),
+                "--container-id",
+                "ta-01M1CY4EK24B8MM10ZD2H7VE2R",
+            ]
+        )
+
+    request = ctx.pop_request("ServerGetTimeRangeStats")
+    assert request.HasField("container_id")
+    assert request.container_id == "ta-01M1CY4EK24B8MM10ZD2H7VE2R"
+
+
+def test_server_stats_cli_inference_status(servicer, set_env_client):
+    servicer.app_functions["fu-server"] = api_pb2.FunctionData(is_server=True)
+    since = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 18, 13, tzinfo=timezone.utc)
+    response = api_pb2.ServerGetTimeRangeStatsResponse(
+        inference=api_pb2.ServerGetTimeRangeStatsResponse.ServerInferenceStats(
+            engine=api_pb2.LLM_ENGINE_VLLM,
+            status=api_pb2.SERVER_INFERENCE_STATS_STATUS_UNAVAILABLE,
+        )
+    )
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+
+    with servicer.intercept() as ctx:
+        ctx.add_response("ServerGetTimeRangeStats", response)
+        result = run_cli_command(
+            [
+                "server",
+                "stats",
+                "fu-server",
+                "--since",
+                since.isoformat(),
+                "--until",
+                until.isoformat(),
+            ]
+        )
+
+    assert "Inference · vLLM" in result.stdout
+    assert "Inference metrics are temporarily unavailable." in result.stdout
+
+
+def test_server_stats_cli_rejects_invalid_identifier(set_env_client):
+    run_cli_command(
+        ["server", "stats", "my-server"],
+        expected_exit_code=2,
+        expected_stderr="SERVER must be a Function ID.*deployed Server name.*APP_NAME/SERVER_NAME",
+    )
+
+
+def test_server_stats_cli_nonexistent_id(servicer, set_env_client):
+    run_cli_command(
+        ["server", "stats", "fu-doesnotexist"],
+        expected_exit_code=1,
+        expected_error="Function not found",
+    )
+
+
+def test_function_stats_cli_relative_since(servicer, set_env_client):
+    servicer.app_functions["fu-test"] = api_pb2.FunctionData(is_server=False)
+    until = datetime(2026, 8, 18, 13, tzinfo=timezone.utc)
+    since = until - timedelta(minutes=30)
+    response = api_pb2.FunctionGetTimeRangeStatsResponse()
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+
+    before = datetime.now(timezone.utc)
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGetTimeRangeStats", response)
+        result = run_cli_command(
+            [
+                "function",
+                "stats",
+                "fu-test",
+                "--since",
+                "30m",
+            ]
+        )
+    after = datetime.now(timezone.utc)
+
+    request = ctx.pop_request("FunctionGetTimeRangeStats")
+    requested_since = request.since.ToDatetime(tzinfo=timezone.utc)
+    requested_until = request.until.ToDatetime(tzinfo=timezone.utc)
+    assert before - timedelta(minutes=30) <= requested_since <= after - timedelta(minutes=30)
+    assert before <= requested_until <= after
+    assert not request.rollup
+    assert ctx.get_requests("FunctionGetCurrentStats") == []
+    assert "Duration 0:30:00 · 2026-08-18 12:30:00 to 2026-08-18 13:00:00 UTC" in result.stdout
+
+
+@pytest.mark.parametrize("option", ["--since", "--until"])
+def test_function_stats_cli_rejects_invalid_time_options(option):
+    run_cli_command(
+        ["function", "stats", "fu-test", option, "tomorrow-ish"],
+        expected_exit_code=2,
+        expected_stderr="Use a relative duration",
+    )
+
+
+def test_server_info_cli(set_env_client, mock_dir, servicer):
+    test_app_file = textwrap.dedent("""\
+    import modal
+
+    app = modal.App("test-server-info")
+
+
+    @app.server(
+        cpu=(2, 16),
+        memory=(4 << 10, 32 << 10),
+        ephemeral_disk=512 << 10,
+        cloud="gcp",
+        compute_region=["apac"],
+        nonpreemptible=True,
+        target_concurrency=5.2,
+        port=5432,
+        h2_enabled=True,
+    )
+    class Server:
+        @modal.enter()
+        def enter(self):
+            pass
+
+    """)
+
+    with mock_dir({"test_server_info_app.py": test_app_file}):
+        run_cli_command(["deploy", "test_server_info_app.py"])
+
+        json_output = run_cli_command(["server", "info", "test-server-info/Server", "--json"])
+        loaded = json.loads(json_output.stdout)
+        assert loaded["cpu"] == [2.0, 16.0]
+        assert loaded["memory_mib"] == 32 * 1024
+        assert loaded["ephemeral_disk_mib"] == 512 * 1024
+        assert loaded["cloud"] == "gcp"
+        assert loaded["compute_regions"] == ["apac"]
+        assert loaded["nonpreemptible"]
+
+        human_output = run_cli_command(["server", "info", "test-server-info/Server"])
+        deformatted = re.sub(r"\s+", " ", human_output.stdout)
+
+        assert "Object ID: fu-1" in deformatted
+        assert "App ID: ap-1" in deformatted
+        assert "Resources:" in deformatted
+        assert "CPU: 2.0 - 16.0 core(s)" in deformatted
+        assert "Memory: 32.0 GiB" in deformatted
+        assert "Ephemeral Disk: 512.0 GiB" in deformatted
+        assert "GPU(s): -" in deformatted
+        assert "Scheduling:" in deformatted
+        assert "Compute Region(s): apac" in deformatted
+        assert "Nonpreemptible Capacity: Enabled" in deformatted
+        assert "Cloud Provider: gcp" in deformatted
+        assert "Autoscaling:" in deformatted
+        assert "Min/Max/Buffer Containers: - / - / -" in deformatted
+        assert "Scaledown Window: -" in deformatted
+
+        # check that referring by function ID also works:
+        fn_id_json_res = run_cli_command(["server", "info", "fu-1", "--json"])
+        assert loaded == json.loads(fn_id_json_res.stdout)
+
+        fn_id_human_res = run_cli_command(["server", "info", "fu-1"])
+        assert human_output.stdout == fn_id_human_res.stdout
+
+
+def test_function_info_cli(set_env_client, mock_dir, servicer):
+    test_app_file = textwrap.dedent("""\
+    import time
+
+    import modal
+
+    app = modal.App("test-function-info")
+
+
+    @app.function(
+        cpu=(2, 16),
+        memory=(4 << 10, 32 << 10),
+        gpu=["H100:8", "B200:8"],
+        ephemeral_disk=512 << 10,
+        timeout=600,
+        cloud="aws",
+        region=["us", "eu"],
+    )
+    @modal.clustered(size=10, rdma=True)
+    def do_stuff(x: float):
+        start = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - start
+            if elapsed > 500:
+                return x**2
+
+            x += 0.0001
+
+    """)
+
+    with mock_dir({"test_function_info_app.py": test_app_file}):
+        run_cli_command(["deploy", "test_function_info_app.py"])
+
+        json_output = run_cli_command(["function", "info", "test-function-info/do_stuff", "--json"])
+        loaded = json.loads(json_output.stdout)
+        assert loaded["cpu"] == [2.0, 16.0]
+        assert loaded["memory_mib"] == 32 * 1024
+        assert loaded["ephemeral_disk_mib"] == 512 * 1024
+        assert loaded["cloud"] == "aws"
+        assert loaded["regions"] == ["us", "eu"]
+        assert not loaded["nonpreemptible"]
+        assert loaded["cluster_info"] is not None
+        assert not loaded["block_network"]
+        assert not loaded["single_use_containers"]
+        assert not loaded["restrict_modal_access"]
+
+        human_output = run_cli_command(["function", "info", "test-function-info/do_stuff"])
+        deformatted = re.sub(r"\s+", " ", human_output.stdout)
+
+        assert "Object ID: fu-1" in deformatted
+        assert "App ID: ap-1" in deformatted
+        assert "Resources:" in deformatted
+        assert "CPU: 2.0 - 16.0 core(s)" in deformatted
+        assert "Memory: 32.0 GiB" in deformatted
+        assert "Ephemeral Disk: 512.0 GiB" in deformatted
+        assert "GPU(s): H100 x 8 | B200 x 8" in deformatted
+        assert "Scheduling:" in deformatted
+        assert "Compute Region(s): us | eu" in deformatted
+        assert "Nonpreemptible Capacity: -" in deformatted
+        assert "Cloud Provider: aws" in deformatted
+        assert "Routing Region: -" in deformatted
+        assert "Autoscaling:" in deformatted
+        assert "Min/Max/Buffer Containers: - / - / -" in deformatted
+        assert "Scaledown Window: -" in deformatted
+        assert "Security:" in deformatted
+        assert "Outbound Networking: Enabled" in deformatted
+        assert "Modal API Access: Enabled" in deformatted
+        assert "Container Reuse: Enabled" in deformatted
+        assert "Clustering:" in deformatted
+        assert "Cluster Size: 10" in deformatted
+        assert "RDMA: Enabled" in deformatted
+
+        # check that referring by function ID also works:
+        fn_id_json_res = run_cli_command(["function", "info", "fu-1", "--json"])
+        assert loaded == json.loads(fn_id_json_res.stdout)
+
+        fn_id_human_res = run_cli_command(["function", "info", "fu-1"])
+        assert human_output.stdout == fn_id_human_res.stdout
+
+
+_CLI_HELP_LAYOUT: dict[str, dict[str, list[str]]] = {
+    "app": {
+        "Management": ["list", "rollover", "rollback", "stop"],
+        "Inspection": ["info", "history", "logs", "stats", "dashboard"],
+    },
+    "container": {"Commands": ["list", "logs", "exec", "stop"]},
+    "endpoint": {
+        "Management": ["list", "create", "stop"],
+        "Inspection": ["library", "info", "logs", "stats"],
+    },
+    "function": {"Commands": ["info", "logs", "stats", "calls", "variants", "autoscaler", "metrics"]},
+    "server": {"Commands": ["deploy", "info", "logs", "stats", "requests", "autoscaler", "metrics"]},
+    "image": {"Commands": ["build", "pull", "logs", "names"]},
+    "image names": {"Commands": ["list", "delete"]},
+    "dict": {
+        "Management": ["list", "create", "clear", "delete"],
+        "Inspection": ["get", "items"],
+    },
+    "nfs": {
+        "Management": ["list", "create", "delete"],
+        "File operations": ["ls", "get", "put", "rm"],
+    },
+    "secret": {"Commands": ["list", "create", "delete"]},
+    "queue": {
+        "Management": ["list", "create", "clear", "delete"],
+        "Inspection": ["peek", "len"],
+    },
+    "volume": {
+        "Management": ["list", "create", "rename", "dashboard", "delete"],
+        "File operations": ["ls", "get", "put", "cp", "rm"],
+    },
+    "workspace": {"Commands": ["members", "audit-logs", "proxy-tokens", "settings", "service-users", "member-tokens"]},
+    "workspace members": {"Commands": ["list"]},
+    "workspace proxy-tokens": {"Commands": ["list", "create", "update", "allow", "revoke", "delete"]},
+    "workspace settings": {"Commands": ["list", "set"]},
+    "workspace member-tokens": {"Commands": ["list", "delete", "disable", "enable"]},
+    "workspace service-users": {"Commands": ["create", "list", "delete", "info", "set-role"]},
+    "environment": {
+        "Management": ["list", "create", "update", "delete", "roles"],
+        "Inspection": ["billing"],
+    },
+    "environment roles": {"Commands": ["list", "update"]},
+    "environment billing": {"Commands": ["summary", "report"]},
+    "profile": {"Commands": ["list", "current", "activate"]},
+    "config": {"Commands": ["show", "set-environment"]},
+    "token": {"Commands": ["info", "new", "rotate", "set"]},
+    "skills": {"Commands": ["install", "update", "show"]},
+    "billing": {"Commands": ["summary", "report", "rates"]},
+}
+
+
+@pytest.mark.parametrize("group_path", list(_CLI_HELP_LAYOUT))
+def test_cli_help_subcommand_layout(group_path):
+    import click
+
+    from modal.cli._help import group_commands_by_panel
+    from modal.cli.entry_point import entrypoint_cli
+
+    group = entrypoint_cli
+    for name in group_path.split():
+        group = group.commands[name]  # type: ignore
+    assert isinstance(group, click.Group)
+
+    layout = {panel: [name for name, _ in items] for panel, items in group_commands_by_panel(group).items()}
+    assert layout == _CLI_HELP_LAYOUT[group_path]
+    # Dict equality ignores key order, but panel order is part of the layout.
+    assert list(layout) == list(_CLI_HELP_LAYOUT[group_path])
+
+
+def test_cli_help_top_level_commands_order():
+    from modal.cli._help import group_commands_by_panel
+    from modal.cli.entry_point import entrypoint_cli
+
+    commands = [name for name, _ in group_commands_by_panel(entrypoint_cli)["Commands"]]
+    assert commands == ["run", "serve", "deploy", "shell", "curl"]
+
+
+def test_function_autoscaler(set_env_client, mock_dir):
+    test_app_file = textwrap.dedent("""\
+    import time
+
+    import modal
+
+    app = modal.App("test-function-autoscaler")
+
+
+    @app.function(
+        min_containers=2,
+        buffer_containers=3,
+        max_containers=4,
+        scaledown_window=90,
+    )
+    def do_stuff():
+        pass
+
+    """)
+
+    with mock_dir({"test_function_autoscaler.py": test_app_file}):
+        run_cli_command(["deploy", "test_function_autoscaler.py"])
+
+        json_output = run_cli_command(
+            ["function", "autoscaler", "settings", "test-function-autoscaler/do_stuff", "--json"]
+        )
+        loaded = json.loads(json_output.stdout)
+
+        assert loaded["current_settings"] == {
+            "min_containers": 2,
+            "max_containers": 4,
+            "buffer_containers": 3,
+            "scaledown_window": 90,
+        }
+
+        human_output = run_cli_command(["function", "autoscaler", "settings", "test-function-autoscaler/do_stuff"])
+        deformatted = re.sub(r"\s+", " ", human_output.stdout)
+
+        assert "Min Containers 2" in deformatted
+        assert "Max Containers 4" in deformatted
+        assert "Buffer Containers 3" in deformatted
+        assert "Scaledown Window 90 seconds" in deformatted
+
+        for input, error in [
+            (("--scaledown-window", "1.5"), "Invalid input for '--scaledown-window': '1.5' must be an integer."),
+            (("--max-containers", "5"), None),
+            (("--min-containers", "3"), None),
+            (("--buffer-containers", "4", "--scaledown-window", "45"), None),
+        ]:
+            exit_code = 0
+            if error:
+                exit_code = 2
+
+            res = run_cli_command(
+                ["function", "autoscaler", "update", "test-function-autoscaler/do_stuff", *input],
+                expected_exit_code=exit_code,
+            )
+
+            if error:
+                assert error in res.stderr
+
+        json_output = run_cli_command(
+            ["function", "autoscaler", "settings", "test-function-autoscaler/do_stuff", "--json"]
+        )
+        loaded = json.loads(json_output.stdout)
+
+        assert loaded["current_settings"] == {
+            "min_containers": 3,
+            "max_containers": 5,
+            "scaledown_window": 45,
+            "buffer_containers": 4,
+        }
+
+
+def test_server_autoscaler(set_env_client, mock_dir, servicer):
+    test_app_file = textwrap.dedent("""\
+    import modal
+
+    app = modal.App("test-server-autoscaler")
+
+
+    @app.server(
+        min_containers=2,
+        buffer_containers=3,
+        max_containers=4,
+        scaleup_window=15,
+        scaledown_window=90,
+        target_concurrency=5.2,
+    )
+    class MyServer:
+        @modal.enter()
+        def enter(self):
+            pass
+
+    """)
+
+    with mock_dir({"test_server_autoscaler.py": test_app_file}):
+        run_cli_command(["deploy", "test_server_autoscaler.py"])
+
+        json_output = run_cli_command(["server", "autoscaler", "settings", "test-server-autoscaler/MyServer", "--json"])
+        loaded = json.loads(json_output.stdout)
+
+        assert loaded["current_settings"] == {
+            "min_containers": 2,
+            "max_containers": 4,
+            "buffer_containers": 3,
+            "scaledown_window": 90,
+            "scaleup_window": 15,
+            "target_concurrency": 5.2,
+        }
+
+        human_output = run_cli_command(["server", "autoscaler", "settings", "test-server-autoscaler/MyServer"])
+        deformatted = re.sub(r"\s+", " ", human_output.stdout)
+
+        assert "Min Containers 2" in deformatted
+        assert "Max Containers 4" in deformatted
+        assert "Buffer Containers 3" in deformatted
+        assert "Scaledown Window 90 seconds" in deformatted
+        assert "Scaleup Window 15 seconds" in deformatted
+        assert "Target Concurrency 5.2 requests/container" in deformatted
+
+        for input, error in [
+            (("--scaledown-window", "1.5"), "Invalid input for '--scaledown-window': '1.5' must be an integer."),
+            (("--target-concurrency", "1.5"), None),
+            (
+                ("--target-concurrency", "1.5.6"),
+                "Error: Invalid input for '--target-concurrency': '1.5.6' must be a positive float "
+                'or the string "none"',
+            ),
+            (("--max-containers", "5"), None),
+            (("--min-containers", "3"), None),
+            (("--buffer-containers", "4", "--scaledown-window", "45", "--scaleup-window", "15"), None),
+        ]:
+            exit_code = 0
+            if error:
+                exit_code = 2
+
+            res = run_cli_command(
+                ["server", "autoscaler", "update", "test-server-autoscaler/MyServer", *input],
+                expected_exit_code=exit_code,
+            )
+
+            if error:
+                assert error in res.stderr
+
+        json_output = run_cli_command(["server", "autoscaler", "settings", "test-server-autoscaler/MyServer", "--json"])
+        loaded = json.loads(json_output.stdout)
+
+        assert loaded["current_settings"] == {
+            "target_concurrency": 1.5,
+            "min_containers": 3,
+            "max_containers": 5,
+            "buffer_containers": 4,
+            "scaleup_window": 15,
+            "scaledown_window": 45,
+        }
+
+        run_cli_command(
+            ["server", "autoscaler", "update", "test-server-autoscaler/MyServer", "--target-concurrency", "none"]
+        )
+
+        json_output = run_cli_command(["server", "autoscaler", "settings", "test-server-autoscaler/MyServer", "--json"])
+        loaded = json.loads(json_output.stdout)
+
+        assert loaded["current_settings"] == {
+            "target_concurrency": None,
+            "min_containers": 3,
+            "max_containers": 5,
+            "buffer_containers": 4,
+            "scaleup_window": 15,
+            "scaledown_window": 45,
+        }
+
+
+def test_cli_does_not_import_aiohttp():
+    # aiohttp adds ~100ms to startup, so the CLI should only import it when a command needs it.
+    # Runs in a subprocess because the test suite itself imports aiohttp.
+    code = "import sys, modal.__main__; assert 'aiohttp' not in sys.modules"
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def _deployed_server_def(servicer):
+    """The single Function definition recorded by a `modal server deploy` run."""
+    assert len(servicer.app_functions) == 1
+    return next(iter(servicer.app_functions.values()))
+
+
+def _deployed_server_image_commands(servicer) -> list[str]:
+    """Dockerfile commands of the deployed Server's Image, oldest layer first."""
+    commands: list[str] = []
+    image_id = _deployed_server_def(servicer).image_id
+    while image_id:
+        image = servicer.images[image_id]
+        commands = list(image.dockerfile_commands) + commands
+        image_id = image.base_images[0].image_id if image.base_images else ""
+    return commands
+
+
+def test_server_deploy_runs_the_image_cmd(servicer, set_env_client):
+    run_cli_command(["server", "deploy", "--image", "docker.io/nginx", "--port", "80"])
+
+    function_def = _deployed_server_def(servicer)
+    # The App holds a single Server, which always carries this name.
+    assert function_def.function_name == "Server"
+    assert function_def.http_config.port == 80
+    # Lift and shift runs the Image's own ENTRYPOINT and CMD, which are left untouched.
+    assert function_def.http_config.HasField("lift_and_shift_config")
+    dockerfile_commands = _deployed_server_image_commands(servicer)
+    assert not any(command.startswith(("ENTRYPOINT", "CMD")) for command in dockerfile_commands)
+    # The placeholder class carries no behavior and none of it reaches the container.
+    assert function_def.function_serialized == b""
+    assert function_def.class_serialized == b""
+    assert servicer.app_state_history["ap-1"] == [api_pb2.APP_STATE_INITIALIZING, api_pb2.APP_STATE_DEPLOYED]
+
+
+@pytest.mark.parametrize(
+    "image_ref, app_name",
+    [
+        ("docker.io/nginx", "nginx"),
+        ("ghcr.io/org/api:v2", "api"),
+        ("my-registry.com:5000/team/api@sha256:" + "0" * 64, "api"),
+        ("my-image:v1", "my-image"),
+        ("prod/my-image:v1", "my-image"),
+    ],
+)
+def test_server_deploy_infers_app_name(servicer, set_env_client, image_ref, app_name):
+    servicer.image_tags["my-image:v1"] = servicer.image_tags["prod/my-image:v1"] = "im-named"
+    servicer.images["im-named"] = api_pb2.Image()
+
+    run_cli_command(["server", "deploy", "--image", image_ref, "--port", "80"])
+
+    assert [name for _, name in servicer.deployed_apps] == [app_name]
+
+
+def test_server_deploy_app_name(servicer, set_env_client):
+    run_cli_command(["server", "deploy", "--app-name", "my-app", "--image", "docker.io/nginx", "--port", "80"])
+
+    assert [name for _, name in servicer.deployed_apps] == ["my-app"]
+
+
+def test_server_deploy_existing_app_requires_confirmation(servicer, set_env_client):
+    args = ["server", "deploy", "--image", "docker.io/nginx", "--port", "80"]
+    run_cli_command(args)
+    deployed_states = list(servicer.app_state_history["ap-1"])
+
+    res = run_cli_command(args, expected_exit_code=1, expected_stderr=None)
+
+    assert (
+        "App 'nginx' is already deployed. Redeploying replaces everything in it with this Server."
+        " Pass --app-name to deploy under a different name. Do you want to redeploy it?"
+    ) in res.stdout
+    assert "no interactive terminal detected. Rerun with --yes (-y)" in str(res.exception)
+    assert servicer.app_state_history["ap-1"] == deployed_states
+
+
+def test_server_deploy_existing_app_confirmed(servicer, set_env_client):
+    args = ["server", "deploy", "--image", "docker.io/nginx", "--port", "80"]
+    run_cli_command(args)
+    deployed_states = list(servicer.app_state_history["ap-1"])
+
+    with mock.patch("modal.cli.server.confirm_or_suggest_yes") as confirm:
+        run_cli_command(args)
+
+    confirm.assert_called_once_with(
+        "App 'nginx' is already deployed. Redeploying replaces everything in it with this Server."
+        " Pass --app-name to deploy under a different name. Do you want to redeploy it?"
+    )
+    assert len(servicer.app_state_history["ap-1"]) > len(deployed_states)
+
+
+def test_server_deploy_existing_app_with_explicit_name_omits_hint(servicer, set_env_client):
+    args = ["server", "deploy", "--image", "docker.io/nginx", "--port", "80", "--app-name", "web"]
+    run_cli_command(args)
+
+    res = run_cli_command(args, expected_exit_code=1, expected_stderr=None)
+
+    assert (
+        "App 'web' is already deployed. Redeploying replaces everything in it with this Server."
+        " Do you want to redeploy it?"
+    ) in res.stdout
+
+
+def test_server_deploy_yes_skips_confirmation(servicer, set_env_client):
+    args = ["server", "deploy", "--image", "docker.io/nginx", "--port", "80"]
+    run_cli_command(args)
+    deployed_states = list(servicer.app_state_history["ap-1"])
+
+    with mock.patch("modal.cli.server.confirm_or_suggest_yes") as confirm:
+        run_cli_command([*args, "--yes"])
+
+    confirm.assert_not_called()
+    assert len(servicer.app_state_history["ap-1"]) > len(deployed_states)
+
+
+def test_server_deploy_force_build(servicer, set_env_client):
+    run_cli_command(["server", "deploy", "--image", "docker.io/nginx", "--port", "80", "--force-build"])
+
+    assert servicer.force_built_images == [_deployed_server_def(servicer).image_id]
+
+
+def test_server_deploy_force_build_rejects_published_image(servicer, set_env_client):
+    servicer.image_tags["my-image:v1"] = "im-named"
+    servicer.images["im-named"] = api_pb2.Image()
+
+    res = run_cli_command(
+        ["server", "deploy", "--image", "my-image:v1", "--port", "80", "--force-build"],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "Invalid value for --force-build" in res.stderr
+
+
+def test_server_deploy_cmd(servicer, set_env_client):
+    run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "docker.io/python:3.12",
+            "--port",
+            "8000",
+            "--cmd",
+            "python -m http.server 8000 --bind '0.0.0.0'",
+        ]
+    )
+
+    dockerfile_commands = _deployed_server_image_commands(servicer)
+    assert dockerfile_commands[-1] == 'CMD ["python", "-m", "http.server", "8000", "--bind", "0.0.0.0"]'
+
+
+def test_server_deploy_entrypoint(servicer, set_env_client):
+    run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "docker.io/python:3.12",
+            "--port",
+            "8000",
+            "--entrypoint",
+            "python -m",
+            "--cmd",
+            "http.server 8000",
+        ]
+    )
+
+    dockerfile_commands = _deployed_server_image_commands(servicer)
+    # CMD follows ENTRYPOINT, since an ENTRYPOINT instruction resets any CMD before it.
+    assert [c for c in dockerfile_commands if c.startswith(("ENTRYPOINT", "CMD"))] == [
+        'ENTRYPOINT ["python", "-m"]',
+        'CMD ["http.server", "8000"]',
+    ]
+
+
+@pytest.mark.parametrize(
+    "image_ref, image_tag",
+    [("my-image", "my-image:latest"), ("my-image:v1", "my-image:v1"), ("prod/my-image:v1", "prod/my-image:v1")],
+)
+def test_server_deploy_named_image(servicer, set_env_client, image_ref, image_tag):
+    servicer.image_tags[image_tag] = "im-named"
+    servicer.images["im-named"] = api_pb2.Image()
+
+    run_cli_command(["server", "deploy", "--image", image_ref, "--port", "80"])
+
+    function_def = _deployed_server_def(servicer)
+    assert function_def.image_id == "im-named"
+    assert function_def.http_config.HasField("lift_and_shift_config")
+
+
+@pytest.mark.parametrize("image_ref", ["nginx", "library/nginx", "docker.io/", "localhost:5000/"])
+def test_server_deploy_unknown_image(servicer, set_env_client, image_ref):
+    res = run_cli_command(
+        ["server", "deploy", "--image", image_ref, "--port", "80"],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "is not a published Modal Image or a registry reference" in res.stderr
+
+
+def test_server_deploy_named_image_takes_precedence_over_registry(servicer, set_env_client):
+    servicer.image_tags["my.env/my-image:latest"] = "im-named"
+    servicer.images["im-named"] = api_pb2.Image()
+
+    run_cli_command(["server", "deploy", "--image", "my.env/my-image", "--port", "80"])
+
+    assert _deployed_server_def(servicer).image_id == "im-named"
+
+
+@pytest.mark.parametrize("image_tag", ["docker.io/nginx", "ghcr.io/org/api:v2"])
+def test_server_deploy_accepts_registry_qualified_images(servicer, set_env_client, image_tag):
+    run_cli_command(["server", "deploy", "--image", image_tag, "--port", "80"])
+
+    assert _deployed_server_def(servicer).http_config.port == 80
+
+
+@pytest.mark.parametrize("missing_option", ["--image", "--port"])
+def test_server_deploy_requires_image_and_port(servicer, set_env_client, missing_option):
+    options = {"--image": "docker.io/nginx", "--port": "80"}
+    del options[missing_option]
+    args = [arg for option, value in options.items() for arg in (option, value)]
+
+    res = run_cli_command(["server", "deploy", *args], expected_exit_code=2, expected_stderr=None)
+    assert f"Missing option '{missing_option}'" in res.stderr
+
+
+def test_server_deploy_passes_through_resources(servicer, set_env_client):
+    run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "my-registry.com/api:v2",
+            "--port",
+            "8000",
+            "--gpu",
+            "A100",
+            "--cpu",
+            "2",
+            "--memory",
+            "4096",
+            "--env-var",
+            "LOG_LEVEL=debug",
+            "--min-containers",
+            "1",
+            "--max-containers",
+            "5",
+            "--buffer-containers",
+            "2",
+            "--scaleup-window",
+            "10",
+            "--scaledown-window",
+            "120",
+            "--target-concurrency",
+            "1.5",
+            "--max-concurrency",
+            "4",
+            "--exit-grace-period",
+            "20",
+            "--unauthenticated",
+        ]
+    )
+
+    function_def = _deployed_server_def(servicer)
+    assert function_def.http_config.port == 8000
+    assert function_def.http_config.unauthenticated
+    assert function_def.http_config.exit_grace_period == 20
+    assert function_def.resources.gpu_config.gpu_type == "A100"
+    assert function_def.resources.milli_cpu == 2000
+    assert function_def.resources.memory_mb == 4096
+    assert function_def.autoscaler_settings.min_containers == 1
+    assert function_def.autoscaler_settings.max_containers == 5
+    assert function_def.autoscaler_settings.buffer_containers == 2
+    assert function_def.autoscaler_settings.scaleup_window == 10
+    assert function_def.autoscaler_settings.scaledown_window == 120
+    assert function_def.autoscaler_settings.target_concurrency_float == 1.5
+    assert function_def.max_concurrent_inputs == 4
+
+
+def test_server_deploy_gpu_fallbacks(servicer, set_env_client):
+    run_cli_command(
+        ["server", "deploy", "--image", "docker.io/nginx", "--port", "80", "--gpu", "H100:2, A100"],
+    )
+
+    function_data = _deployed_server_def(servicer)
+    gpus = [
+        (ranked.rank, ranked.function.resources.gpu_config.gpu_type, ranked.function.resources.gpu_config.count)
+        for ranked in function_data.ranked_functions
+    ]
+    assert gpus == [(0, "H100", 2), (1, "A100", 1)]
+
+
+@pytest.mark.parametrize("gpu", ["H100,", ",A100", "H100,,A100"])
+def test_server_deploy_rejects_empty_gpu_entries(servicer, set_env_client, gpu):
+    with servicer.intercept() as ctx:
+        res = run_cli_command(
+            ["server", "deploy", "--image", "docker.io/nginx", "--port", "80", "--gpu", gpu],
+            expected_exit_code=2,
+            expected_stderr=None,
+        )
+    assert "no empty entries" in res.stderr
+    assert ctx.calls == []
+
+
+def test_server_deploy_cpu_and_memory_limits(servicer, set_env_client):
+    run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "docker.io/nginx",
+            "--port",
+            "80",
+            "--cpu",
+            "0.5,4",
+            "--memory",
+            "4096, 8192",
+        ]
+    )
+
+    resources = _deployed_server_def(servicer).resources
+    assert (resources.milli_cpu, resources.milli_cpu_max) == (500, 4000)
+    assert (resources.memory_mb, resources.memory_mb_max) == (4096, 8192)
+
+
+def test_server_deploy_none_values(servicer, set_env_client):
+    run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "docker.io/nginx",
+            "--port",
+            "80",
+            "--target-concurrency",
+            "none",
+            "--max-concurrency",
+            "None",
+            "--max-containers",
+            "none",
+        ]
+    )
+
+    function_def = _deployed_server_def(servicer)
+    assert function_def.autoscaler_settings.HasField("target_concurrency_float")
+    assert function_def.autoscaler_settings.target_concurrency_float == 0
+    assert function_def.max_concurrent_inputs == 0
+    assert not function_def.autoscaler_settings.HasField("max_containers")
+
+
+def test_server_deploy_env_var_splits_on_first_equals(servicer, set_env_client):
+    run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "docker.io/nginx",
+            "--port",
+            "80",
+            "--env-var",
+            "DATABASE_URL=postgres://db?sslmode=require",
+            "--env-var",
+            "EMPTY=",
+        ]
+    )
+
+    function_def = _deployed_server_def(servicer)
+    assert [servicer.secrets[secret_id] for secret_id in function_def.secret_ids] == [
+        {"DATABASE_URL": "postgres://db?sslmode=require", "EMPTY": ""}
+    ]
+
+
+def test_server_deploy_bad_env_var(servicer, set_env_client):
+    res = run_cli_command(
+        ["server", "deploy", "--image", "docker.io/nginx", "--port", "80", "--env-var", "NOPE"],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "KEY=VALUE" in res.stderr
+
+
+def test_server_deploy_secret_from_env(servicer, set_env_client, monkeypatch):
+    monkeypatch.setenv("API_KEY", "abc")
+    monkeypatch.setenv("API_TOKEN", "xyz")
+
+    run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "docker.io/nginx",
+            "--port",
+            "80",
+            "--secret-from-env",
+            "API_KEY,API_TOKEN",
+        ]
+    )
+
+    secret_ids = _deployed_server_def(servicer).secret_ids
+    assert [servicer.secrets[secret_id] for secret_id in secret_ids] == [{"API_KEY": "abc", "API_TOKEN": "xyz"}]
+
+
+def test_server_deploy_secret_from_env_missing(servicer, set_env_client, monkeypatch):
+    monkeypatch.delenv("MISSING", raising=False)
+
+    res = run_cli_command(
+        ["server", "deploy", "--image", "docker.io/nginx", "--port", "80", "--secret-from-env", "MISSING"],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "not set in the local environment: MISSING" in res.stderr
+
+
+def test_server_deploy_registry_secret(servicer, set_env_client, client):
+    modal.Secret.objects.create("registry-creds", {"REGISTRY_USERNAME": "u", "REGISTRY_PASSWORD": "p"}, client=client)
+
+    run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "my-registry.com/api:v2",
+            "--port",
+            "80",
+            "--registry-secret",
+            "registry-creds",
+        ]
+    )
+
+    image = servicer.images[_deployed_server_def(servicer).image_id]
+    registry_config = image.image_registry_config
+    assert registry_config.registry_auth_type == api_pb2.REGISTRY_AUTH_TYPE_STATIC_CREDS
+    assert registry_config.secret_id == servicer.deployed_secrets[("registry-creds", "main")]
+
+
+def test_server_deploy_registry_secret_rejects_named_image(servicer, set_env_client):
+    servicer.image_tags["my-image:v1"] = "im-named"
+    servicer.images["im-named"] = api_pb2.Image()
+
+    res = run_cli_command(
+        ["server", "deploy", "--image", "my-image:v1", "--port", "80", "--registry-secret", "creds"],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "only applies to registry images" in res.stderr
+
+
+def test_server_deploy_registry_secret_from_env(servicer, set_env_client, monkeypatch):
+    monkeypatch.setenv("REGISTRY_USERNAME", "u")
+    monkeypatch.setenv("REGISTRY_PASSWORD", "p")
+    monkeypatch.setenv("API_KEY", "abc")
+
+    run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "my-registry.com/api:v2",
+            "--port",
+            "80",
+            "--registry-secret-from-env",
+            "REGISTRY_USERNAME,REGISTRY_PASSWORD",
+            "--secret-from-env",
+            "API_KEY",
+        ]
+    )
+
+    function_def = _deployed_server_def(servicer)
+    registry_config = servicer.images[function_def.image_id].image_registry_config
+    assert registry_config.registry_auth_type == api_pb2.REGISTRY_AUTH_TYPE_STATIC_CREDS
+    assert servicer.secrets[registry_config.secret_id] == {"REGISTRY_USERNAME": "u", "REGISTRY_PASSWORD": "p"}
+    assert [servicer.secrets[secret_id] for secret_id in function_def.secret_ids] == [{"API_KEY": "abc"}]
+
+
+def test_server_deploy_registry_secret_from_env_missing(servicer, set_env_client, monkeypatch):
+    monkeypatch.delenv("MISSING", raising=False)
+
+    res = run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "my-registry.com/api:v2",
+            "--port",
+            "80",
+            "--registry-secret-from-env",
+            "MISSING",
+        ],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "--registry-secret-from-env" in res.stderr
+    assert "not set in the local environment: MISSING" in res.stderr
+
+
+def test_server_deploy_registry_secret_from_env_rejects_named_image(servicer, set_env_client, monkeypatch):
+    monkeypatch.setenv("REGISTRY_USERNAME", "u")
+    servicer.image_tags["my-image:v1"] = "im-named"
+    servicer.images["im-named"] = api_pb2.Image()
+
+    res = run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "my-image:v1",
+            "--port",
+            "80",
+            "--registry-secret-from-env",
+            "REGISTRY_USERNAME",
+        ],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "--registry-secret-from-env" in res.stderr
+    assert "only applies to registry images" in res.stderr
+
+
+def test_server_deploy_registry_secret_flags_are_exclusive(servicer, set_env_client, monkeypatch):
+    monkeypatch.setenv("REGISTRY_USERNAME", "u")
+
+    res = run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "my-registry.com/api:v2",
+            "--port",
+            "80",
+            "--registry-secret",
+            "creds",
+            "--registry-secret-from-env",
+            "REGISTRY_USERNAME",
+        ],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "cannot be used together" in res.stderr
+
+
+_AWS_KEYS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"]
+_BASIC_KEYS = ["REGISTRY_USERNAME", "REGISTRY_PASSWORD"]
+_OIDC_KEYS = ["AWS_ROLE_ARN", "AWS_REGION"]
+_ECR_IMAGE = "123456789012.dkr.ecr.us-east-1.amazonaws.com/api:v2"
+
+
+def test_server_deploy_volumes(servicer, set_env_client, client):
+    modal.Volume.objects.create("my-models", client=client)
+
+    run_cli_command(["server", "deploy", "--image", "docker.io/nginx", "--port", "80", "--volume", "my-models:/models"])
+
+    assert list(_deployed_server_def(servicer).volume_mounts) == [
+        api_pb2.VolumeMount(
+            mount_path="/models",
+            volume_id=servicer.deployed_volumes[("my-models", "main")],
+            allow_background_commits=True,
+        )
+    ]
+
+
+def test_server_deploy_creates_missing_volume(servicer, set_env_client):
+    args = ["server", "deploy", "--image", "docker.io/nginx", "--port", "80"]
+    res = run_cli_command([*args, "--volume", "new-vol:/data"])
+
+    assert "Creating Volume 'new-vol', which does not exist yet." in res.stdout
+    assert list(_deployed_server_def(servicer).volume_mounts) == [
+        api_pb2.VolumeMount(
+            mount_path="/data",
+            volume_id=servicer.deployed_volumes[("new-vol", "main")],
+            allow_background_commits=True,
+        )
+    ]
+
+
+def test_server_deploy_existing_volume_has_no_creation_message(servicer, set_env_client, client):
+    modal.Volume.objects.create("my-models", client=client)
+
+    args = ["server", "deploy", "--image", "docker.io/nginx", "--port", "80"]
+    res = run_cli_command([*args, "--volume", "my-models:/m"])
+
+    assert "Creating Volume" not in res.stdout
+
+
+@pytest.mark.parametrize(
+    "first, second, error",
+    [
+        ("/data", "/data", "more than one Volume is mounted at /data"),
+        ("/data", "/data/", "more than one Volume is mounted at /data"),
+    ],
+)
+def test_server_deploy_rejects_conflicting_volume_mount_paths(servicer, set_env_client, first, second, error):
+    with servicer.intercept() as ctx:
+        res = run_cli_command(
+            [
+                "server",
+                "deploy",
+                "--image",
+                "docker.io/nginx",
+                "--port",
+                "80",
+                "--volume",
+                f"a:{first}",
+                "--volume",
+                f"b:{second}",
+            ],
+            expected_exit_code=2,
+            expected_stderr=None,
+        )
+    assert error in res.stderr
+    assert ctx.calls == []
+
+
+def test_server_deploy_accepts_sibling_volume_mount_paths(servicer, set_env_client):
+    run_cli_command(
+        [
+            "server",
+            "deploy",
+            "--image",
+            "docker.io/nginx",
+            "--port",
+            "80",
+            "--volume",
+            "a:/mnt/stuff",
+            "--volume",
+            "b:/mnt/stuff2",
+        ]
+    )
+
+    function_def = _deployed_server_def(servicer)
+    assert sorted(mount.mount_path for mount in function_def.volume_mounts) == ["/mnt/stuff", "/mnt/stuff2"]
+
+
+@pytest.mark.parametrize("flag", ["--secret-from-env", "--registry-secret-from-env"])
+def test_server_deploy_from_env_requires_keys(servicer, set_env_client, flag):
+    res = run_cli_command(
+        ["server", "deploy", "--image", "docker.io/nginx", "--port", "80", flag, " , "],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "must name at least one environment variable" in res.stderr
+
+
+@pytest.mark.parametrize("volume_spec", ["my-models", "my-models:models", ":/models"])
+def test_server_deploy_bad_volume(servicer, set_env_client, volume_spec):
+    res = run_cli_command(
+        ["server", "deploy", "--image", "docker.io/nginx", "--port", "80", "--volume", volume_spec],
+        expected_exit_code=2,
+        expected_stderr=None,
+    )
+    assert "NAME:/absolute/path" in res.stderr
+
+
+@pytest.mark.parametrize(
+    "bad_option",
+    [
+        ["--env-var", "NOPE"],
+        ["--volume", "my-models"],
+        ["--secret-from-env", "MODAL_TEST_UNSET_VAR"],
+        ["--app-name", ""],
+        ["--app-name", "not a valid name"],
+        ["--target-concurrency", "0"],
+        ["--target-concurrency", "nan"],
+        ["--max-concurrency", "0"],
+        ["--max-containers", "0"],
+        ["--cpu", "4,2"],
+        ["--cpu", "1,2,3"],
+        ["--memory", "0"],
+    ],
+)
+def test_server_deploy_rejects_bad_options_before_contacting_modal(servicer, set_env_client, bad_option):
+    with servicer.intercept() as ctx:
+        run_cli_command(
+            ["server", "deploy", "--image", "my-image:v1", "--port", "80", *bad_option],
+            expected_exit_code=2,
+            expected_stderr=None,
+        )
+
+    assert ctx.calls == []
+
+
+@pytest.mark.parametrize("sessioned", [False, True])
+def test_server_deploy_sessioned(servicer, set_env_client, sessioned):
+    args = ["server", "deploy", "--image", "docker.io/nginx", "--port", "80"]
+    run_cli_command([*args, "--sessioned"] if sessioned else args)
+
+    function_def = _deployed_server_def(servicer)
+    assert function_def.is_sessioned is sessioned
+    assert function_def.http_config.HasField("lift_and_shift_config")
+
+
+def test_service_users_cli(set_env_client):
+    list_output = run_cli_command(["workspace", "service-users", "list", "--json"])
+    list_loaded = json.loads(list_output.stdout)
+    assert isinstance(list_loaded, list)
+    assert len(list_loaded) == 2  # alice-bot and ops-bot
+
+    for i, expiration in zip(
+        range(6),
+        [None, f"{60 * 60 * 24}", f"{60 * 60 * 24}s", f"{60 * 24}m", "24h", "1d"],
+    ):
+        is_json = i % 2 == 1
+
+        command = ["workspace", "service-users", "create", f"test-{i}"]
+        if expiration:
+            command.extend(["--expires-in", expiration])
+        if is_json:
+            command.append("--json")
+
+        create_output = run_cli_command(command)
+
+        if is_json:
+            create_loaded = json.loads(create_output.stdout)
+            assert isinstance(create_loaded, dict)
+
+            assert "token_id" in create_loaded
+            assert "token_secret" in create_loaded
+            assert "expires_at" in create_loaded
+
+            if expiration:
+                assert create_loaded["expires_at"] is not None
+
+            continue
+
+        assert "MODAL_TOKEN_ID=" in create_output.stdout
+        assert "MODAL_TOKEN_SECRET=" in create_output.stdout
+        if expiration:
+            assert ", expiring at " in create_output.stdout
+
+    # failure cases
+    run_cli_command(
+        ["workspace", "service-users", "create", "test-0"],
+        expected_exit_code=1,
+        expected_error="Service user with name 'test-0' already exists",
+    )
+    run_cli_command(
+        ["workspace", "service-users", "create", "test-10", "--expires-in", "-10"],
+        expected_exit_code=2,
+        expected_stderr="Value passed to `--expires-in` must be a positive integer.",
+    )
+    run_cli_command(
+        ["workspace", "service-users", "create", "test-10", "--expires-in", "10y"],
+        expected_exit_code=2,
+        expected_stderr=("Invalid duration:"),
+    )
+    run_cli_command(
+        ["workspace", "service-users", "create", "test-10", "--expires-in", "hello"],
+        expected_exit_code=2,
+        expected_stderr=("Invalid duration:"),
+    )
+
+    expected_lines = [
+        r"alice-bot\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+-",
+        r"ops-bot\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+-",
+        r"test-0\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+-",
+        r"test-1\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+[^\s]+",
+        r"test-2\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+[^\s]+",
+        r"test-3\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+[^\s]+",
+        r"test-4\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+[^\s]+",
+        r"test-5\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+[^\s]+",
+    ]
+
+    list_output = run_cli_command(["workspace", "service-users", "list"])
+    for line in expected_lines:
+        assert re.search(line, list_output.stdout)
+
+    list_output = run_cli_command(["workspace", "service-users", "list", "--json"])
+    list_loaded = json.loads(list_output.stdout)
+    assert isinstance(list_loaded, list)
+    assert len(list_loaded) == 8
+
+    for i in range(3):
+        run_cli_command(["workspace", "service-users", "delete", "-y", f"test-{i}"])
+
+    list_output = run_cli_command(["workspace", "service-users", "list", "--json"])
+    list_loaded = json.loads(list_output.stdout)
+    assert isinstance(list_loaded, list)
+    assert len(list_loaded) == 5
+
+    expected_lines = [
+        r"alice-bot\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+-",
+        r"ops-bot\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+-",
+        r"test-3\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+[^\s]+",
+        r"test-4\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+[^\s]+",
+        r"test-5\s+ak-[a-zA-Z0-9]+\s+[^\s]+\s+[^\s]+",
+    ]
+
+    list_output = run_cli_command(["workspace", "service-users", "list"])
+    for line in expected_lines:
+        assert re.search(line, list_output.stdout)
+
+    run_cli_command(
+        ["workspace", "service-users", "delete", "-y", "test-0"],
+        expected_exit_code=1,
+        expected_error="Service user 'test-0' not found",
+    )
+
+    # should still work and be a noop
+    run_cli_command(["workspace", "service-users", "delete", "-y", "--allow-missing", "test-0"])
+
+    run_cli_command(
+        ["workspace", "service-users", "info", "test-0"],
+        expected_exit_code=1,
+        expected_error="Could not find Service User",
+    )
+
+    info_output = run_cli_command(["workspace", "service-users", "info", "test-3"])
+    expected_lines = [
+        r"This Service User does not have access to any Environments.",
+        r"Name:\s+test-3",
+        r"Service User ID:\s+sv-6",
+        r"Token ID:\s+ak-SU6",
+        r"Created By:\s+user",
+        r"Created At:\s+[^\s]+",
+        r"Last Used:\s+-",
+        r"Expires:\s+[^\s]+",
+    ]
+    for line in expected_lines:
+        assert re.search(line, info_output.stdout)
+
+    run_cli_command(["workspace", "service-users", "set-role", "test-3", "main", "contributor"])
+
+    info_output = run_cli_command(["workspace", "service-users", "info", "test-3"])
+    expected_lines = [
+        r"Name:\s+test-3",
+        r"Service User ID:\s+sv-6",
+        r"Token ID:\s+ak-SU6",
+        r"Created By:\s+user",
+        r"Created At:\s+[^\s]+",
+        r"Last Used:\s+-",
+        r"Expires:\s+[^\s]+",
+        r"Environment Access:",
+        r"main\s+Contributor",
+    ]
+    for line in expected_lines:
+        assert re.search(line, info_output.stdout)
+
+    run_cli_command(["workspace", "service-users", "set-role", "test-3", "main", "no-access"])
+
+    info_output = run_cli_command(["workspace", "service-users", "info", "test-3"])
+    expected_lines = [
+        r"This Service User does not have access to any Environments.",
+        r"Name:\s+test-3",
+        r"Service User ID:\s+sv-6",
+        r"Token ID:\s+ak-SU6",
+        r"Created By:\s+user",
+        r"Created At:\s+[^\s]+",
+        r"Last Used:\s+-",
+        r"Expires:\s+[^\s]+",
+    ]
+    for line in expected_lines:
+        assert re.search(line, info_output.stdout)
+
+
+@pytest.mark.parametrize("count", [1_000_000, 1_000_001])
+def test_function_calls_total_input_limit(servicer, set_env_client, monkeypatch, count):
+    # Isolate the total-input limit from per-bucket refinement.
+    monkeypatch.setattr("modal._logs._FETCH_LIMIT", 2_000_000)
+    base = datetime(2026, 9, 15, 12, tzinfo=timezone.utc)
+    counted = api_pb2.FunctionCallCountResponse()
+    counted.buckets.add(count=count).bucket_start_at.FromDatetime(base)
+    with servicer.intercept() as ctx:
+        ctx.add_response("FunctionGetById", api_pb2.FunctionGetByIdResponse(function=api_pb2.FunctionData()))
+        ctx.add_response("FunctionCallCount", counted)
+        if count <= 1_000_000:
+            ctx.add_response("FunctionCallFetch", api_pb2.FunctionCallFetchResponse())
+        result = run_cli_command(
+            [
+                "function",
+                "calls",
+                "fu-test",
+                "--since",
+                base.isoformat(),
+                "--until",
+                (base + timedelta(hours=1)).isoformat(),
+                "--json",
+            ],
+            expected_exit_code=2 if count > 1_000_000 else 0,
+        )
+    if count > 1_000_000:
+        assert "Cannot fetch more than 1,000,000 inputs" in result.stderr
+        assert not ctx.get_requests("FunctionCallFetch")
+    else:
+        assert json.loads(result.stdout) == []
+        assert len(ctx.get_requests("FunctionCallFetch")) == 1
+
+
+@pytest.mark.parametrize("kind", ["function", "server"])
+@pytest.mark.parametrize("by_id", [False, True])
+def test_metrics_export_cli(servicer, set_env_client, kind, by_id):
+    rpc = "FunctionGetMetrics" if kind == "function" else "ServerGetMetrics"
+    response = getattr(api_pb2, rpc + "Response")(bucket_secs=60)
+    response.since.FromSeconds(1800000000)
+    response.until.FromSeconds(1800000120)
+    series = response.series.add(name="live_containers_max", unit="containers")
+    series.points.add(value=0).timestamp.FromSeconds(1800000000)
+    series.points.add().timestamp.FromSeconds(1800000060)
+    args = [
+        kind,
+        "metrics",
+        "fu-test" if by_id else "my-app/my-object",
+        "--since",
+        "2027-01-15T08:00:30+00:00",
+        "--until",
+        "2027-01-15T08:02:30+00:00",
+        "--group",
+        "containers",
+        "--group",
+        "calls" if kind == "function" else "requests",
+        "--bucket-size",
+        "1m",
+        "--json",
+        "--env",
+        "main",
+    ]
+    if kind == "function":
+        args += ["--all-variants"]
+    with servicer.intercept() as ctx:
+        if by_id:
+            ctx.add_response(
+                "FunctionGetById",
+                api_pb2.FunctionGetByIdResponse(function=api_pb2.FunctionData(is_server=kind == "server")),
+            )
+        else:
+            ctx.add_response(
+                "FunctionGet",
+                api_pb2.FunctionGetResponse(
+                    function_id="fu-test", function=api_pb2.FunctionData(is_server=kind == "server")
+                ),
+            )
+        ctx.add_response(rpc, response)
+        result = run_cli_command(args)
+    if not by_id:
+        assert ctx.pop_request("FunctionGet").environment_name == "main"
+    request = ctx.pop_request(rpc)
+    assert request.function_id == "fu-test"
+    assert request.since.seconds == 1800000030
+    assert request.until.seconds == 1800000150
+    assert request.bucket_secs == 60
+    assert list(request.groups) == ["containers", "calls" if kind == "function" else "requests"]
+    if kind == "function":
+        assert request.rollup
+    data = json.loads(result.stdout)
+    assert data["since"] == "2027-01-15T08:00:00+00:00"
+    assert data["until"] == "2027-01-15T08:02:00+00:00"
+    assert "warnings" not in data
+    assert data["series"][0]["points"] == [
+        {"timestamp": data["since"], "value": 0},
+        {"timestamp": "2027-01-15T08:01:00+00:00", "value": None},
+    ]
+
+
+@pytest.mark.parametrize("kind", ["function", "server"])
+@pytest.mark.parametrize("output", ["summary", "json", "csv"])
+def test_metrics_relative_max_range(servicer, set_env_client, kind, output):
+    rpc = (
+        "MetricsGetInfo"
+        if output == "summary"
+        else ("FunctionGetMetrics" if kind == "function" else "ServerGetMetrics")
+    )
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(
+                function_id="fu-test", function=api_pb2.FunctionData(is_server=kind == "server")
+            ),
+        )
+        ctx.add_response(rpc, getattr(api_pb2, rpc + "Response")(bucket_secs=86400))
+        args = [kind, "metrics", "app/name", "--since", "31d"]
+        if output != "summary":
+            args.append("--" + output)
+        run_cli_command(args)
+    request = ctx.pop_request(rpc)
+    assert request.until.ToDatetime() - request.since.ToDatetime() == timedelta(days=31)
+
+
+@pytest.mark.parametrize("kind", ["function", "server"])
+def test_metrics_export_json_defaults(servicer, set_env_client, kind):
+    rpc = "FunctionGetMetrics" if kind == "function" else "ServerGetMetrics"
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(
+                function_id="fu-test", function=api_pb2.FunctionData(is_server=kind == "server")
+            ),
+        )
+        ctx.add_response(rpc, getattr(api_pb2, rpc + "Response")(bucket_secs=60))
+        result = run_cli_command([kind, "metrics", "app/name", "--json"])
+    request = ctx.pop_request(rpc)
+    assert request.until.ToDatetime() - request.since.ToDatetime() == timedelta(hours=1)
+    assert not request.groups
+    assert not request.HasField("bucket_secs")
+    if kind == "function":
+        assert not request.rollup
+    assert json.loads(result.stdout)["series"] == []
+
+
+@pytest.mark.parametrize(
+    "kind,options,message",
+    [
+        ("server", ["--all-variants"], "No such option"),
+        ("function", ["--bucket-size", "59s"], "Invalid value"),
+        ("function", ["--since", "bad-time"], "Invalid time format"),
+        ("server", ["--since", "2026-10-02", "--until", "2026-10-01"], "must be before"),
+        ("function", ["--since", "2026-08-01T00:00:00+00:00", "--until", "2026-10-01T00:00:00+00:00"], "31 days"),
+        (
+            "function",
+            ["--since", "2026-10-01T00:00:00+00:00", "--until", "2026-10-02T00:00:00+00:00", "--bucket-size", "1m"],
+            "500 points",
+        ),
+    ],
+)
+def test_metrics_export_invalid_options(kind, options, message):
+    result = run_cli_command([kind, "metrics", "fu-test", *options], expected_exit_code=2)
+    assert message in result.stderr
+
+
+@pytest.mark.parametrize(
+    "kind,valid_group,invalid_group", [("function", "calls", "requests"), ("server", "requests", "calls")]
+)
+def test_metrics_invalid_group_uses_schema(servicer, set_env_client, kind, valid_group, invalid_group):
+    async def reject_groups(servicer, stream):
+        request = await stream.recv_message()
+        assert list(request.groups) == [invalid_group]
+        raise GRPCError(
+            Status.INVALID_ARGUMENT, f"Invalid metrics groups: {invalid_group}. Valid groups: {valid_group}"
+        )
+
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(
+                function_id="fu-test", function=api_pb2.FunctionData(is_server=kind == "server")
+            ),
+        )
+        ctx.set_responder("MetricsGetInfo", reject_groups)
+        result = run_cli_command([kind, "metrics", "app/name", "--group", invalid_group], expected_exit_code=2)
+    assert f"Invalid metrics groups: {invalid_group}" in result.stderr
+    assert f"Valid groups: {valid_group}" in result.stderr
+    ctx.pop_request("FunctionGet")
+    ctx.pop_request("MetricsGetInfo")
+    assert not ctx.calls
+
+
+@pytest.mark.parametrize("kind", ["function", "server"])
+@pytest.mark.parametrize("empty_window", [False, True])
+def test_metrics_export_summary_does_not_fetch_samples(servicer, set_env_client, kind, empty_window, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "120")
+    response = api_pb2.MetricsGetInfoResponse(
+        bucket_secs=60,
+        bucket_count=0 if empty_window else 2,
+        groups=[
+            api_pb2.MetricGroupDefinition(
+                name="containers",
+                metrics=[
+                    api_pb2.MetricDefinition(
+                        name="live_containers_max", unit="containers", description="Peak containers"
+                    ),
+                ],
+            ),
+        ],
+    )
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(
+                function_id="fu-test",
+                function=api_pb2.FunctionData(is_server=kind == "server"),
+            ),
+        )
+        ctx.add_response("MetricsGetInfo", response)
+        # No sample response is registered: fetching samples fails this test.
+        result = run_cli_command(
+            [
+                kind,
+                "metrics",
+                "app/name",
+                "--group",
+                "containers",
+                "--since",
+                "2027-01-15T08:00:30+00:00",
+                "--until",
+                "2027-01-15T08:00:59+00:00" if empty_window else "2027-01-15T08:02:30+00:00",
+            ]
+        )
+    ctx.pop_request("FunctionGet")
+    request = ctx.pop_request("MetricsGetInfo")
+    assert request.target_type == (
+        api_pb2.MetricsGetInfoRequest.METRICS_TARGET_TYPE_SERVER
+        if kind == "server"
+        else api_pb2.MetricsGetInfoRequest.METRICS_TARGET_TYPE_FUNCTION
+    )
+    assert request.since.seconds == 1800000030
+    assert request.until.seconds == (1800000059 if empty_window else 1800000150)
+    assert not request.HasField("bucket_secs")
+    assert not ctx.calls
+    assert "Metrics schema for fu-test" in result.stdout
+    assert "Groups: containers" in " ".join(result.stdout.split())
+    summary = " ".join(result.stdout.split())
+    assert "Range: [2027-01-15 08:00:00," in summary
+    assert "Bucket size: 1 minute" in summary
+    assert f"Data size: {0 if empty_window else 2} points" in summary
+    assert "Series" in result.stdout
+    assert "live_containers_max" in result.stdout
+    assert "Description" in result.stdout
+    assert "Peak containers" in result.stdout
+    assert "CONTAINERS --group containers · 1 series" in summary
+    assert "Export:" in result.stdout
+    assert f"modal {kind} metrics fu-test" in summary
+    assert "--csv --group containers > metrics.csv" in summary
+    assert "--json --group containers" in summary
+    assert "successful_calls" not in result.stdout
+
+
+@pytest.mark.parametrize("kind", ["function", "server"])
+def test_metrics_export_csv(servicer, set_env_client, kind):
+    import csv
+    import io
+
+    rpc = "FunctionGetMetrics" if kind == "function" else "ServerGetMetrics"
+    response = getattr(api_pb2, rpc + "Response")(bucket_secs=60)
+    response.since.FromSeconds(1800000000)
+    response.until.FromSeconds(1800000120)
+    series = response.series.add(name="live_containers_max", unit="containers")
+    series.points.add(value=0).timestamp.FromSeconds(1800000000)
+    series.points.add().timestamp.FromSeconds(1800000060)
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(
+                function_id="fu-test",
+                function=api_pb2.FunctionData(is_server=kind == "server"),
+            ),
+        )
+        ctx.add_response(rpc, response)
+        result = run_cli_command([kind, "metrics", "app/name", "--group", "containers", "--csv"])
+    assert list(csv.DictReader(io.StringIO(result.stdout))) == [
+        {
+            "series_name": "live_containers_max",
+            "unit": "containers",
+            "time": "2027-01-15T08:00:00Z",
+            "value": "0.0",
+        },
+        {
+            "series_name": "live_containers_max",
+            "unit": "containers",
+            "time": "2027-01-15T08:01:00Z",
+            "value": "",
+        },
+    ]
+    assert not result.stderr
+    assert "Warning" not in result.stdout
+
+
+@pytest.mark.parametrize("kind", ["function", "server"])
+def test_metrics_export_output_flags_mutually_exclusive(kind):
+    result = run_cli_command([kind, "metrics", "fu-test", "--json", "--csv"], expected_exit_code=2)
+    assert "--json and --csv are mutually exclusive" in result.stderr
+
+
+@pytest.mark.parametrize("kind", ["function", "server"])
+def test_metrics_command_help(kind):
+    result = run_cli_command([kind, "metrics", "--help"])
+    assert "--json" in result.stdout and "--csv" in result.stdout
+    assert "By default, prints a schema summarizing" in " ".join(result.stdout.split())
+    assert "COMMAND" not in result.stdout
+
+
+@pytest.mark.parametrize("kind", ["function", "server"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_metrics_summary_uses_server_bucket_resolution(servicer, set_env_client, kind, explicit):
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(
+                function_id="fu-test",
+                function=api_pb2.FunctionData(is_server=kind == "server"),
+            ),
+        )
+        ctx.add_response("MetricsGetInfo", api_pb2.MetricsGetInfoResponse(bucket_secs=300, bucket_count=12))
+        args = [
+            kind,
+            "metrics",
+            "app/name",
+            "--since",
+            "2027-01-15T08:00:30+00:00",
+            "--until",
+            "2027-01-15T09:00:30+00:00",
+        ]
+        if explicit:
+            args.extend(["--bucket-size", "5m"])
+        result = run_cli_command(args)
+    request = ctx.pop_request("MetricsGetInfo")
+    assert request.HasField("bucket_secs") == explicit
+    if explicit:
+        assert request.bucket_secs == 300
+    summary = " ".join(result.stdout.split())
+    assert "Bucket size: 5 minutes" in summary
+    assert "Data size: 0 points" in summary
+
+
+@pytest.mark.parametrize("kind", ["function", "server"])
+def test_metrics_bucket_size_duration(servicer, set_env_client, kind):
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(
+                function_id="fu-test", function=api_pb2.FunctionData(is_server=kind == "server")
+            ),
+        )
+        ctx.add_response("MetricsGetInfo", api_pb2.MetricsGetInfoResponse(bucket_secs=28800, bucket_count=84))
+        result = run_cli_command([kind, "metrics", "app/name", "--since", "28d", "--bucket-size", "8h"])
+    request = ctx.pop_request("MetricsGetInfo")
+    assert request.bucket_secs == 28800
+    assert "Bucket size: 8 hours" in " ".join(result.stdout.split())
+
+
+@pytest.mark.parametrize("kind", ["function", "server"])
+@pytest.mark.parametrize("output", ["summary", "json", "csv"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_metrics_resource_groups(servicer, set_env_client, kind, output, explicit):
+    import csv
+    import io
+
+    metrics = [
+        ("cpu", "cpu_usage", "cores", "avg"),
+        ("memory", "memory_requested", "GiB", "avg"),
+        ("network", "network_ingress", "bytes", "sum"),
+        ("gpu", "gpu_count_h100", "GPUs", "avg"),
+    ]
+    schema = api_pb2.MetricsGetInfoResponse(bucket_secs=60, bucket_count=2)
+    rpc = "FunctionGetMetrics" if kind == "function" else "ServerGetMetrics"
+    response = getattr(api_pb2, rpc + "Response")(bucket_secs=60)
+    response.since.FromSeconds(1800000000)
+    response.until.FromSeconds(1800000120)
+    for group, name, unit, _ in metrics:
+        description = f"Description of {name}"
+        schema.groups.add(name=group).metrics.add(name=name, unit=unit, description=description)
+        series = response.series.add(name=name, unit=unit, description=description)
+        series.points.add(value=0).timestamp.FromSeconds(1800000000)
+        series.points.add().timestamp.FromSeconds(1800000060)
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(
+                function_id="fu-test", function=api_pb2.FunctionData(is_server=kind == "server")
+            ),
+        )
+        if output == "summary":
+            ctx.add_response("MetricsGetInfo", schema)
+        if output != "summary":
+            ctx.add_response(rpc, response)
+        args = [kind, "metrics", "app/name"]
+        if explicit:
+            for group, *_ in metrics:
+                args.extend(["--group", group])
+        if output != "summary":
+            args.append("--" + output)
+        result = run_cli_command(args)
+    ctx.pop_request("FunctionGet")
+    if output == "summary":
+        ctx.pop_request("MetricsGetInfo")
+    if output != "summary":
+        request = ctx.pop_request(rpc)
+        assert list(request.groups) == ([m[0] for m in metrics] if explicit else [])
+    assert not ctx.calls
+    if output == "summary":
+        assert "Data size: 8 points" in " ".join(result.stdout.split())
+        for _, name, unit, _ in metrics:
+            assert name in result.stdout and unit in result.stdout
+    elif output == "json":
+        data = json.loads(result.stdout)
+        assert len(data["series"]) == 4
+        for series, (_, name, unit, _) in zip(data["series"], metrics):
+            assert series["name"] == name
+            assert series["unit"] == unit
+            assert series["description"] == f"Description of {name}"
+            assert [point["value"] for point in series["points"]] == [0, None]
+    else:
+        rows = list(csv.DictReader(io.StringIO(result.stdout)))
+        assert len(rows) == 8
+        for group, name, unit, _ in metrics:
+            points = [row for row in rows if row["series_name"] == name]
+            assert [row["value"] for row in points] == ["0.0", ""]
+            assert all(row["unit"] == unit for row in points)
+
+
+@pytest.mark.parametrize("kind", ["function", "server"])
+@pytest.mark.parametrize("output", ["summary", "csv"])
+def test_metrics_schema_uses_server_rows(servicer, set_env_client, monkeypatch, kind, output):
+    monkeypatch.setenv("COLUMNS", "140")
+    schema = api_pb2.MetricsGetInfoResponse(bucket_secs=60, bucket_count=2)
+    for label, names in (("future_{a,b}_avg", ["future_a_avg", "future_b_avg"]), ("future_c_avg", ["future_c_avg"])):
+        row = schema.groups.add(name="future", display_name=label, description=f"Server definition for {label}.")
+        for name in names:
+            row.metrics.add(name=name, unit="widgets", description="Individual definition.")
+    rpc = "ServerGetMetrics" if kind == "server" else "FunctionGetMetrics"
+    response = getattr(api_pb2, rpc + "Response")(bucket_secs=60)
+    for name in ("future_a_avg", "future_b_avg", "future_c_avg"):
+        response.series.add(name=name, unit="widgets").points.add(value=1).timestamp.FromSeconds(1800000000)
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "FunctionGet",
+            api_pb2.FunctionGetResponse(
+                function_id="fu-test", function=api_pb2.FunctionData(is_server=kind == "server")
+            ),
+        )
+        if output == "summary":
+            ctx.add_response("MetricsGetInfo", schema)
+        args = [kind, "metrics", "app/name", "--group", "future"]
+        if output == "csv":
+            ctx.add_response(rpc, response)
+            args.append("--csv")
+        result = run_cli_command(args)
+    ctx.pop_request("FunctionGet")
+    if output == "summary":
+        ctx.pop_request("MetricsGetInfo")
+        summary = " ".join(result.stdout.split())
+        assert "Data size: 6 points" in summary
+        assert result.stdout.count("FUTURE --group future · 3 series") == 1
+        assert "Groups: future" in summary
+        assert "future, future" not in summary
+        assert "future_{a,b}_avg (widgets)" in result.stdout
+        assert "Server definition for future_{a,b}_avg." in result.stdout
+        assert "Server definition for future_c_avg." in result.stdout
+    else:
+        import csv
+        import io
+
+        ctx.pop_request(rpc)
+        assert [row["series_name"] for row in csv.DictReader(io.StringIO(result.stdout))] == [
+            "future_a_avg",
+            "future_b_avg",
+            "future_c_avg",
+        ]
+    assert not ctx.calls
+
+
+def test_workspace_members_cli(set_env_client, servicer: MockClientServicer, monkeypatch):
+    monkeypatch.setattr("modal._utils.time_utils.locale_tz", lambda: timezone.utc)
+
+    resp = run_cli_command(["workspace", "member-tokens", "list"])
+    deformatted = re.sub(r"\s+", " ", resp.stdout)
+
+    assert "Token ID Name Created By Created At Expires" in deformatted
+    assert "ak-MT1 - Alice" in deformatted
+    assert "ak-MT2 named-token Bob" in deformatted
+
+    json_output_str = run_cli_command(["workspace", "member-tokens", "list", "--json"])
+    json_output = json.loads(json_output_str.stdout)
+
+    assert json_output == [
+        {
+            "name": None,
+            "token_id": "ak-MT1",
+            "user_id": "us-1",
+            "username": "Alice",
+            "created_at": "2020-01-01 00:00:00+00:00",
+            "last_used_at": "2021-01-01 00:00:00+00:00",
+            "expires_at": None,
+            "disabled": False,
+        },
+        {
+            "name": "named-token",
+            "token_id": "ak-MT2",
+            "user_id": "us-2",
+            "username": "Bob",
+            "created_at": "2020-01-01 00:00:00+00:00",
+            "last_used_at": None,
+            "expires_at": "2021-01-01 00:00:00+00:00",
+            "disabled": False,
+        },
+    ]
+
+    run_cli_command(["workspace", "member-tokens", "delete", "-y", "ak-MT1"])
+
+    run_cli_command(
+        ["workspace", "member-tokens", "delete", "-y", "ak-MT1"],
+        expected_exit_code=1,
+        expected_error="Token not found",
+    )
+
+    run_cli_command(["workspace", "member-tokens", "delete", "-y", "ak-MT1", "--allow-missing"])
+
+    json_output_str = run_cli_command(["workspace", "member-tokens", "list", "--json"])
+    json_output = json.loads(json_output_str.stdout)
+
+    assert json_output == [
+        {
+            "name": "named-token",
+            "token_id": "ak-MT2",
+            "user_id": "us-2",
+            "username": "Bob",
+            "created_at": "2020-01-01 00:00:00+00:00",
+            "last_used_at": None,
+            "expires_at": "2021-01-01 00:00:00+00:00",
+            "disabled": False,
+        },
+    ]
+
+    for i in range(15):
+        expiration: int | None = None
+        if i % 2 == 0:
+            expiration = (i + 1) * 86_400
+
+        servicer._create_token(f"token-{i}", expiration=expiration)
+
+    json_output_str = run_cli_command(["workspace", "member-tokens", "list", "--json"])
+    json_output = json.loads(json_output_str.stdout)
+
+    assert len(json_output) == 16
+    token_ids = []
+    for t in json_output:
+        if t["name"] not in {"token-10", "token-11", "token-12", "token-13", "token-14"}:
+            continue
+
+        token_ids.append(t["token_id"])
+
+    res = run_cli_command(["workspace", "member-tokens", "delete", "-y", *token_ids[:3]])
+    assert "Deleted 3 tokens" in res.stdout
+    res = run_cli_command(["workspace", "member-tokens", "delete", "-y", *token_ids, "--allow-missing"])
+    assert "Deleted 2 tokens" in res.stdout
+
+    json_output_str = run_cli_command(["workspace", "member-tokens", "list", "--json"])
+    json_output = json.loads(json_output_str.stdout)
+
+    assert len(json_output) == 11
+    assert set(t["name"] for t in json_output) == {"named-token", *([f"token-{i}" for i in range(10)])}
+    assert set(t["token_id"] for t in json_output) == {*([f"ak-MT{i}" for i in range(2, 13)])}
+    assert set(t["name"] for t in json_output if t["expires_at"] is not None) == {
+        "named-token",
+        "token-0",
+        "token-2",
+        "token-4",
+        "token-6",
+        "token-8",
+    }
+
+    for verb in ["disable", "enable"]:
+        run_cli_command(
+            [
+                "workspace",
+                "member-tokens",
+                verb,
+                "-y",
+                "ak-MT1",
+            ],
+            expected_exit_code=1,
+            expected_error="Token not found",
+        )
+
+    run_cli_command(
+        [
+            "workspace",
+            "member-tokens",
+            "disable",
+            "-y",
+            "ak-MT2",
+            "ak-MT3",
+            "ak-MT4",
+            "ak-MT5",
+            "ak-MT6",
+            "ak-MT7",
+        ]
+    )
+
+    json_output_str = run_cli_command(["workspace", "member-tokens", "list", "--json"])
+    json_output = json.loads(json_output_str.stdout)
+    assert len(json_output) == 11
+    assert set(t["token_id"] for t in json_output if t["disabled"]) == {
+        "ak-MT2",
+        "ak-MT3",
+        "ak-MT4",
+        "ak-MT5",
+        "ak-MT6",
+        "ak-MT7",
+    }
+
+    run_cli_command(
+        [
+            "workspace",
+            "member-tokens",
+            "disable",
+            "-y",
+            "ak-MT5",
+            "ak-MT6",
+            "ak-MT7",
+            "ak-MT8",
+        ]
+    )
+
+    json_output_str = run_cli_command(["workspace", "member-tokens", "list", "--json"])
+    json_output = json.loads(json_output_str.stdout)
+    assert len(json_output) == 11
+    assert set(t["token_id"] for t in json_output if t["disabled"]) == {
+        "ak-MT2",
+        "ak-MT3",
+        "ak-MT4",
+        "ak-MT5",
+        "ak-MT6",
+        "ak-MT7",
+        "ak-MT8",
+    }
+
+    run_cli_command(["workspace", "member-tokens", "disable", "-y", "--all"])
+
+    json_output_str = run_cli_command(["workspace", "member-tokens", "list", "--json"])
+    json_output = json.loads(json_output_str.stdout)
+    assert set(t["token_id"] for t in json_output if t["disabled"]) == {*([f"ak-MT{i}" for i in range(2, 13)])}
+
+    run_cli_command(
+        [
+            "workspace",
+            "member-tokens",
+            "enable",
+            "-y",
+            "ak-MT2",
+            "ak-MT4",
+            "ak-MT6",
+            "ak-MT8",
+            "ak-MT10",
+            "ak-MT12",
+        ]
+    )
+
+    json_output_str = run_cli_command(["workspace", "member-tokens", "list", "--json"])
+    json_output = json.loads(json_output_str.stdout)
+    assert set(t["token_id"] for t in json_output if t["disabled"]) == {
+        "ak-MT3",
+        "ak-MT5",
+        "ak-MT7",
+        "ak-MT9",
+        "ak-MT11",
+    }
+
+    run_cli_command(
+        [
+            "workspace",
+            "member-tokens",
+            "enable",
+            "-y",
+            "ak-MT2",
+            "ak-MT3",
+            "ak-MT4",
+            "ak-MT5",
+            "ak-MT6",
+        ]
+    )
+
+    json_output_str = run_cli_command(["workspace", "member-tokens", "list", "--json"])
+    json_output = json.loads(json_output_str.stdout)
+    assert set(t["token_id"] for t in json_output if t["disabled"]) == {"ak-MT7", "ak-MT9", "ak-MT11"}
+
+
+@pytest.fixture
+def workspace_audit_log_entries(servicer):
+    servicer.audit_log_entries = [
+        api_pb2.AuditLogEntry(
+            id=f"al-{n}",
+            event_at_timestamp=Timestamp(seconds=int(datetime(2026, 10, 11, 14, n, tzinfo=timezone.utc).timestamp())),
+            action="app.deploy",
+            status="success",
+            actor=api_pb2.AuditLogActor(type="user", id="us-1"),
+            targets=[api_pb2.AuditLogTarget(type="app", id=f"ap-{n}")],
+            context=api_pb2.AuditLogContext(environment_id="en-1", source="sdk", ip_address="203.0.113.7"),
+            metadata_json='{"app_name": "demo"}',
+        )
+        for n in range(9, 0, -1)
+    ]
+    return servicer
+
+
+def _audit_log_targets(stdout: str) -> list[str]:
+    return [",".join(target["id"] for target in json.loads(line)["targets"]) for line in stdout.splitlines()]
+
+
+def test_workspace_audit_logs_prints_the_newest_events_oldest_first(workspace_audit_log_entries, set_env_client):
+    res = run_cli_command(["workspace", "audit-logs", "-n", "3"])
+    assert _audit_log_targets(res.stdout) == ["ap-7", "ap-8", "ap-9"]
+
+
+@pytest.mark.parametrize("count_only,as_csv", [(False, False), (False, True), (True, False)])
+def test_workspace_audit_logs_retry_warning_filter(workspace_audit_log_entries, set_env_client, count_only, as_csv):
+    messages = []
+    attempts = 0
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    async def rate_limited(servicer, stream):
+        nonlocal attempts
+        await stream.recv_message()
+        attempts += 1
+        if attempts > 1:
+            response = api_pb2.AuditLogCountResponse(count=9) if count_only else api_pb2.AuditLogPlanResponse()
+            await stream.send_message(response)
+            return
+        raise GRPCError(
+            Status.RESOURCE_EXHAUSTED,
+            "AuditLog rate limit exceeded",
+            [api_pb2.RPCRetryPolicy(retry_after_secs=0.001)],
+        )
+
+    handler = Collect()
+    logger.addHandler(handler)
+    try:
+        with workspace_audit_log_entries.intercept() as ctx:
+            ctx.set_responder("AuditLogCount" if count_only else "AuditLogPlan", rate_limited)
+            args = ["workspace", "audit-logs", "--since", "1d"]
+            if as_csv:
+                args.append("--csv")
+            if count_only:
+                args.append("--count")
+            result = run_cli_command(args)
+        if count_only:
+            assert result.stdout.strip() == "9"
+        elif as_csv:
+            assert len(list(csv.DictReader(io.StringIO(result.stdout)))) == 9
+        else:
+            assert len(_audit_log_targets(result.stdout)) == 9
+        assert attempts == 2
+        assert not [message for message in messages if "RESOURCE_EXHAUSTED" in message]
+        assert not any(isinstance(f, _audit_logs._DropRateLimitWarnings) for f in logger.filters)
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_workspace_audit_logs_defaults_to_the_newest_100_events(workspace_audit_log_entries, set_env_client):
+    res = run_cli_command(["workspace", "audit-logs"])
+    assert _audit_log_targets(res.stdout) == [f"ap-{n}" for n in range(1, 10)]
+
+
+def test_workspace_audit_logs_with_since_streams_the_range_oldest_first(workspace_audit_log_entries, set_env_client):
+    res = run_cli_command(["workspace", "audit-logs", "--since", "1d", "-q", "status:success"])
+    assert _audit_log_targets(res.stdout) == [f"ap-{n}" for n in range(1, 10)]
+
+
+def test_workspace_audit_logs_with_since_and_limit_prints_the_newest_n(workspace_audit_log_entries, set_env_client):
+    res = run_cli_command(["workspace", "audit-logs", "--since", "1d", "-n", "2"])
+    assert _audit_log_targets(res.stdout) == ["ap-8", "ap-9"]
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_workspace_audit_logs_rejects_nonpositive_limit(set_env_client, limit):
+    result = run_cli_command(
+        ["workspace", "audit-logs", "-n", str(limit)],
+        expected_exit_code=2,
+        expected_stderr="Invalid value for '--limit': must be at least 1",
+    )
+    assert result.stdout == ""
+
+
+def test_workspace_audit_logs_count_prints_the_number_of_events(workspace_audit_log_entries, set_env_client):
+    res = run_cli_command(["workspace", "audit-logs", "--count", "--since", "1d"])
+    assert res.stdout.strip() == "9"
+
+
+@pytest.mark.parametrize("extra", [[], ["--until", "1h"]])
+def test_workspace_audit_logs_count_requires_since(set_env_client, extra):
+    run_cli_command(
+        ["workspace", "audit-logs", "--count", *extra],
+        expected_exit_code=2,
+        expected_stderr="--since is required with --count.",
+    )
+
+
+@pytest.mark.parametrize("extra", [[], ["--since", "1d"]])
+def test_workspace_audit_logs_count_rejects_csv(set_env_client, extra):
+    run_cli_command(
+        ["workspace", "audit-logs", "--count", "--csv", *extra],
+        expected_exit_code=2,
+        expected_stderr="--csv can't be used with --count.",
+    )
+
+
+def test_workspace_audit_logs_count_empty(workspace_audit_log_entries, set_env_client):
+    workspace_audit_log_entries.audit_log_entries.clear()
+    result = run_cli_command(["workspace", "audit-logs", "--count", "--since", "1d"])
+    assert result.stdout.strip() == "0"
+
+
+def test_workspace_audit_logs_rejects_a_range_longer_than_7_days(workspace_audit_log_entries, set_env_client):
+    run_cli_command(["workspace", "audit-logs", "--since", "8d"], expected_exit_code=2)
+
+
+@pytest.mark.parametrize(
+    "args, expected_ids", [([], range(1, 10)), (["-n", "2"], [8, 9]), (["--since", "1d"], range(1, 10))]
+)
+def test_workspace_audit_logs_csv(workspace_audit_log_entries, set_env_client, args, expected_ids):
+    result = run_cli_command(["workspace", "audit-logs", "--csv", *args])
+    reader = csv.DictReader(io.StringIO(result.stdout))
+    rows = list(reader)
+    assert reader.fieldnames == [
+        "id",
+        "timestamp",
+        "action",
+        "status",
+        "actor_type",
+        "actor_id",
+        "actor_name",
+        "actor_email",
+        "target_type",
+        "target_id",
+        "workspace_id",
+        "environment_id",
+        "environment_name",
+        "source",
+        "ip_address",
+        "metadata",
+    ]
+    assert rows == [
+        {
+            "id": f"al-{n}",
+            "timestamp": f"2026-10-11T14:0{n}:00.000+00:00",
+            "action": "app.deploy",
+            "status": "success",
+            "actor_type": "user",
+            "actor_id": "us-1",
+            "actor_name": "",
+            "actor_email": "",
+            "target_type": "app",
+            "target_id": f"ap-{n}",
+            "workspace_id": "",
+            "environment_id": "en-1",
+            "environment_name": "",
+            "source": "sdk",
+            "ip_address": "203.0.113.7",
+            "metadata": json.dumps({"app_name": "demo"}),
+        }
+        for n in expected_ids
+    ]
+
+
+def test_workspace_audit_logs_csv_escapes_values(workspace_audit_log_entries, set_env_client):
+    entry = workspace_audit_log_entries.audit_log_entries[0]
+    entry.actor.name = 'Alice, "A"\nSmith'
+    entry.metadata_json = json.dumps({"name": 'hello, "world"'})
+    entry.context.ip_address = ""
+    result = run_cli_command(["workspace", "audit-logs", "--csv", "-n", "1"])
+    (row,) = csv.DictReader(io.StringIO(result.stdout))
+    assert row["actor_name"] == entry.actor.name
+    assert json.loads(row["metadata"]) == {"name": 'hello, "world"'}
+    assert row["ip_address"] == ""
+
+
+def test_workspace_audit_logs_csv_without_targets(workspace_audit_log_entries, set_env_client):
+    workspace_audit_log_entries.audit_log_entries[0].ClearField("targets")
+    result = run_cli_command(["workspace", "audit-logs", "--csv", "-n", "1"])
+    (row,) = csv.DictReader(io.StringIO(result.stdout))
+    assert row["target_type"] == ""
+    assert row["target_id"] == ""
+
+
+def test_workspace_audit_logs_csv_ascii_stdout(workspace_audit_log_entries, set_env_client, monkeypatch):
+    entry = workspace_audit_log_entries.audit_log_entries[0]
+    entry.actor.name = "Zoë 李"
+    entry.context.environment_name = "développement"
+    output = io.BytesIO()
+    stdout = io.TextIOWrapper(output, encoding="ascii")
+    monkeypatch.setattr(sys, "stdout", stdout)
+    entrypoint_cli.main(["workspace", "audit-logs", "--csv", "-n", "1"], standalone_mode=False)
+    stdout.flush()
+    (row,) = csv.DictReader(io.StringIO(output.getvalue().decode("utf-8")))
+    assert row["actor_name"] == entry.actor.name
+    assert row["environment_name"] == entry.context.environment_name
+
+
+def test_workspace_audit_logs_csv_empty(workspace_audit_log_entries, set_env_client):
+    workspace_audit_log_entries.audit_log_entries.clear()
+    result = run_cli_command(["workspace", "audit-logs", "--csv"])
+    reader = csv.DictReader(io.StringIO(result.stdout))
+    assert list(reader) == []
+    assert reader.fieldnames[0] == "id"
+
+
+def test_workspace_audit_logs_json_prints_each_full_event_on_one_line_without_a_header(
+    workspace_audit_log_entries, set_env_client, monkeypatch
+):
+    monkeypatch.setattr("modal._utils.time_utils.locale_tz", lambda: timezone.utc)
+    res = run_cli_command(["workspace", "audit-logs", "-n", "2"])
+    events = [json.loads(line) for line in res.stdout.splitlines()]
+    assert events == [
+        {
+            "id": f"al-{n}",
+            "timestamp": f"2026-10-11T14:0{n}:00.000+00:00",
+            "action": "app.deploy",
+            "status": "success",
+            "actor": {"type": "user", "id": "us-1", "name": "", "email": ""},
+            "targets": [{"type": "app", "id": f"ap-{n}"}],
+            "context": {
+                "workspace_id": "",
+                "environment_id": "en-1",
+                "environment_name": "",
+                "source": "sdk",
+                "ip_address": "203.0.113.7",
+            },
+            "metadata": {"app_name": "demo"},
+        }
+        for n in (8, 9)
+    ]
+
+
+@pytest.mark.parametrize(
+    "name,email,environment_name",
+    [
+        ("Alice", "alice@example.com", "production"),
+        ("Alice", "", ""),
+        ("", "", ""),
+    ],
+)
+def test_workspace_audit_logs_resolved_names(
+    workspace_audit_log_entries, set_env_client, name, email, environment_name
+):
+    entry = workspace_audit_log_entries.audit_log_entries[0]
+    entry.actor.name = name
+    entry.actor.email = email
+    entry.context.environment_name = environment_name
+    result = run_cli_command(["workspace", "audit-logs", "-n", "1"])
+    event = json.loads(result.stdout)
+    assert event["actor"] == {"type": "user", "id": "us-1", "name": name, "email": email}
+    assert event["context"]["environment_name"] == environment_name
+    assert event["context"]["environment_id"] == "en-1"
+
+
+def test_workspace_audit_logs_json_with_since_and_limit_prints_the_newest_n(
+    workspace_audit_log_entries, set_env_client
+):
+    res = run_cli_command(["workspace", "audit-logs", "--since", "1d", "-n", "2"])
+    assert [json.loads(line)["id"] for line in res.stdout.splitlines()] == ["al-8", "al-9"]
+
+
+def test_workspace_audit_logs_json_keeps_unparseable_metadata_as_text(
+    workspace_audit_log_entries, set_env_client, monkeypatch
+):
+    workspace_audit_log_entries.audit_log_entries[0].metadata_json = "not json"
+    res = run_cli_command(["workspace", "audit-logs", "-n", "1"])
+    assert json.loads(res.stdout)["metadata"] == "not json"
+
+
+def test_workspace_audit_logs_rejects_json_flag(set_env_client):
+    run_cli_command(["workspace", "audit-logs", "--json"], expected_exit_code=2, expected_stderr="No such option")
+
+
+def test_workspace_audit_logs_empty(workspace_audit_log_entries, set_env_client):
+    workspace_audit_log_entries.audit_log_entries.clear()
+    result = run_cli_command(["workspace", "audit-logs", "--since", "1d"])
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("event_at", ["2026-10-11T14:09:00.123456Z", "2026-10-11T16:09:00.123456+02:00"])
+def test_workspace_audit_logs_utc_timestamp_and_json_bytes(
+    workspace_audit_log_entries, set_env_client, monkeypatch, event_at
+):
+    monkeypatch.setattr("modal._utils.time_utils.locale_tz", lambda: timezone(timedelta(hours=-4)))
+    workspace_audit_log_entries.audit_log_entries[0].event_at_timestamp.FromJsonString(event_at)
+    result = run_cli_command(["workspace", "audit-logs", "-n", "1"])
+    assert result.stdout == (
+        '{"id": "al-9", "timestamp": "2026-10-11T14:09:00.123+00:00", "action": "app.deploy", '
+        '"status": "success", "actor": {"type": "user", "id": "us-1", "name": "", "email": ""}, '
+        '"targets": [{"type": "app", "id": "ap-9"}], "context": {"workspace_id": "", '
+        '"environment_id": "en-1", "environment_name": "", "source": "sdk", "ip_address": "203.0.113.7"}, '
+        '"metadata": {"app_name": "demo"}}\n'
+    )
+
+
+_SUGGEST_APP = textwrap.dedent("""\
+import modal
+
+app = modal.App("suggest-app")
+
+
+@app.function()
+def train():
+    pass
+
+
+@app.function()
+def evaluate():
+    pass
+""")
+
+
+def test_cli_unknown_command_suggests(set_env_client):
+    result = run_cli_command(["fucntion", "list"], expected_exit_code=2)
+    assert "No such command 'fucntion'." in result.stderr
+    assert "function" in result.stderr
+    assert result.stderr.count("Did you mean") == 1
+
+
+@pytest.mark.parametrize("arguments", [["list"], ["list", "--env", "dev", "--json"]])
+def test_cli_unknown_command_suggests_only_command_name(set_env_client, arguments):
+    result = run_cli_command(["deployment", *arguments], expected_exit_code=2)
+    assert "No such command 'deployment'." in result.stderr
+    assert "Did you mean 'deploy'?" in result.stderr
+    assert "modal deploy list" not in result.stderr
+    assert "--env" not in result.stderr
+    assert "--json" not in result.stderr
+
+
+def test_cli_command_in_wrong_group_suggests(set_env_client):
+    result = run_cli_command(["logs", "my-app"], expected_exit_code=2)
+    assert "app logs" in result.stderr
+    assert "function logs" in result.stderr
+
+
+def test_function_ref_with_dot_suggests_slash(set_env_client, mock_dir, servicer):
+    with mock_dir({"suggest_app.py": _SUGGEST_APP}):
+        run_cli_command(["deploy", "suggest_app.py"])
+        result = run_cli_command(["function", "info", "suggest-app.train"], expected_exit_code=2)
+    assert "APP_NAME/FUNCTION_NAME" in result.stderr
+    assert "Did you mean:" in result.stderr
+    assert "suggest-app/train" in result.stderr
+    assert "function info suggest-app/train" in result.stderr
+
+
+def test_function_ref_with_dot_suggests_slash_without_lookup(set_env_client):
+    # Nothing deployed: the rewrite is still suggested because the separator is wrong.
+    result = run_cli_command(["server", "logs", "my-app.web"], expected_exit_code=2)
+    assert "Did you mean:" in result.stderr
+    assert "my-app/web" in result.stderr
+
+
+def test_function_ref_typo_suggests_close_name(set_env_client, mock_dir, servicer):
+    servicer.object_suggestions[api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_FUNCTION] = [
+        api_pb2.ObjectSuggestion(app_name="suggest-app", object_name="train")
+    ]
+    with mock_dir({"suggest_app.py": _SUGGEST_APP}):
+        run_cli_command(["deploy", "suggest_app.py"])
+        result = run_cli_command(["function", "info", "suggest-app/trian"], expected_exit_code=1)
+    assert "Did you mean:" in get_hint(result.exception)
+    assert "suggest-app/train" in get_hint(result.exception)
+
+
+def test_function_ref_app_typo_suggests_close_app(set_env_client, mock_dir, servicer):
+    servicer.object_suggestions[api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_FUNCTION] = [
+        api_pb2.ObjectSuggestion(app_name="suggest-app", object_name="train")
+    ]
+    with mock_dir({"suggest_app.py": _SUGGEST_APP}):
+        run_cli_command(["deploy", "suggest_app.py"])
+        result = run_cli_command(["function", "info", "suggest-ap/train"], expected_exit_code=1)
+    assert "suggest-app/train" in get_hint(result.exception)
+
+
+def test_run_object_path_typo_suggests(set_env_client, mock_dir):
+    with mock_dir({"suggest_app.py": _SUGGEST_APP}):
+        result = run_cli_command(["run", "suggest_app.py::trian"], expected_exit_code=1)
+    assert "Did you mean:" in result.stderr
+    assert "suggest_app.py::train" in result.stderr
+
+
+def test_run_module_typo_suggestion_preserves_module_flag(set_env_client, mock_dir, monkeypatch):
+    from click.testing import CliRunner
+
+    argv = ["modal", "run", "-m", "hint_package.worker::trian"]
+    monkeypatch.setattr(sys, "argv", argv)
+    with mock_dir({"hint_package": {"__init__.py": "", "worker.py": _SUGGEST_APP}}):
+        result = CliRunner().invoke(entrypoint_cli, argv[1:])
+        assert result.exit_code == 1
+        assert "run -m hint_package.worker::train" in result.stderr
+        run_cli_command(["run", "-m", "hint_package.worker::train"])
+
+
+def test_run_ambiguous_parent_has_no_typo_hint(set_env_client, mock_dir):
+    source = _SUGGEST_APP.replace("app =", "training_app =").replace("@app.function()", "@training_app.function()")
+    with mock_dir({"suggest_app.py": source}):
+        result = run_cli_command(["run", "suggest_app.py::training_app"], expected_exit_code=1)
+    assert "'training_app' matches multiple entrypoints" in result.stderr
+    assert "training_app.train" in result.stderr
+    assert "training_app.evaluate" in result.stderr
+    assert "Could not find" not in result.stderr
+    assert "Did you mean" not in result.stderr
+
+
+_DOTTED_APP = textwrap.dedent("""\
+import modal
+
+app = modal.App("simple-app.name")
+
+
+@app.function()
+def train():
+    pass
+""")
+
+
+def test_function_ref_dotted_app_name_picks_real_split(set_env_client, mock_dir, servicer):
+    servicer.object_suggestions[api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_FUNCTION] = [
+        api_pb2.ObjectSuggestion(app_name="simple-app.name", object_name="train")
+    ]
+    # `simple-app.name.train` could be `simple-app/name.train` or `simple-app.name/train`;
+    # only the latter matches a deployed App, so it is the single suggestion.
+    with mock_dir({"dotted_app.py": _DOTTED_APP}):
+        run_cli_command(["deploy", "dotted_app.py"])
+        result = run_cli_command(["function", "info", "simple-app.name.train"], expected_exit_code=2)
+    assert "Did you mean:" in result.stderr
+    assert "simple-app.name/train" in result.stderr
+    assert "simple-app/name.train" not in result.stderr
+
+
+def test_function_ref_dotted_ambiguous_lists_all_splits(set_env_client):
+    # Nothing deployed: don't guess a split, list them all.
+    result = run_cli_command(["function", "info", "simple-app.name.foo.bar"], expected_exit_code=2)
+    assert "Did you mean:" in result.stderr
+    for ref in ["simple-app/name.foo.bar", "simple-app.name/foo.bar", "simple-app.name.foo/bar"]:
+        assert f"function info {ref}" in result.stderr
+
+
+def test_function_ref_with_dots_on_both_sides_is_not_rewritten(set_env_client):
+    # `/` present: this is a valid-shaped ref, so a miss is a plain not-found, not a separator hint.
+    result = run_cli_command(["function", "info", "simple-app.name/foo.bar"], expected_exit_code=1)
+    assert "APP_NAME/FUNCTION_NAME" not in str(result.exception)
+
+
+_SUGGEST_CLS_APP = textwrap.dedent("""\
+import modal
+
+app = modal.App("suggest-cls-app")
+
+
+@app.function()
+def train():
+    pass
+
+
+@app.cls()
+class Model:
+    @modal.method()
+    def generate(self):
+        pass
+""")
+
+
+def test_server_ref_typo_suggests_only_servers(set_env_client, mock_dir, servicer):
+    servicer.object_suggestions[api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_SERVER] = [
+        api_pb2.ObjectSuggestion(app_name="suggest-app", object_name="train")
+    ]
+    with mock_dir({"suggest_app.py": _SUGGEST_APP}):
+        run_cli_command(["deploy", "suggest_app.py"])
+    app_id = servicer.deployed_apps[("main", "suggest-app")]
+    # The mock servicer can't classify servers from a definition, so say so directly.
+    servicer.app_servers[app_id] = {"train": servicer.app_objects[app_id]["train"]}
+
+    result = run_cli_command(["server", "info", "suggest-app/trian"], expected_exit_code=1)
+    assert "Did you mean:" in get_hint(result.exception)
+    assert "suggest-app/train" in get_hint(result.exception)
+    assert "server info suggest-app/train" in get_hint(result.exception)
+
+    # `train` is a Server, so it is not offered for a Function command.
+    result = run_cli_command(["function", "info", "suggest-app/trian"], expected_exit_code=1)
+    assert "Did you mean" not in get_hint(result.exception)
+
+
+@pytest.mark.parametrize("method", ["generate", "g", "*"])
+def test_function_ref_cls_typo_keeps_method(set_env_client, mock_dir, servicer, method):
+    servicer.object_suggestions[api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_FUNCTION] = [
+        api_pb2.ObjectSuggestion(app_name="suggest-cls-app", object_name=f"Model.{method}")
+    ]
+    with mock_dir({"suggest_cls_app.py": _SUGGEST_CLS_APP}):
+        run_cli_command(["deploy", "suggest_cls_app.py"])
+        result = run_cli_command(["function", "info", f"suggest-cls-app/Modl.{method}"], expected_exit_code=1)
+    assert "Did you mean:" in get_hint(result.exception)
+    assert f"suggest-cls-app/Model.{method}" in get_hint(result.exception)
+
+
+@pytest.mark.parametrize("group", ["function", "server"])
+@pytest.mark.parametrize(
+    "ref_args",
+    [
+        ["my-app.web"],  # `.` instead of `/`
+        ["my-app::web"],  # `::` (as in `modal run file.py::fn`) instead of `/`
+        ["my-app:web"],
+    ],
+)
+def test_ref_separator_mistakes_suggest_slash(set_env_client, group, ref_args):
+    result = run_cli_command([group, "info", *ref_args], expected_exit_code=2)
+    assert "Did you mean:" in result.stderr
+    assert "my-app/web" in result.stderr
+    assert f"{group} info my-app/web" in result.stderr
+
+
+@pytest.mark.parametrize("group", ["function", "server"])
+@pytest.mark.parametrize("separator", [":", "::"])
+def test_colon_separator_fails_without_lookups_and_preserves_invocation(set_env_client, servicer, group, separator):
+    ref = f"my-app.name{separator}Model.train"
+    with servicer.intercept() as ctx:
+        result = run_cli_command([group, "logs", "-e", "staging", ref, "--since=1h"], expected_exit_code=2)
+    assert f"Invalid {group.title()} reference {ref!r}." in result.stderr
+    assert f"Use '/' between the App and {group.title()} names." in result.stderr
+    assert "Did you mean:" in result.stderr
+    assert "my-app.name/Model.train" in result.stderr
+    assert f"modal {group} logs -e staging my-app.name/Model.train --since=1h" in result.stderr
+    assert not ctx.get_requests("ObjectSuggest")
+    assert not ctx.get_requests("FunctionGet")
+
+
+def test_extra_argument_outside_ref_groups_has_no_ref_hint(set_env_client):
+    result = run_cli_command(["app", "logs", "my-app", "train"], expected_exit_code=2)
+    assert "unexpected extra argument" in result.stderr
+    assert "Did you mean" not in result.stderr
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "timeout"])
+@pytest.mark.parametrize("ref", ["my-app.web", "my-app/web"])
+def test_suggestion_lookup_failure_preserves_original_error(set_env_client, servicer, monkeypatch, failure, ref):
+    monkeypatch.setattr("modal.cli.utils.SUGGESTION_RPC_TIMEOUT", 0.05)
+
+    async def fail_suggestion(servicer, stream):
+        await stream.recv_message()
+        if failure == "timeout":
+            await asyncio.sleep(1)
+        raise GRPCError(Status.UNAVAILABLE, "suggestions unavailable")
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("ObjectSuggest", fail_suggestion)
+        started = time.monotonic()
+        result = run_cli_command(["function", "info", ref], expected_exit_code=2 if "/" not in ref else 1)
+        assert time.monotonic() - started < 1
+
+    if "/" not in ref:
+        assert "APP_NAME/FUNCTION_NAME" in result.stderr
+        assert "Did you mean:" in result.stderr
+        assert "my-app/web" in result.stderr
+    else:
+        assert isinstance(result.exception, NotFoundError)
+        assert "Did you mean" not in get_hint(result.exception)
+
+
+def test_ambiguous_separator_hint_shows_canonical_commands(set_env_client, monkeypatch):
+    from click.testing import CliRunner
+
+    from modal.cli.entry_point import entrypoint_cli
+
+    argv = ["modal", "function", "logs", "my-app.name.train", "--since", "1h"]
+    monkeypatch.setattr(sys, "argv", argv)
+    result = CliRunner().invoke(entrypoint_cli, argv[1:])
+    assert result.exit_code == 2
+    assert "function logs my-app/name.train" in result.stderr
+    assert "function logs my-app.name/train" in result.stderr
+    assert "--since 1h" in result.stderr
+
+
+def test_missing_object_hint_lists_corrected_commands(set_env_client, servicer):
+    with servicer.intercept() as ctx:
+        ctx.add_response(
+            "ObjectSuggest",
+            api_pb2.ObjectSuggestResponse(
+                suggestions=[
+                    api_pb2.ObjectSuggestion(app_name="my-app", object_name="train1"),
+                    api_pb2.ObjectSuggestion(app_name="my-app", object_name="train2"),
+                ]
+            ),
+        )
+        result = run_cli_command(["function", "info", "my-app/train"], expected_exit_code=1)
+    assert "function info my-app/train1" in get_hint(result.exception)
+    assert "function info my-app/train2" in get_hint(result.exception)
+
+
+@pytest.mark.parametrize(
+    "group,kind,ref",
+    [
+        ("app", api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_APP, "my-ap"),
+        ("function", api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_FUNCTION, "my-app/trian"),
+        ("server", api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_SERVER, "my-app/trian"),
+    ],
+)
+def test_object_suggestion_request_is_bounded_and_scoped(set_env_client, servicer, group, kind, ref):
+    with servicer.intercept() as ctx:
+        run_cli_command([group, "info", ref, "--env", "staging"], expected_exit_code=1)
+    # Error-path suggestions use one scoped request instead of enumerating workspace objects.
+    requests = ctx.get_requests("ObjectSuggest")
+    assert len(requests) == 1
+    assert requests[0].query == ref
+    assert requests[0].kind == kind
+    assert requests[0].environment_name == "staging"
+    assert not ctx.get_requests("AppList")
+    assert not ctx.get_requests("AppGetInfo")
+
+
+def test_app_name_typo_suggests_corrected_command(set_env_client, servicer):
+    servicer.object_suggestions[api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_APP] = [
+        api_pb2.ObjectSuggestion(object_name="training-app")
+    ]
+    result = run_cli_command(["app", "logs", "training-ap", "--env", "staging"], expected_exit_code=1)
+    assert "Did you mean:" in get_hint(result.exception)
+    assert "training-app" in get_hint(result.exception)
+    assert "app logs training-app" in get_hint(result.exception)
+
+
+@pytest.mark.parametrize("env_first", [False, True])
+@pytest.mark.parametrize("suggestions", [["staging-app"], ["staging-app", "staging-worker"]])
+def test_object_hint_suggests_names_only_when_reference_is_ambiguous(set_env_client, servicer, env_first, suggestions):
+    servicer.object_suggestions[api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_APP] = [
+        api_pb2.ObjectSuggestion(object_name=name) for name in suggestions
+    ]
+    args = ["--env", "staging", "staging"] if env_first else ["staging", "--env", "staging"]
+    result = run_cli_command(["app", "logs", *args], expected_exit_code=1)
+    lines = [line.strip() for line in get_hint(result.exception).splitlines()]
+    assert "Did you mean:" in lines
+    for name in suggestions:
+        assert name in lines
+    assert not any(line.startswith("modal ") for line in lines)
+
+
+@pytest.mark.parametrize(
+    "group,subcommand,options",
+    [
+        ("app", ["info"], ["--json", "--no-color"]),
+        ("app", ["stop"], ["--yes"]),
+        ("app", ["logs"], ["--function", "fu-abc", "--timestamps", "--search", "a b"]),
+        ("function", ["logs"], ["--since", "1h", "--all-variants", "--function-call", "fc-abc", "--timestamps"]),
+        ("function", ["calls"], ["--since", "2h", "--until", "1h", "--all-variants", "--json"]),
+        ("function", ["variants"], ["--limit", "0", "--json"]),
+        ("function", ["autoscaler", "update"], ["--min-containers", "0", "--scaledown-window", "30"]),
+        ("server", ["logs"], ["--since", "1h", "--show-server-id", "--search", "a b"]),
+        ("server", ["stats"], ["--since", "2h", "--container-id", "ta-abc", "--json", "--no-color"]),
+        ("server", ["autoscaler", "update"], ["--min-containers", "0", "--target-concurrency", "none"]),
+    ],
+)
+def test_object_suggestion_preserves_handler_options(set_env_client, servicer, group, subcommand, options):
+    kind = {
+        "app": api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_APP,
+        "function": api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_FUNCTION,
+        "server": api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_SERVER,
+    }[group]
+    app_name = "" if group == "app" else "training-app"
+    object_name = "training-app" if group == "app" else "train"
+    servicer.object_suggestions[kind] = [api_pb2.ObjectSuggestion(app_name=app_name, object_name=object_name)]
+    ref = "training-ap" if group == "app" else "training-app/trian"
+    corrected_ref = "training-app" if group == "app" else "training-app/train"
+    result = run_cli_command([group, *subcommand, ref, "--env", "staging", *options], expected_exit_code=1)
+    message = get_hint(result.exception)
+    retry = next(line.strip() for line in message.splitlines() if line.strip().startswith("modal "))
+    assert shlex.split(retry) == ["modal", group, *subcommand, corrected_ref, "--env", "staging", *options]
+
+
+def test_run_suggestion_places_explicit_options_before_reference(set_env_client, mock_dir):
+    with mock_dir({"hint_options_package": {"__init__.py": "", "worker.py": _SUGGEST_APP}}):
+        result = run_cli_command(
+            [
+                "run",
+                "--profile",
+                "staging",
+                "-m",
+                "--name",
+                "named retry",
+                "--quiet",
+                "--env",
+                "staging",
+                "hint_options_package.worker::trian",
+            ],
+            expected_exit_code=1,
+        )
+        retry = next(line.strip() for line in result.stderr.splitlines() if line.strip().startswith("modal "))
+        args = shlex.split(retry)
+        assert args == [
+            "modal",
+            "run",
+            "--profile",
+            "staging",
+            "-m",
+            "--name",
+            "named retry",
+            "--quiet",
+            "--env",
+            "staging",
+            "hint_options_package.worker::train",
+        ]
+        run_cli_command(args[1:])
+        result = run_cli_command(["run", "-m", "hint_options_package.worker::trian"], expected_exit_code=1)
+        retry = next(line.strip() for line in result.stderr.splitlines() if line.strip().startswith("modal "))
+        assert shlex.split(retry) == ["modal", "run", "-m", "hint_options_package.worker::train"]
+
+
+def test_run_suggestion_omits_entrypoint_arguments(set_env_client, mock_dir):
+    with mock_dir({"suggest_app.py": _SUGGEST_APP}):
+        result = run_cli_command(["run", "suggest_app.py::trian", "--api-key", "sk-123"], expected_exit_code=1)
+    lines = [line.strip() for line in result.stderr.splitlines()]
+    assert "suggest_app.py::train" in lines
+    assert "sk-123" not in result.stderr
+    assert not any(line.startswith("modal ") for line in lines)
+
+
+def test_app_rollback_suggestion_preserves_requested_version(set_env_client, servicer):
+    servicer.object_suggestions[api_pb2.ObjectSuggestRequest.OBJECT_SUGGEST_KIND_APP] = [
+        api_pb2.ObjectSuggestion(object_name="training-app")
+    ]
+    args = ["app", "rollback", "training-ap", "v2", "--env", "staging", "--strategy", "recreate"]
+    result = run_cli_command(args, expected_exit_code=1)
+    assert "modal app rollback training-app v2 --env staging --strategy recreate" in get_hint(result.exception)
+
+
+@pytest.mark.parametrize(
+    "group,command,arguments",
+    [("app", "rollback", ["v2"]), ("app", "stop", ["--yes"]), ("function", "info", []), ("server", "info", [])],
+)
+@pytest.mark.parametrize("profile_first", [False, True])
+def test_object_suggestion_preserves_selected_profile(
+    set_env_client, servicer, group, command, arguments, profile_first
+):
+    kinds = api_pb2.ObjectSuggestRequest
+    kind = {
+        "app": kinds.OBJECT_SUGGEST_KIND_APP,
+        "function": kinds.OBJECT_SUGGEST_KIND_FUNCTION,
+        "server": kinds.OBJECT_SUGGEST_KIND_SERVER,
+    }[group]
+    servicer.object_suggestions[kind] = [
+        api_pb2.ObjectSuggestion(app_name="" if group == "app" else "training-app", object_name="train")
+    ]
+    ref = "trian" if group == "app" else "training-app/trian"
+    for profile in ("staging", "production"):
+        invocation = [group, command, ref, *arguments]
+        profile_args = ["--profile", profile]
+        invocation = profile_args + invocation if profile_first else invocation + profile_args
+        result = run_cli_command(invocation, expected_exit_code=1)
+        retry = next(
+            line.strip() for line in get_hint(result.exception).splitlines() if line.strip().startswith("modal ")
+        )
+        corrected_ref = "train" if group == "app" else "training-app/train"
+        assert shlex.split(retry) == ["modal", *(corrected_ref if arg == ref else arg for arg in invocation)]
+
+    # A later invocation inherits the active profile, but did not pass --profile.
+    result = run_cli_command([group, command, ref, *arguments], expected_exit_code=1)
+    retry = next(line.strip() for line in get_hint(result.exception).splitlines() if line.strip().startswith("modal "))
+    assert shlex.split(retry)[:3] == ["modal", group, command]
+    assert "--profile" not in shlex.split(retry)
+
+
+def test_successful_function_lookup_does_not_request_suggestions(set_env_client, mock_dir, servicer):
+    with mock_dir({"suggest_app.py": _SUGGEST_APP}):
+        run_cli_command(["deploy", "suggest_app.py"])
+        with servicer.intercept() as ctx:
+            run_cli_command(["function", "info", "suggest-app/train"])
+    assert not ctx.get_requests("ObjectSuggest")
+
+
+def test_hallucinated_auth_command_explained_without_credentials(servicer, monkeypatch):
+    servicer.command_suggestion.message = "Modal authentication is managed with 'modal token'.\n    modal token --help"
+    monkeypatch.setattr("modal.client._Client.from_env", mock.Mock(side_effect=AssertionError("Needs no credentials")))
+    with servicer.intercept() as ctx:
+        result = run_cli_command(["auth", "login", "--token-secret", "do-not-send"], expected_exit_code=2)
+    assert "No such command 'auth'." in result.stderr
+    assert "authentication is managed with 'modal token'" in result.stderr
+    assert "modal token --help" in result.stderr
+    assert "modal token login" not in result.stderr
+    assert "Did you mean" not in result.stderr
+    requests = ctx.get_requests("CliCommandSuggest")
+    assert requests
+    assert all(b"do-not-send" not in request.SerializeToString() for request in requests)
+    assert "x-modal-token-secret" not in servicer.last_metadata
+    assert "x-modal-token-id" not in servicer.last_metadata
+
+
+@pytest.mark.parametrize(
+    "override_headers",
+    [{}, {"x-modal-test-route": "worker-b", "x-Alingo-Modal-Core-version": "99.0.0"}],
+)
+def test_command_suggestion_preserves_cached_authenticated_client(
+    servicer, set_env_client, monkeypatch, override_headers
+):
+    monkeypatch.setenv("MODAL_OVERRIDE_HEADERS", ",".join(f"{key}:{value}" for key, value in override_headers.items()))
+    original = modal.Client.from_env()
+    servicer.command_suggestion.message = "Use 'modal token' to authenticate."
+    result = run_cli_command(["auth"], expected_exit_code=2)
+    assert "Use 'modal token' to authenticate." in result.stderr
+    assert modal.Client.from_env() is original
+    assert not original.is_closed()
+    for key, value in override_headers.items():
+        assert servicer.last_metadata[key] == value
+    original.hello()
+
+
+def test_newer_command_suggestion_overrides_local_fuzzy_hint(servicer):
+    servicer.command_suggestion.CopyFrom(
+        api_pb2.CliCommandSuggestResponse(
+            message="A newer version provides 'modal serve-next'. Upgrade Modal, then retry:",
+            append_original_command=True,
+        )
+    )
+    result = run_cli_command(["serve-next", "logs", "my-app/web", "--since", "1h"], expected_exit_code=2)
+    assert "A newer version provides 'modal serve-next'" in result.stderr
+    assert "modal serve-next logs my-app/web --since 1h" in result.stderr
+    assert "Did you mean" not in result.stderr
+
+
+def test_command_suggestion_does_not_replace_local_logs_suggestions(servicer):
+    result = run_cli_command(["logs"], expected_exit_code=2)
+    assert "Did you mean:" in result.stderr
+    for group in ["app", "container", "endpoint", "function", "image"]:
+        assert f"entrypoint-cli {group} logs" in result.stderr
+    assert "... (see 'entrypoint-cli --help')" in result.stderr
+
+
+def test_nested_command_suggestion_sends_only_command_path(servicer):
+    with servicer.intercept() as ctx:
+        run_cli_command(["endpoint", "statistics", "private-app/secret", "--since", "1h"], expected_exit_code=2)
+    requests = ctx.get_requests("CliCommandSuggest")
+    assert requests
+    for request in requests:
+        assert request == api_pb2.CliCommandSuggestRequest(parent_path=["endpoint"], unknown_command="statistics")
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "timeout", "unimplemented"])
+def test_command_suggestion_failure_preserves_local_hints(servicer, monkeypatch, failure):
+    monkeypatch.setattr("modal.cli._help.COMMAND_SUGGESTION_TIMEOUT", 0.05)
+
+    async def fail_explanation(servicer, stream):
+        await stream.recv_message()
+        if failure == "timeout":
+            await asyncio.sleep(1)
+        raise GRPCError(Status.UNIMPLEMENTED if failure == "unimplemented" else Status.UNAVAILABLE, "No guidance")
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("CliCommandSuggest", fail_explanation)
+        started = time.monotonic()
+        result = run_cli_command(["fucntion", "logs", "my-app/train"], expected_exit_code=2)
+        assert time.monotonic() - started < 1
+    assert "Did you mean 'function'?" in result.stderr
+    assert "my-app/train" not in result.stderr
+
+
+@pytest.mark.parametrize("append_original", [False, True])
+def test_empty_command_suggestion_preserves_local_hints(servicer, append_original):
+    servicer.command_suggestion.append_original_command = append_original
+    result = run_cli_command(["fucntion"], expected_exit_code=2)
+    assert "Did you mean" in result.stderr
+
+
+@pytest.mark.parametrize("append_original", [False, True])
+def test_command_suggestion_preserves_full_invocation_locally(servicer, append_original):
+    servicer.command_suggestion.message = "Server-provided guidance."
+    servicer.command_suggestion.append_original_command = append_original
+    result = run_cli_command(
+        ["--profile", "dev", "endpoint", "statistics", "my app/web", "--since", "1h"], expected_exit_code=2
+    )
+    assert "Server-provided guidance." in result.stderr
+    retry = "modal --profile dev endpoint statistics 'my app/web' --since 1h"
+    assert (retry in result.stderr) == append_original
+    assert "Did you mean" not in result.stderr
+
+
+def test_command_suggestion_skips_help_options_and_dynamic_run_refs(servicer, mock_dir, set_env_client):
+    with servicer.intercept() as ctx:
+        run_cli_command(["--help"])
+        run_cli_command(["function", "--no-such-option"], expected_exit_code=2)
+        with mock_dir({"suggest_app.py": _SUGGEST_APP}):
+            run_cli_command(["run", "suggest_app.py::trian"], expected_exit_code=1)
+    assert not ctx.get_requests("CliCommandSuggest")

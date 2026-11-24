@@ -1,0 +1,818 @@
+# Copyright Modal Labs 2026
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import pytest
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import aiohttp.web
+import jwt
+import pytest_asyncio
+
+from modal import App, Sandbox
+from modal._utils.http_utils import run_temporary_http_server
+from modal.client import Client
+from modal.exception import (
+    AlreadyExistsError,
+    AuthError,
+    InvalidError,
+    NotFoundError,
+    PermissionDeniedError,
+    ServiceError,
+)
+from modal.experimental import IdempotencyConflict, Stream, StreamInfo
+from modal.experimental.stream import MAX_VALUE_BYTES, AppendResult, StreamToken
+from modal_proto import api_pb2
+
+WORKSPACE_ID = "ac-" + "a" * 22
+
+
+def _error(status: int, code: str, **extra):
+    return aiohttp.web.json_response({"error": {"code": code, "message": code, **extra}}, status=status)
+
+
+class FakeStreamsService:
+    """The streams HTTP API for one environment, stamping entry `seq` at `seq` seconds past the epoch."""
+
+    def __init__(self):
+        self.runs: dict[str, dict] = {}
+        self.tokens: dict[str, dict] = {}
+        # Identity tokens the service accepts, by the sandbox each proves.
+        self.identities: dict[str, str] = {}
+        self.refreshes: list[dict] = []
+        self.expired_rejections = 0
+        # Refreshes wait while `hold_refreshes` is set.
+        self.hold_refreshes: asyncio.Event | None = None
+        # Blob uploads by `<run id>/<sha256>`, served at presigned URLs that need no credentials.
+        self.blobs: dict[str, bytes] = {}
+        self.max_blob_bytes = 1 << 30
+        self.uploading = self.max_uploading = 0
+        # Uploads wait while `hold_uploads` is set.
+        self.hold_uploads: asyncio.Event | None = None
+        self.requests: list[aiohttp.web.Request] = []
+        # Ends the next follow response, without a seal, after this many entries.
+        self.drop_follow_after: int | None = None
+        # Appends set `append_arrived`, then wait while `hold_appends` is set.
+        self.append_arrived = asyncio.Event()
+        self.hold_appends: asyncio.Event | None = None
+        # Per follow request in order: an error status to send, or 0 to end the response with no entries.
+        self.follow_script: list[int] = []
+        # Creates and deletes that apply and then answer 503, as if the response were lost.
+        self.lose_write_responses = 0
+        self.changed = asyncio.Condition()
+        self.app = aiohttp.web.Application(middlewares=[self._record])
+        self.app.add_routes(
+            [
+                aiohttp.web.post("/v1/runs", self.create),
+                aiohttp.web.get("/v1/runs/{run}", self.get_run),
+                aiohttp.web.delete("/v1/runs/{run}", self.delete),
+                aiohttp.web.post("/v1/runs/{run}/append", self.append),
+                aiohttp.web.post("/v1/runs/{run}/seal", self.seal),
+                aiohttp.web.get("/v1/runs/{run}/events", self.events),
+                aiohttp.web.post("/v1/runs/{run}/tokens", self.mint_token),
+                aiohttp.web.post("/v1/tokens/refresh", self.refresh_token),
+                aiohttp.web.post("/v1/runs/{run}/blobs", self.presign_put),
+                aiohttp.web.get("/v1/runs/{run}/blobs/{run_id}/{sha256}", self.presign_get),
+                aiohttp.web.put("/presigned/{run_id}/{sha256}", self.put_blob),
+                aiohttp.web.get("/presigned/{run_id}/{sha256}", self.get_blob),
+            ]
+        )
+
+    @aiohttp.web.middleware
+    async def _record(self, request, handler):
+        self.requests.append(request)
+        if request.path.startswith("/presigned/"):
+            assert "Authorization" not in request.headers
+            return await handler(request)
+        grant = self.tokens.get(request.headers["Authorization"].removeprefix("Bearer "))
+        if grant is not None and request.path != "/v1/tokens/refresh":
+            if "x-streams-environment" in request.headers:
+                return _error(400, "invalid")
+            if time.time() >= grant["expires_at"]:
+                self.expired_rejections += 1
+                return _error(401, "token_expired")
+            if request.match_info.get("run") != grant["run"] or request.path.endswith("/tokens"):
+                return _error(403, "permission_denied")
+            if grant["access"] == "read" and request.method != "GET":
+                return _error(403, "permission_denied")
+        return await handler(request)
+
+    async def mint_token(self, request):
+        body, run = await request.json(), request.match_info["run"]
+        if body.get("create_if_missing"):
+            self.runs.setdefault(run, {"gen": 1, "events": [], "sealed": False, "retention_s": body.get("retention_s")})
+        if run not in self.runs:
+            return _error(404, "not_found")
+        grant = {"run": run, "access": body["access"], "ttl_s": body["ttl_s"], "sandbox": body.get("sandbox_id")}
+        return self._mint(grant)
+
+    def _mint(self, grant):
+        expires_at = int(time.time()) + grant["ttl_s"]
+        sandbox = grant["sandbox"] or ""
+        token = f"v4.{WORKSPACE_ID}.main.{grant['run']}.r1.{grant['access']}.{sandbox}.{grant['ttl_s']}.{expires_at}."
+        token += uuid.uuid4().hex
+        self.tokens[token] = {**grant, "expires_at": expires_at}
+        return aiohttp.web.json_response({"token": token, "expires_at": expires_at})
+
+    async def refresh_token(self, request):
+        body = await request.json()
+        self.refreshes.append({"token": request.headers["Authorization"].removeprefix("Bearer "), **body})
+        if self.hold_refreshes is not None:
+            await self.hold_refreshes.wait()
+        grant = self.tokens.get(self.refreshes[-1]["token"])
+        if grant is None:
+            return _error(401, "unauthenticated")
+        if grant["sandbox"] is None:
+            return _error(403, "forbidden")
+        if self.identities.get(body["identity_token"]) != grant["sandbox"]:
+            return _error(403, "forbidden")
+        return self._mint(grant)
+
+    async def create(self, request):
+        body = await request.json()
+        if body["run_id"] in self.runs:
+            return _error(409, "already_exists")
+        events, retention_s = [], body.get("retention_s")
+        if (parent := body.get("parent_run_id")) is not None:
+            if parent not in self.runs:
+                return _error(404, "not_found")
+            parent_events = [e for e in self.runs[parent]["events"] if e["kind"] != "seal"]
+            events = parent_events[: body.get("fork_seq", len(parent_events))]
+            retention_s = retention_s or self.runs[parent]["retention_s"]
+        self.runs[body["run_id"]] = {
+            "gen": 1,
+            "events": events,
+            "sealed": False,
+            "retention_s": retention_s,
+            "parent_run_id": parent,
+            "fork_seq": len(events) if parent else None,
+        }
+        return self._maybe_lose(aiohttp.web.json_response({"run_id": body["run_id"], "gen": 1}))
+
+    def _maybe_lose(self, response):
+        if self.lose_write_responses:
+            self.lose_write_responses -= 1
+            return _error(503, "unavailable")
+        return response
+
+    async def delete(self, request):
+        if self.runs.pop(request.match_info["run"], None) is None:
+            return _error(404, "not_found")
+        return self._maybe_lose(aiohttp.web.Response(status=204))
+
+    async def get_run(self, request):
+        if (run := self.runs.get(request.match_info["run"])) is None:
+            return _error(404, "not_found")
+        fields = {
+            "gen": run["gen"],
+            "head_seq": len(run["events"]),
+            "sealed": run["sealed"],
+            "created_ts_us": 0,
+            "last_event_ts_us": len(run["events"]) * 1_000_000,
+            "expires_ts_us": run["retention_s"] and (len(run["events"]) + run["retention_s"]) * 1_000_000,
+        }
+        if run["sealed"]:
+            fields["sealed_seq"] = len(run["events"])
+        return aiohttp.web.json_response(
+            {**fields, "parent_run_id": run.get("parent_run_id"), "fork_seq": run.get("fork_seq")}
+        )
+
+    async def append(self, request):
+        self.append_arrived.set()
+        if self.hold_appends is not None:
+            await self.hold_appends.wait()
+        if (run := self.runs.get(request.match_info["run"])) is None:
+            return _error(404, "not_found")
+        body = await request.json()
+        if not all(ev["op_id"] for ev in body["events"]):
+            return _error(400, "invalid_argument")
+        if any(len(json.dumps(ev.get("value"), separators=(",", ":")).encode()) > 64 * 1024 for ev in body["events"]):
+            return _error(413, "too_large")
+        stored = {e["op_id"]: e for e in run["events"]}
+        for ev in body["events"]:
+            prior = stored.get(ev["op_id"])
+            if prior is not None and (prior.get("value"), prior.get("ref")) != (ev.get("value"), ev.get("ref")):
+                return _error(409, "idempotency_conflict", op_id=ev["op_id"], seq=prior["seq"])
+        if any(ev["op_id"] not in stored for ev in body["events"]) and body["gen"] != run["gen"]:
+            return _error(409, "fenced")
+        results = []
+        for ev in body["events"]:
+            if (prior := stored.get(ev["op_id"])) is None:
+                prior = stored[ev["op_id"]] = {**ev, "seq": len(run["events"]) + 1}
+                prior["ts_us"] = prior["seq"] * 1_000_000
+                run["events"].append(prior)
+                results.append({"seq": prior["seq"], "deduped": False})
+            else:
+                results.append({"seq": prior["seq"], "deduped": True})
+        async with self.changed:
+            self.changed.notify_all()
+        return aiohttp.web.json_response({"results": results})
+
+    async def presign_put(self, request):
+        body, run_id = await request.json(), f"st-{request.match_info['run']}"
+        assert body.keys() == {"sha256", "size"}
+        if request.match_info["run"] not in self.runs:
+            return _error(404, "not_found")
+        if body["size"] > self.max_blob_bytes:
+            return _error(413, "too_large")
+        checksum = base64.b64encode(bytes.fromhex(body["sha256"])).decode()
+        return aiohttp.web.json_response(
+            {
+                "ref": f"blob:{run_id}/{body['sha256']}",
+                "url": f"{request.url.origin()}/presigned/{run_id}/{body['sha256']}?signature=fake",
+                "headers": {"content-length": str(body["size"]), "x-amz-checksum-sha256": checksum},
+                "expires_at": int(time.time()) + 600,
+            }
+        )
+
+    async def presign_get(self, request):
+        run_id, sha256 = request.match_info["run_id"], request.match_info["sha256"]
+        if run_id != f"st-{request.match_info['run']}":
+            return _error(403, "forbidden")
+        url = f"{request.url.origin()}/presigned/{run_id}/{sha256}?signature=fake"
+        return aiohttp.web.json_response({"url": url, "expires_at": int(time.time()) + 600})
+
+    async def put_blob(self, request):
+        self.uploading += 1
+        self.max_uploading = max(self.max_uploading, self.uploading)
+        async with self.changed:
+            self.changed.notify_all()
+        try:
+            if self.hold_uploads is not None:
+                await self.hold_uploads.wait()
+            data, sha256 = await request.read(), request.match_info["sha256"]
+            checksum = base64.b64encode(hashlib.sha256(data).digest()).decode()
+            if request.headers.get("x-amz-checksum-sha256") != checksum or hashlib.sha256(data).hexdigest() != sha256:
+                return aiohttp.web.Response(status=400)
+            self.blobs[f"{request.match_info['run_id']}/{sha256}"] = data
+            return aiohttp.web.Response()
+        finally:
+            self.uploading -= 1
+
+    async def get_blob(self, request):
+        key = f"{request.match_info['run_id']}/{request.match_info['sha256']}"
+        if key not in self.blobs:
+            return aiohttp.web.Response(status=404)
+        return aiohttp.web.Response(body=self.blobs[key])
+
+    async def seal(self, request):
+        run = self.runs[request.match_info["run"]]
+        if not run["sealed"]:
+            seq = len(run["events"]) + 1
+            seal = {"op_id": "dlog:seal", "kind": "seal", "value": {"gen": run["gen"]}}
+            run["events"].append({**seal, "seq": seq, "ts_us": seq * 1_000_000})
+            run["sealed"] = True
+        async with self.changed:
+            self.changed.notify_all()
+        return aiohttp.web.json_response({"sealed_seq": len(run["events"])})
+
+    async def events(self, request):
+        if (run := self.runs.get(request.match_info["run"])) is None:
+            return _error(404, "not_found")
+        q, events = request.query, run["events"]
+        start = int(q.get("from_seq", 1))
+        if q.get("follow") != "true":
+            page = events[start - 1 : start - 1 + int(q["limit"])]
+            headers = {"x-dlog-head-seq": str(len(events)), "x-dlog-next-seq": str(start + len(page))}
+            return aiohttp.web.Response(text="".join(json.dumps(e) + "\n" for e in page), headers=headers)
+        resp = aiohttp.web.StreamResponse(headers={"content-type": "text/event-stream"})
+        await resp.prepare(request)
+        if self.follow_script:
+            if status := self.follow_script.pop(0):
+                error = {"status": status, "code": "unavailable", "message": "read failed"}
+                await resp.write(f"event: error\ndata: {json.dumps(error)}\n\n".encode())
+            return resp
+        drop_after, self.drop_follow_after = self.drop_follow_after, None
+        sent = 0
+        while True:
+            while start <= len(events):
+                if sent == drop_after:
+                    return resp
+                await resp.write(f"id: {start}\ndata: {json.dumps(events[start - 1])}\n\n".encode())
+                start, sent = start + 1, sent + 1
+            if run["sealed"]:
+                await resp.write(b"event: sealed\ndata:\n\n")
+                return resp
+            async with self.changed:
+                await self.changed.wait()
+
+
+@pytest_asyncio.fixture
+async def service(monkeypatch, servicer):
+    servicer.auth_token = jwt.encode(
+        {"exp": int(time.time()) + 3600, "workspace_id": WORKSPACE_ID},
+        "a-shared-secret-of-at-least-32-bytes",
+        algorithm="HS256",
+    )
+    fake = FakeStreamsService()
+    async with run_temporary_http_server(fake.app) as url:
+        monkeypatch.setenv("MODAL_STREAMS_URL", url)
+        yield fake
+
+
+@pytest.mark.asyncio
+async def test_from_name_and_append(client, servicer, service, monkeypatch):
+    with pytest.raises(NotFoundError):
+        await Stream.from_name("missing", client=client).append.aio(1)
+
+    stream = Stream.from_name("s", create_if_missing=True, retention=timedelta(days=2), client=client)
+    assert await stream.append.aio("a") == AppendResult(seq=1, deduped=False)
+    assert service.runs["s"]["retention_s"] == 2 * 86400
+    with pytest.raises(InvalidError, match="at least one hour"):
+        Stream.from_name("s", create_if_missing=True, retention=timedelta(minutes=59))
+    # A second handle finds the stream and writes alongside the first.
+    other = Stream.from_name("s", create_if_missing=True, client=client)
+    assert await other.append.aio("b") == AppendResult(seq=2, deduped=False)
+    assert await stream.append.aio("c") == AppendResult(seq=3, deduped=False)
+    # A writer outside this API takes a new generation; the handle picks it up and resends.
+    service.runs["s"]["gen"] = 2
+    assert await stream.append.aio("d") == AppendResult(seq=4, deduped=False)
+
+    assert {r.headers["x-streams-environment"] for r in service.requests} == {"main"}
+    assert {r.headers["Authorization"] for r in service.requests} == {f"Bearer {servicer.auth_token}"}
+
+    with pytest.raises(InvalidError, match="JSON"):
+        await stream.append.aio(float("nan"))
+    with pytest.raises(InvalidError, match="surrogates"):
+        await stream.append.aio("\ud800")
+    with pytest.raises(InvalidError, match="Invalid Stream name"):
+        Stream.from_name("a.b", client=client)
+
+    # An empty setting means the default service, here pointed at the fake one.
+    monkeypatch.setattr("modal.experimental.stream.DEFAULT_STREAMS_URL", os.environ["MODAL_STREAMS_URL"])
+    monkeypatch.setenv("MODAL_STREAMS_URL", "")
+    assert await Stream.from_name("s", client=client).append.aio("e") == AppendResult(seq=5, deduped=False)
+
+    sent = len(service.requests)
+    for url in ("https://streams.example.com", "https://localhost.example.com", "https://127.0.0.1.nip.io"):
+        monkeypatch.setenv("MODAL_STREAMS_URL", url)
+        with pytest.raises(InvalidError, match="localhost"):
+            await Stream.from_name("s", client=client).append.aio("e")
+    assert len(service.requests) == sent
+
+
+@pytest.mark.asyncio
+async def test_default_environment_is_per_client(client, servicer, service, credentials):
+    await Stream.from_name("s", create_if_missing=True, client=client).append.aio(1)
+    # A second client whose workspace has a different default environment.
+    servicer.environments = {"staging": "en-2", **servicer.environments}
+    async with Client(servicer.client_addr, api_pb2.CLIENT_TYPE_CLIENT, credentials) as other:
+        await Stream.from_name("s", create_if_missing=True, client=other).append.aio(2)
+    assert [r.headers["x-streams-environment"] for r in service.requests] == ["main"] * 2 + ["staging"] * 3
+
+
+@pytest.mark.asyncio
+async def test_name_limits(client, service):
+    await Stream.from_name("n" * 64, create_if_missing=True, client=client).append.aio(1)
+    for name in ["n" * 65, "", "a.b"]:
+        with pytest.raises(InvalidError, match="1-64 alphanumeric"):
+            Stream.from_name(name)
+
+
+@pytest.mark.asyncio
+async def test_append_many_dedupe(client, service):
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    assert await stream.append.aio({"n": 1}, idempotency_key="k1") == AppendResult(1, False)
+    assert await stream.append.aio({"n": 1}, idempotency_key="k1") == AppendResult(1, True)
+    results = await stream.append_many.aio([{"n": 1}, {"n": 2}], idempotency_keys=["k1", "k2"])
+    assert results == [AppendResult(1, True), AppendResult(2, False)]
+
+    with pytest.raises(IdempotencyConflict) as exc_info:
+        await stream.append_many.aio([{"n": 3}, {"n": 99}], idempotency_keys=["k3", "k2"])
+    assert (exc_info.value.idempotency_key, exc_info.value.seq) == ("k2", 2)
+    assert len(service.runs["s"]["events"]) == 2
+    with pytest.raises(InvalidError, match="distinct"):
+        await stream.append_many.aio([{"n": 3}, {"n": 4}], idempotency_keys=["k3", "k3"])
+    assert await stream.append_many.aio(v for v in [{"n": 5}]) == [AppendResult(3, False)]
+
+
+@pytest.mark.asyncio
+async def test_fork(client, service, monkeypatch):
+    monkeypatch.setattr("modal.experimental.stream.RETRY_MAX_DELAY_S", 0)
+    stream = Stream.from_name("s", create_if_missing=True, retention=timedelta(days=3), client=client)
+    await stream.append_many.aio(["a", "b", "c"])
+    fork = await stream.fork.aio("f", at=2, retention=timedelta(hours=2))
+    assert service.runs["f"]["retention_s"] == 7200
+    assert await fork.append.aio("x") == AppendResult(seq=3, deduped=False)
+    assert [e.value async for e in fork.read.aio()] == ["a", "b", "x"]
+    assert [e.value async for e in stream.read.aio()] == ["a", "b", "c"]
+
+    # A fork created by a request whose response was lost is found by the retry.
+    service.lose_write_responses = 1
+    whole = await stream.fork.aio("g")
+    assert service.runs["g"]["retention_s"] == 3 * 86400
+    assert [e.value async for e in whole.read.aio()] == ["a", "b", "c"]
+    with pytest.raises(AlreadyExistsError):
+        await stream.fork.aio("f", at=1)
+    with pytest.raises(AlreadyExistsError):
+        await whole.fork.aio("f")
+    # An older fork of the same parent is not mistaken for one of all its current entries.
+    await stream.append.aio("d")
+    with pytest.raises(AlreadyExistsError):
+        await stream.fork.aio("g")
+
+
+@pytest.mark.asyncio
+async def test_delete(client, service):
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    await stream.append.aio("a")
+    await Stream.objects.delete.aio("s", client=client)
+    with pytest.raises(NotFoundError):
+        await stream.append.aio("b")
+    with pytest.raises(NotFoundError):
+        await Stream.objects.delete.aio("s", client=client)
+    await Stream.objects.delete.aio("s", allow_missing=True, client=client)
+
+    # A delete is sent once, so a lost response surfaces instead of being resent.
+    await Stream.from_name("t", create_if_missing=True, client=client).append.aio("a")
+    service.lose_write_responses = 1
+    with pytest.raises(ServiceError):
+        await Stream.objects.delete.aio("t", client=client)
+    assert [r.method for r in service.requests].count("DELETE") == 4
+
+
+@pytest.mark.asyncio
+async def test_read_and_info(client, service):
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    await stream.append_many.aio(["a", "b", "c"], idempotency_keys=["k1", "k2", "k3"])
+
+    entries = [e async for e in stream.read.aio()]
+    assert [(e.seq, e.idempotency_key, e.kind, e.value) for e in entries] == [
+        (1, "k1", "value", "a"),
+        (2, "k2", "value", "b"),
+        (3, "k3", "value", "c"),
+    ]
+    assert entries[1].ts == datetime.fromtimestamp(2, tz=timezone.utc)
+    assert [e.value async for e in stream.read.aio(3)] == ["c"]
+    assert (await asyncio.to_thread(lambda: stream[2])).value == "b"
+    for seq in (4, 0):
+        with pytest.raises(IndexError):
+            await asyncio.to_thread(stream.__getitem__, seq)
+    with pytest.raises(TypeError):
+        await asyncio.to_thread(stream.__getitem__, slice(1, 2))  # type: ignore[arg-type]
+
+    epoch = datetime.fromtimestamp(0, tz=timezone.utc)
+    assert await stream.info.aio() == StreamInfo("s", 3, False, epoch, epoch + timedelta(seconds=3), None)
+    kept = Stream.from_name("kept", create_if_missing=True, retention=timedelta(hours=1), client=client)
+    info = await kept.info.aio()
+    assert (info.last_seq, info.expires_at) == (0, epoch + timedelta(hours=1))
+
+
+@pytest.mark.asyncio
+async def test_follow_resumes_after_dropped_connection(client, service):
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    await stream.append_many.aio(["a", "b", "c"])
+    service.drop_follow_after = 1
+
+    seen = []
+    async for entry in stream.read.aio(2, follow=True):
+        seen.append(entry.value)
+        if entry.value == "c":
+            await stream.append.aio("d")
+            await stream.seal.aio()
+    assert seen == ["b", "c", "d", {"gen": 1}]
+    follows = [dict(r.query) for r in service.requests if r.query.get("follow") == "true"]
+    assert follows == [{"follow": "true", "from_seq": "2"}, {"follow": "true", "from_seq": "3"}]
+
+
+@pytest.mark.asyncio
+async def test_follow_gives_up_on_repeated_errors(client, service, monkeypatch):
+    # Each scripted error waits 0.02 s, far inside the 0.5 s deadline, so scheduling delays cannot flake this.
+    for name, value in [("RETRY_DEADLINE_S", 0.5), ("RETRY_BASE_DELAY_S", 0.02), ("RETRY_MAX_DELAY_S", 0.02)]:
+        monkeypatch.setattr(f"modal.experimental.stream.{name}", value)
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    service.follow_script = [503] * 100
+    with pytest.raises(ServiceError, match="read failed"):
+        async for _ in stream.read.aio(follow=True):
+            pass
+    assert 1 < 100 - len(service.follow_script) < 100
+    # Errors between connections that end cleanly do not add up, though together they outlast the deadline.
+    service.follow_script = [503, 503, 0] * 15
+    await stream.seal.aio()
+    assert [e.kind async for e in stream.read.aio(follow=True)] == ["seal"]
+    service.follow_script = [410]
+    with pytest.raises(NotFoundError):
+        async for _ in stream.read.aio(follow=True):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_writer_reports_written_and_conflicts(client, service):
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    await stream.append.aio("taken", idempotency_key="dup")
+    written: list[tuple[str, AppendResult]] = []
+    conflicts: list[IdempotencyConflict] = []
+    async with stream.writer(on_written=lambda k, r: written.append((k, r)), on_conflict=conflicts.append) as w:
+        await w.append.aio("a", idempotency_key="k1")
+        await w.flush.aio()
+        service.hold_appends, service.append_arrived = asyncio.Event(), asyncio.Event()
+        await w.append.aio("b", idempotency_key="k2")
+        await service.append_arrived.wait()
+        # Queued behind "b", these go in one batch up to the reused "k3"; the conflicting "dup" is dropped from it.
+        for key, value in [("k3", "c"), ("dup", "other"), ("k4", "d"), ("k3", "not c")]:
+            await w.append.aio(value, idempotency_key=key)
+        service.hold_appends.set()
+        await w.flush.aio()
+        assert written == [
+            ("k1", AppendResult(2, False)),
+            ("k2", AppendResult(3, False)),
+            ("k3", AppendResult(4, False)),
+            ("k4", AppendResult(5, False)),
+        ]
+        assert [(c.idempotency_key, c.seq) for c in conflicts] == [("dup", 1), ("k3", 4)]
+    with pytest.raises(InvalidError, match="closed"):
+        await w.append.aio("late")
+
+    writer = stream.writer()
+    await writer.append.aio("other", idempotency_key="dup")
+    with pytest.raises(IdempotencyConflict):
+        await writer.flush.aio()
+    with pytest.raises(IdempotencyConflict):
+        await writer.append.aio("next")
+    with pytest.raises(IdempotencyConflict):
+        await writer.close.aio()
+
+    # An empty key is sent as given, as `Stream.append` sends it.
+    with pytest.raises(InvalidError):
+        await stream.append.aio("v", idempotency_key="")
+    writer = stream.writer()
+    await writer.append.aio("v", idempotency_key="")
+    with pytest.raises(InvalidError):
+        await writer.close.aio()
+
+
+@pytest.mark.asyncio
+async def test_writer_waits_while_full(client, service, monkeypatch):
+    monkeypatch.setattr("modal.experimental.stream.WRITER_MAX_PENDING", 1)
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    service.hold_appends = asyncio.Event()
+    async with stream.writer() as w:
+        await w.append.aio("a")
+        await service.append_arrived.wait()
+        second = asyncio.ensure_future(w.append.aio("b"))
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(second), 0.2)
+        service.hold_appends.set()
+        await second
+    assert [e["value"] for e in service.runs["s"]["events"]] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_writer_sync_append_from_threads(client, service, monkeypatch):
+    monkeypatch.setattr("modal.experimental.stream.WRITER_MAX_PENDING", 20)
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    w = stream.writer()
+
+    def produce(i: int) -> None:
+        for n in range(50):
+            w.append(f"{i}-{n}")
+
+    await asyncio.gather(*(asyncio.to_thread(produce, i) for i in range(4)))
+    await w.close.aio()
+    written = [e["value"] for e in service.runs["s"]["events"]]
+    assert len(written) == 200
+    for i in range(4):
+        assert [v for v in written if v.startswith(f"{i}-")] == [f"{i}-{n}" for n in range(50)]
+
+
+@pytest.mark.asyncio
+async def test_writer_close_again_after_a_cancelled_close(client, service):
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    service.hold_appends = asyncio.Event()
+    w = stream.writer()
+    await w.append.aio("a")
+    await service.append_arrived.wait()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(w.close.aio(), 0.2)
+    service.hold_appends.set()
+    await asyncio.wait_for(w.close.aio(), 10)
+    assert [e["value"] for e in service.runs["s"]["events"]] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_writer_close_rejects_waiting_append(client, service, monkeypatch):
+    monkeypatch.setattr("modal.experimental.stream.WRITER_MAX_PENDING", 1)
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    service.hold_appends = asyncio.Event()
+    w = stream.writer()
+    await w.append.aio("a")
+    await service.append_arrived.wait()
+    waiting = asyncio.ensure_future(w.append.aio("b"))
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(waiting), 0.2)
+    closing = asyncio.ensure_future(w.close.aio())
+    try:
+        with pytest.raises(InvalidError, match="closed"):
+            await asyncio.wait_for(waiting, 5)
+        assert not closing.done()
+    finally:
+        service.hold_appends.set()
+    await closing
+    assert [e["value"] for e in service.runs["s"]["events"]] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_access_tokens(client, service, monkeypatch):
+    stream = Stream.from_name("s", client=client)
+    with pytest.raises(NotFoundError):
+        await stream.create_token.aio()
+    write_token = (await stream.create_token.aio(create_if_missing=True, retention=timedelta(hours=2))).token
+    assert service.runs["s"]["retention_s"] == 7200
+    before = time.time()
+    read = await stream.create_token.aio(access="read", ttl=timedelta(minutes=5))
+    assert isinstance(read, StreamToken)
+    assert int(before) + 300 <= read.expires_at.timestamp() <= time.time() + 300
+    with pytest.raises(InvalidError, match="between one second and one hour"):
+        await stream.create_token.aio(ttl=timedelta(hours=2))
+    read_token = read.token
+
+    # Token holders need no Modal credentials.
+    async def no_client():
+        raise AssertionError("token handles must not create a Modal client")
+
+    monkeypatch.setattr("modal.experimental.stream._Client.from_env", no_client)
+    writer = Stream.from_token(write_token, name="s")
+    assert await writer.append.aio("a") == AppendResult(1, False)
+    async with writer.writer() as w:
+        await w.append.aio("b")
+    reader = Stream.from_token(read_token, name="s")
+    assert [e.value async for e in reader.read.aio()] == ["a", "b"]
+    with pytest.raises(PermissionDeniedError):
+        await reader.append.aio("c")
+    with pytest.raises(PermissionDeniedError):
+        await Stream.from_token(write_token, name="other").read.aio().__anext__()
+    assert await writer.seal.aio() == 3
+    assert [e.seq async for e in reader.read.aio(follow=True)] == [1, 2, 3]
+
+    service.tokens[read_token]["expires_at"] = 0
+    with pytest.raises(AuthError, match="token_expired"):
+        async for _ in reader.read.aio(follow=True):
+            pass
+    with pytest.raises(InvalidError, match="Modal credentials"):
+        await writer.create_token.aio()
+    with pytest.raises(InvalidError, match="create_if_missing"):
+        await stream.create_token.aio(retention=timedelta(hours=1))
+
+
+@pytest_asyncio.fixture
+async def sandbox(client, servicer):
+    app = App()
+    async with app.run(client=client):
+        yield await Sandbox.create.aio(app=app, include_oidc_identity_token=True, client=client)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_bound_token_refreshes(client, service, sandbox, monkeypatch, tmp_path):
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    bound = await stream.create_token.aio(sandbox=sandbox)
+    assert service.tokens[bound.token]["sandbox"] == sandbox.object_id
+    identity_file = tmp_path / "identity"
+    identity_file.write_text("identity-1\n")
+    monkeypatch.setenv("MODAL_IDENTITY_TOKEN_FILE", str(identity_file))
+    service.identities = {"identity-1": sandbox.object_id, "identity-2": sandbox.object_id}
+
+    handle = Stream.from_token(bound.token, name="s")
+    assert await handle.append.aio("a") == AppendResult(1, False)
+    assert service.refreshes == []
+    # An expired token is refreshed with the identity token, and the request is resent with the new one.
+    service.tokens[bound.token]["expires_at"] = 0
+    assert await handle.append.aio("b") == AppendResult(2, False)
+    assert service.refreshes == [{"token": bound.token, "identity_token": "identity-1"}]
+    current = service.requests[-1].headers["Authorization"].removeprefix("Bearer ")
+    assert current != bound.token and service.tokens[current]["sandbox"] == sandbox.object_id
+
+    # The identity token file is reread, since it is rewritten as the identity token renews.
+    identity_file.write_text("identity-2")
+    service.tokens[current]["expires_at"] = 0
+    assert await handle.append.aio("c") == AppendResult(3, False)
+    assert service.refreshes[-1] == {"token": current, "identity_token": "identity-2"}
+
+    # So is one that expires under a followed read.
+    current = service.requests[-1].headers["Authorization"].removeprefix("Bearer ")
+    service.tokens[current]["expires_at"] = 0
+    await stream.seal.aio()
+    assert [e.seq async for e in handle.read.aio(follow=True)] == [1, 2, 3, 4]
+    assert len(service.refreshes) == 3
+
+    # Requests that find the token expired together share one refresh.
+    current = service.requests[-1].headers["Authorization"].removeprefix("Bearer ")
+    service.tokens[current]["expires_at"] = 0
+    service.hold_refreshes, rejected = asyncio.Event(), service.expired_rejections
+    reads = [asyncio.ensure_future(handle.read.aio().__anext__()) for _ in range(5)]
+    while service.expired_rejections < rejected + 5:
+        await asyncio.sleep(0.01)
+    service.hold_refreshes.set()
+    assert [(await r).seq for r in reads] == [1] * 5
+    assert len(service.refreshes) == 4
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_needs_a_bound_token_and_identity(client, service, sandbox, monkeypatch):
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    unbound = (await stream.create_token.aio()).token
+    bound = (await stream.create_token.aio(sandbox=sandbox)).token
+    service.identities = {"identity": sandbox.object_id}
+    for token in (unbound, bound):
+        service.tokens[token]["expires_at"] = 0
+
+    # Without an identity token, an expired token raises without a refresh.
+    with pytest.raises(AuthError, match="token_expired"):
+        await Stream.from_token(bound, name="s").append.aio("a")
+    assert service.refreshes == []
+    # A refresh the service refuses, for an unbound token or another sandbox's identity, raises the expiry.
+    monkeypatch.setenv("MODAL_IDENTITY_TOKEN", "identity")
+    with pytest.raises(AuthError, match="token_expired"):
+        await Stream.from_token(unbound, name="s").append.aio("a")
+    monkeypatch.setenv("MODAL_IDENTITY_TOKEN", "another-sandbox")
+    with pytest.raises(AuthError, match="token_expired"):
+        await Stream.from_token(bound, name="s").append.aio("a")
+    assert len(service.refreshes) == 2
+    monkeypatch.setenv("MODAL_IDENTITY_TOKEN", "identity")
+    assert await Stream.from_token(bound, name="s").append.aio("a") == AppendResult(1, False)
+
+
+@pytest.mark.asyncio
+async def test_large_values_are_uploaded(client, service, monkeypatch):
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    # The largest value an entry holds, and the smallest that is uploaded instead (2 bytes are JSON quotes).
+    inline, large = "x" * (MAX_VALUE_BYTES - 2), "y" * (MAX_VALUE_BYTES - 1)
+    assert await stream.append_many.aio([inline, large], idempotency_keys=["k1", "k2"]) == [
+        AppendResult(1, False),
+        AppendResult(2, False),
+    ]
+    first, second = service.runs["s"]["events"]
+    assert first["value"] == inline and "ref" not in first
+    sha256 = hashlib.sha256(json.dumps(large).encode()).hexdigest()
+    assert second["ref"] == f"blob:st-s/{sha256}" and "value" not in second
+    assert json.loads(service.blobs[f"st-s/{sha256}"]) == large
+    # Uploads are content-addressed, so a resent value dedupes and a changed one conflicts.
+    assert await stream.append.aio(large, idempotency_key="k2") == AppendResult(2, True)
+    with pytest.raises(IdempotencyConflict):
+        await stream.append.aio(large + "z", idempotency_key="k2")
+
+    token = (await stream.create_token.aio()).token
+    handle = Stream.from_token(token, name="s")
+    big = {"chunks": ["z" * 1000] * 1000}
+    assert await handle.append.aio(big) == AppendResult(3, False)
+    assert [e.value async for e in handle.read.aio()] == [inline, large, big]
+    assert (await asyncio.to_thread(lambda: handle[2])).value == large
+    # Refs other than uploads are left as they are.
+    service.runs["s"]["events"].append({"op_id": "k", "kind": "value", "ref": "sha256:" + "0" * 64, "seq": 4})
+    await stream.seal.aio()
+    assert [e.value async for e in stream.read.aio(follow=True)] == [inline, large, big, None, {"gen": 1}]
+
+    monkeypatch.setattr("modal.experimental.stream.MAX_BLOB_BYTES", MAX_VALUE_BYTES * 2)
+    with pytest.raises(InvalidError, match=f"limited to {MAX_VALUE_BYTES * 2} bytes"):
+        await stream.append.aio("x" * MAX_VALUE_BYTES * 2)
+    sent = len(service.requests)
+    service.max_blob_bytes = MAX_VALUE_BYTES
+    with pytest.raises(InvalidError, match="too large to store"):
+        await stream.append.aio(large)
+    assert len(service.requests) == sent + 1
+
+
+@pytest.mark.asyncio
+async def test_writer_uploads_large_values_before_queueing(client, service, monkeypatch):
+    monkeypatch.setattr("modal.experimental.stream.MAX_CONCURRENT_UPLOADS", 2)
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    values = [f"{n}" * MAX_VALUE_BYTES for n in range(5)]
+    service.hold_uploads = asyncio.Event()
+    extending = asyncio.ensure_future(stream.append_many.aio(values))
+    async with service.changed:
+        await service.changed.wait_for(lambda: service.uploading == 2)
+    service.hold_uploads.set()
+    await extending
+    assert service.max_uploading == 2
+
+    async with stream.writer() as w:
+        await w.append.aio("small")
+        await w.append.aio(values[0] + "!")
+        await w.append.aio("last")
+    events = service.runs["s"]["events"]
+    assert [e.get("value") for e in events[5:]] == ["small", None, "last"]
+    assert [e.value async for e in stream.read.aio(6)] == ["small", values[0] + "!", "last"]
+
+
+@pytest.mark.asyncio
+async def test_uploads_hold_a_bounded_number_of_bytes(client, service, monkeypatch):
+    # Two values just over the inline limit fill the budget, so a third waits although four uploads may run.
+    monkeypatch.setattr("modal.experimental.stream.UPLOAD_BUDGET_BYTES", 2 * MAX_VALUE_BYTES)
+    stream = Stream.from_name("s", create_if_missing=True, client=client)
+    values = [f"{n}" * MAX_VALUE_BYTES for n in range(4)]
+    service.hold_uploads = asyncio.Event()
+    extending = asyncio.ensure_future(stream.append_many.aio(values))
+    async with service.changed:
+        await service.changed.wait_for(lambda: service.uploading == 2)
+    service.hold_uploads.set()
+    await extending
+    assert service.max_uploading == 2
+
+    # A value larger than the whole budget still uploads.
+    monkeypatch.setattr("modal.experimental.stream.UPLOAD_BUDGET_BYTES", 1000)
+    large = "z" * (2 * MAX_VALUE_BYTES)
+    assert await stream.append.aio(large) == AppendResult(5, False)
+    assert (await asyncio.to_thread(stream.__getitem__, 5)).value == large

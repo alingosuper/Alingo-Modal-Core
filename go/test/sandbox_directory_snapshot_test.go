@@ -1,0 +1,334 @@
+package test
+
+import (
+	"io"
+	"testing"
+	"time"
+
+	modal "github.com/modal-labs/Alingo-Modal-Core/go"
+	"github.com/onsi/gomega"
+)
+
+func TestSandboxMountDirectoryEmpty(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	app, err := tc.Apps.FromName(ctx, "libmodal-test", &modal.AppFromNameParams{CreateIfMissing: true})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	image := tc.Images.FromRegistry("debian:12-slim", nil)
+
+	sb, err := tc.Sandboxes.Create(ctx, app, image, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer terminateSandbox(g, sb)
+
+	mkdirProc, err := sb.Exec(ctx, []string{"mkdir", "-p", "/mnt/empty"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	_, err = mkdirProc.Wait(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	err = sb.MountImage(ctx, "/mnt/empty", nil, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	dirCheck, err := sb.Exec(ctx, []string{"test", "-d", "/mnt/empty"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	exitCode, err := dirCheck.Wait(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(exitCode).To(gomega.Equal(0))
+}
+
+func TestSandboxMountDirectoryWithImage(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	app, err := tc.Apps.FromName(ctx, "libmodal-test", &modal.AppFromNameParams{CreateIfMissing: true})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	baseImage := tc.Images.FromRegistry("debian:12-slim", nil)
+
+	sb1, err := tc.Sandboxes.Create(ctx, app, baseImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	echoProc, err := sb1.Exec(ctx, []string{
+		"sh",
+		"-c",
+		"echo -n 'mounted content' > /tmp/test.txt",
+	}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	_, err = echoProc.Wait(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	mountImage, err := sb1.SnapshotFilesystem(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(mountImage.ImageID).To(gomega.MatchRegexp(`^im-`))
+
+	_, err = sb1.Terminate(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	sb2, err := tc.Sandboxes.Create(ctx, app, baseImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer terminateSandbox(g, sb2)
+
+	mkdirProc, err := sb2.Exec(ctx, []string{"mkdir", "-p", "/mnt/data"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	_, err = mkdirProc.Wait(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	err = sb2.MountImage(ctx, "/mnt/data", mountImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	catProc, err := sb2.Exec(ctx, []string{"cat", "/mnt/data/tmp/test.txt"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	output, err := io.ReadAll(catProc.Stdout)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(string(output)).To(gomega.Equal("mounted content"))
+}
+
+func TestSandboxUnmountDirectory(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	app, err := tc.Apps.FromName(ctx, "libmodal-test", &modal.AppFromNameParams{CreateIfMissing: true})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	baseImage := tc.Images.FromRegistry("debian:12-slim", nil)
+
+	sb, err := tc.Sandboxes.Create(ctx, app, baseImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer terminateSandbox(g, sb)
+
+	mkdirProc, err := sb.Exec(ctx, []string{"mkdir", "-p", "/mnt/data"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	_, err = mkdirProc.Wait(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	err = sb.MountImage(ctx, "/mnt/data", nil, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	writeProc, err := sb.Exec(ctx, []string{
+		"sh",
+		"-c",
+		"echo -n 'sandbox data' > /mnt/data/present.txt",
+	}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	_, err = writeProc.Wait(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	err = sb.UnmountImage(ctx, "/mnt/data", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	checkProc, err := sb.Exec(ctx, []string{"test", "!", "-e", "/mnt/data/present.txt"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	exitCode, err := checkProc.Wait(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(exitCode).To(gomega.Equal(0))
+}
+
+func TestSandboxSnapshotDirectory(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	app, err := tc.Apps.FromName(ctx, "libmodal-test", &modal.AppFromNameParams{CreateIfMissing: true})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	baseImage := tc.Images.FromRegistry("debian:12-slim", nil)
+
+	sb1, err := tc.Sandboxes.Create(ctx, app, baseImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	sb1FromID, err := tc.Sandboxes.FromID(ctx, sb1.SandboxID, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer terminateSandbox(g, sb1FromID)
+
+	mkdirProc, err := sb1.Exec(ctx, []string{"mkdir", "-p", "/mnt/data"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	_, err = mkdirProc.Wait(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	err = sb1.MountImage(ctx, "/mnt/data", nil, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	echoProc, err := sb1.Exec(ctx, []string{
+		"sh",
+		"-c",
+		"echo -n 'snapshot test content' > /mnt/data/snapshot.txt",
+	}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	_, err = echoProc.Wait(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	snapshotImage, err := sb1.SnapshotDirectory(ctx, "/mnt/data", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(snapshotImage.ImageID).To(gomega.MatchRegexp(`^im-`))
+
+	_, err = sb1.Terminate(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	sb2, err := tc.Sandboxes.Create(ctx, app, baseImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer terminateSandbox(g, sb2)
+
+	mkdirProc2, err := sb2.Exec(ctx, []string{"mkdir", "-p", "/mnt/data"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	_, err = mkdirProc2.Wait(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	err = sb2.MountImage(ctx, "/mnt/data", snapshotImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	catProc, err := sb2.Exec(ctx, []string{"cat", "/mnt/data/snapshot.txt"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	output, err := io.ReadAll(catProc.Stdout)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(string(output)).To(gomega.Equal("snapshot test content"))
+}
+
+func TestSandboxDirectorySnapshotCustomerSuppliedEncryptionKeyTransitions(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+	csek1 := []byte("first customer-supplied encryption key")
+	csek2 := []byte("second customer-supplied encryption key")
+
+	app, err := tc.Apps.FromName(ctx, "libmodal-test", &modal.AppFromNameParams{CreateIfMissing: true})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	baseImage := tc.Images.FromRegistry("debian:12-slim", nil)
+
+	sb1, err := tc.Sandboxes.Create(ctx, app, baseImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer terminateSandbox(g, sb1)
+
+	g.Expect(writeRemoteFile(ctx, sb1, "/tmp/csek-state/source.txt", []byte("source"))).To(gomega.Succeed())
+	csekSnapshot, err := sb1.SnapshotDirectory(ctx, "/tmp/csek-state", &modal.SandboxSnapshotDirectoryParams{
+		ExperimentalEncryptionKey: csek1,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(csekSnapshot.ImageID).To(gomega.MatchRegexp(`^im-`))
+
+	sb2, err := tc.Sandboxes.Create(ctx, app, baseImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer terminateSandbox(g, sb2)
+
+	g.Expect(writeRemoteFile(ctx, sb2, "/mnt/csek-state/.keep", []byte{})).To(gomega.Succeed())
+	err = sb2.MountImage(ctx, "/mnt/csek-state", csekSnapshot, &modal.SandboxMountImageParams{
+		ExperimentalEncryptionKey: csek1,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	source, err := readRemoteFile(ctx, sb2, "/mnt/csek-state/source.txt")
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(string(source)).To(gomega.Equal("source"))
+	g.Expect(writeRemoteFile(ctx, sb2, "/mnt/csek-state/from-csek-base.txt", []byte("csek base overlay"))).To(gomega.Succeed())
+	modalManagedSnapshot, err := sb2.SnapshotDirectory(ctx, "/mnt/csek-state", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(modalManagedSnapshot.ImageID).To(gomega.MatchRegexp(`^im-`))
+
+	sb3, err := tc.Sandboxes.Create(ctx, app, baseImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer terminateSandbox(g, sb3)
+
+	g.Expect(writeRemoteFile(ctx, sb3, "/mnt/modal-managed/.keep", []byte{})).To(gomega.Succeed())
+	err = sb3.MountImage(ctx, "/mnt/modal-managed", modalManagedSnapshot, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	source, err = readRemoteFile(ctx, sb3, "/mnt/modal-managed/source.txt")
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(string(source)).To(gomega.Equal("source"))
+	csekBase, err := readRemoteFile(ctx, sb3, "/mnt/modal-managed/from-csek-base.txt")
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(string(csekBase)).To(gomega.Equal("csek base overlay"))
+	g.Expect(writeRemoteFile(ctx, sb3, "/mnt/modal-managed/from-modal-base.txt", []byte("modal base overlay"))).To(gomega.Succeed())
+	csekSnapshot2, err := sb3.SnapshotDirectory(ctx, "/mnt/modal-managed", &modal.SandboxSnapshotDirectoryParams{
+		ExperimentalEncryptionKey: csek2,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(csekSnapshot2.ImageID).To(gomega.MatchRegexp(`^im-`))
+
+	sb4, err := tc.Sandboxes.Create(ctx, app, baseImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer terminateSandbox(g, sb4)
+
+	g.Expect(writeRemoteFile(ctx, sb4, "/mnt/csek-state-2/.keep", []byte{})).To(gomega.Succeed())
+	err = sb4.MountImage(ctx, "/mnt/csek-state-2", csekSnapshot2, &modal.SandboxMountImageParams{
+		ExperimentalEncryptionKey: csek2,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	source, err = readRemoteFile(ctx, sb4, "/mnt/csek-state-2/source.txt")
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(string(source)).To(gomega.Equal("source"))
+	csekBase, err = readRemoteFile(ctx, sb4, "/mnt/csek-state-2/from-csek-base.txt")
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(string(csekBase)).To(gomega.Equal("csek base overlay"))
+	modalBase, err := readRemoteFile(ctx, sb4, "/mnt/csek-state-2/from-modal-base.txt")
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(string(modalBase)).To(gomega.Equal("modal base overlay"))
+}
+
+func TestSandboxSnapshotRejectsInvalidTtl(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	app, err := tc.Apps.FromName(ctx, "libmodal-test", &modal.AppFromNameParams{CreateIfMissing: true})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	baseImage := tc.Images.FromRegistry("debian:12-slim", nil)
+
+	sb, err := tc.Sandboxes.Create(ctx, app, baseImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer terminateSandbox(g, sb)
+
+	// Sub-second and other invalid TTL values are rejected client-side.
+	// (NoExpiryTTL is the only valid non-positive value.)
+	_, err = sb.SnapshotDirectory(ctx, "/tmp", &modal.SandboxSnapshotDirectoryParams{TTL: 500 * time.Millisecond})
+	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("at least 1 second")))
+
+	_, err = sb.SnapshotDirectory(ctx, "/tmp", &modal.SandboxSnapshotDirectoryParams{TTL: -2 * time.Second})
+	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("at least 1 second")))
+
+	_, err = sb.SnapshotFilesystem(ctx, &modal.SandboxSnapshotFilesystemParams{TTL: 500 * time.Millisecond})
+	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("at least 1 second")))
+
+	// Non-whole-second TTLs are also rejected.
+	_, err = sb.SnapshotDirectory(ctx, "/tmp", &modal.SandboxSnapshotDirectoryParams{TTL: 1500 * time.Millisecond})
+	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("whole number of seconds")))
+
+	_, err = sb.SnapshotFilesystem(ctx, &modal.SandboxSnapshotFilesystemParams{TTL: 1500 * time.Millisecond})
+	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("whole number of seconds")))
+}
+
+func TestSandboxMountDirectoryWithUnbuiltImageThrows(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	app, err := tc.Apps.FromName(ctx, "libmodal-test", &modal.AppFromNameParams{CreateIfMissing: true})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	baseImage := tc.Images.FromRegistry("debian:12-slim", nil)
+
+	sb, err := tc.Sandboxes.Create(ctx, app, baseImage, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer terminateSandbox(g, sb)
+
+	mkdirProc, err := sb.Exec(ctx, []string{"mkdir", "-p", "/mnt/data"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	_, err = mkdirProc.Wait(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	unbuiltImage := tc.Images.FromRegistry("alpine:3.21", nil)
+	g.Expect(unbuiltImage.ImageID).To(gomega.Equal(""))
+
+	err = sb.MountImage(ctx, "/mnt/data", unbuiltImage, nil)
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.ContainSubstring("Image must be built before mounting"))
+}

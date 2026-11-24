@@ -1,0 +1,5981 @@
+# Copyright Modal Labs 2024
+from __future__ import annotations
+
+import asyncio
+import base64
+import builtins
+import contextlib
+import dataclasses
+import datetime
+import hashlib
+import inspect
+import os
+import platform
+import pytest
+import random
+import re
+import shutil
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import traceback
+import uuid
+from collections import defaultdict
+from collections.abc import AsyncGenerator, Callable, Iterable, Iterator, Sequence
+from pathlib import Path
+from types import ModuleType
+from typing import Any, get_args
+from unittest import mock
+from urllib.parse import quote
+
+import aiohttp.web
+import click.testing
+import grpclib.server
+import jwt
+import pytest_asyncio
+from google.protobuf.empty_pb2 import Empty
+from google.protobuf.timestamp_pb2 import Timestamp
+from grpclib import GRPCError, Status
+from grpclib.events import RecvRequest, listen
+from packaging.version import Version
+
+from modal import __version__, config
+from modal._functions import _Function
+from modal._image import SUPPORTED_PYTHON_SERIES, ImageBuilderVersion
+from modal._runtime.container_io_manager import _ContainerIOManager
+from modal._runtime.task_lifecycle_manager import _TaskLifecycleManager
+from modal._serialization import deserialize, deserialize_data_format, deserialize_params, serialize_data_format
+from modal._utils.async_utils import asyncify, synchronize_api
+from modal._utils.blob_utils import BLOCK_SIZE, MAX_OBJECT_SIZE_BYTES
+from modal._utils.grpc_testing import patch_mock_servicer
+from modal._utils.grpc_utils import custom_detail_codec
+from modal._utils.http_utils import run_temporary_http_server
+from modal._utils.jwt_utils import DecodedJwt
+from modal._utils.name_utils import is_app_id
+from modal._utils.time_utils import add_months
+from modal._vendor import cloudpickle
+from modal.app import _App
+from modal.cli.entry_point import entrypoint_cli
+from modal.client import Client
+from modal.cls import _Cls
+from modal.mount import PYTHON_STANDALONE_VERSIONS, client_mount_name, python_standalone_mount_name
+from modal_proto import api_grpc, api_pb2, task_command_router_grpc, task_command_router_pb2 as sr_pb2
+
+VALID_GPU_TYPES = ["ANY", "T4", "L4", "A10G", "L40S", "A100", "A100-40GB", "A100-80GB", "H100"]
+VALID_CLOUD_PROVIDERS = ["AWS", "GCP", "OCI", "AUTO", "XYZ"]
+
+# Largest FunctionListVariants limit the server answers with a busiest-first listing. Mirrors the
+# server's own limit, which this repository cannot import.
+MAX_SORTED_FUNCTION_VARIANTS_LIMIT = 200
+
+
+@dataclasses.dataclass
+class TaskCommandRouterTaskState:
+    procs: dict[str, asyncio.subprocess.Process] = dataclasses.field(default_factory=dict)
+    stdin_offsets: dict[str, int] = dataclasses.field(default_factory=dict)
+    stdin_closed: set[str] = dataclasses.field(default_factory=set)
+    container_procs: dict[str, asyncio.subprocess.Process] = dataclasses.field(default_factory=dict)
+    container_names: dict[str, str] = dataclasses.field(default_factory=dict)
+    container_name_to_id: dict[str, str] = dataclasses.field(default_factory=dict)
+    latest_container_name_to_id: dict[str, str] = dataclasses.field(default_factory=dict)
+    container_results: dict[str, api_pb2.GenericResult] = dataclasses.field(default_factory=dict)
+    container_termination_requested: set[str] = dataclasses.field(default_factory=set)
+    entrypoint_proc: asyncio.subprocess.Process | None = None
+    entrypoint_buffers: dict[int, bytearray] = dataclasses.field(default_factory=dict)
+    entrypoint_eof: dict[int, bool] = dataclasses.field(default_factory=dict)
+    entrypoint_pumps: list[asyncio.Task] = dataclasses.field(default_factory=list)
+    # Set (and replaced) whenever an entrypoint buffer grows or reaches EOF.
+    entrypoint_changed: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    entrypoint_stdin_offset: int = 0
+
+
+def _timestamp_now() -> Timestamp:
+    ts = Timestamp()
+    ts.GetCurrentTime()
+    return ts
+
+
+def _inline_secret_env(secret_sources: Iterable[api_pb2.SecretSource]) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for source in secret_sources:
+        if source.WhichOneof("source") == "env":
+            env |= dict(source.env.contents)
+    return env
+
+
+@patch_mock_servicer
+class MockTaskCommandRouterServicer(task_command_router_grpc.TaskCommandRouterBase):
+    """Test task command router service that runs commands as local subprocesses."""
+
+    def __init__(self):
+        self._task_states: defaultdict[str, TaskCommandRouterTaskState] = defaultdict(TaskCommandRouterTaskState)
+        self._next_container_id = 0
+        self._exec_start_requests: list[sr_pb2.TaskExecStartRequest] = []
+        self.last_exec_start_request: sr_pb2.TaskExecStartRequest | None = None
+        self.last_container_create_request: sr_pb2.TaskContainerCreateRequest | None = None
+        self.last_snapshot_filesystem_request: sr_pb2.TaskSnapshotFilesystemRequest | None = None
+        self.last_snapshot_memory_request: sr_pb2.TaskSnapshotMemoryRequest | None = None
+        self.shell_prompt: bytes | None = None
+        # When set, TaskExecStdinWriteStream raises UNAVAILABLE once the accepted
+        # stdin offset reaches this many bytes, consuming one remaining failure per
+        # raise. Used to exercise the client's resume-from-offset logic.
+        self.stdin_stream_fail_after_bytes: int | None = None
+        self.stdin_stream_failures_remaining: int = 0
+        self.stdin_stream_attempt_count: int = 0
+        # When set, the next TaskExecStdinWriteStream processes its End message
+        # (closing stdin) but raises instead of sending the response, simulating
+        # a completed upload whose response was lost.
+        self.stdin_stream_drop_response: bool = False
+        # When set, the next TaskExecStdinWriteStream fails with FAILED_PRECONDITION
+        # without closing stdin, so the exec'd process keeps running.
+        self.stdin_stream_reject: bool = False
+        # Messages sent back in the `x-modal-warning` trailing metadata of every TaskExecPoll.
+        self.exec_poll_warnings: list[str] = []
+
+    def _task_state(self, task_id: str) -> TaskCommandRouterTaskState:
+        return self._task_states[task_id]
+
+    async def recv_request(self, event: RecvRequest) -> None:
+        pass
+
+    def register_entrypoint(self, task_id: str, proc: asyncio.subprocess.Process) -> None:
+        """Serve a local subprocess as the task's sandbox entrypoint.
+
+        Pumps the process's stdout/stderr into per-fd buffers so that
+        SandboxStdioReadV2 can serve reads from any offset, live or after exit.
+        Re-registering replaces the previous entrypoint.
+        """
+        task_state = self._task_state(task_id)
+        for stale_pump in task_state.entrypoint_pumps:
+            stale_pump.cancel()
+        # Readers of the previous entrypoint hold its buffers and EOF flags, so
+        # end their streams rather than letting them wait forever.
+        for fd in task_state.entrypoint_eof:
+            task_state.entrypoint_eof[fd] = True
+        self._notify_entrypoint_changed(task_state)
+        task_state.entrypoint_proc = proc
+        task_state.entrypoint_buffers = {
+            sr_pb2.SANDBOX_STDIO_FILE_DESCRIPTOR_STDOUT: bytearray(),
+            sr_pb2.SANDBOX_STDIO_FILE_DESCRIPTOR_STDERR: bytearray(),
+        }
+        task_state.entrypoint_eof = {
+            sr_pb2.SANDBOX_STDIO_FILE_DESCRIPTOR_STDOUT: False,
+            sr_pb2.SANDBOX_STDIO_FILE_DESCRIPTOR_STDERR: False,
+        }
+        task_state.entrypoint_stdin_offset = 0
+        buffers = task_state.entrypoint_buffers
+        eof = task_state.entrypoint_eof
+
+        async def pump(fd: int, source: asyncio.StreamReader) -> None:
+            while chunk := await source.read(4096):
+                buffers[fd].extend(chunk)
+                self._notify_entrypoint_changed(task_state)
+            eof[fd] = True
+            self._notify_entrypoint_changed(task_state)
+
+        task_state.entrypoint_pumps = [
+            asyncio.create_task(pump(sr_pb2.SANDBOX_STDIO_FILE_DESCRIPTOR_STDOUT, proc.stdout)),
+            asyncio.create_task(pump(sr_pb2.SANDBOX_STDIO_FILE_DESCRIPTOR_STDERR, proc.stderr)),
+        ]
+
+    async def SandboxStdinWriteV2(self, stream) -> None:
+        request: sr_pb2.SandboxStdinWriteV2Request = await stream.recv_message()
+        task_state = self._task_state(request.task_id)
+        proc = task_state.entrypoint_proc
+        if proc is None or proc.returncode is not None:
+            raise GRPCError(
+                Status.FAILED_PRECONDITION, "Sandbox has already completed. Stdin is no longer accepting writes"
+            )
+        if request.data:
+            try:
+                proc.stdin.write(request.data)
+                await proc.stdin.drain()
+            except ConnectionError:
+                pass
+            task_state.entrypoint_stdin_offset += len(request.data)
+        if request.eof:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+        await stream.send_message(sr_pb2.SandboxStdinWriteV2Response())
+
+    async def SandboxStdioReadV2(self, stream) -> None:
+        request: sr_pb2.SandboxStdioReadV2Request = await stream.recv_message()
+        task_state = self._task_state(request.task_id)
+        if task_state.entrypoint_proc is None:
+            return
+        if request.file_descriptor not in task_state.entrypoint_buffers:
+            raise GRPCError(Status.INVALID_ARGUMENT, f"Unsupported file descriptor: {request.file_descriptor}")
+        fd = request.file_descriptor
+        buffer = task_state.entrypoint_buffers[fd]
+        eof = task_state.entrypoint_eof
+        offset = request.offset
+        while True:
+            # Grab the event before checking state so a notification between the
+            # check and the wait is not lost.
+            changed = task_state.entrypoint_changed
+            if offset < len(buffer):
+                chunk = bytes(buffer[offset:])
+                await stream.send_message(sr_pb2.SandboxStdioReadV2Response(data=chunk, starting_offset=offset))
+                offset += len(chunk)
+            elif eof[fd]:
+                return
+            else:
+                await changed.wait()
+
+    @staticmethod
+    def _notify_entrypoint_changed(task_state: TaskCommandRouterTaskState) -> None:
+        changed, task_state.entrypoint_changed = task_state.entrypoint_changed, asyncio.Event()
+        changed.set()
+
+    async def SandboxWaitUntilReady(self, stream) -> None:
+        await stream.recv_message()
+        raise GRPCError(Status.UNIMPLEMENTED, "SandboxWaitUntilReady not implemented in mock task command router")
+
+    async def TaskExecStart(self, stream) -> None:
+        request: sr_pb2.TaskExecStartRequest = await stream.recv_message()
+        # Mimic task_command_router behavior - we should remove this proto variant though.
+        # TODO(saltzm): Remove the proto variant.
+        assert request.stderr_config != sr_pb2.TaskExecStderrConfig.TASK_EXEC_STDERR_CONFIG_STDOUT
+        self.last_exec_start_request = request
+        self._exec_start_requests.append(request)
+        # Spawn the command locally.
+        proc = await asyncio.subprocess.create_subprocess_exec(
+            *list(request.command_args),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE,
+            cwd=(request.workdir or None),
+            env={**os.environ, **dict(request.env), **_inline_secret_env(request.secret_sources)},
+        )
+        task_state = self._task_state(request.task_id)
+        task_state.procs[request.exec_id] = proc
+        task_state.stdin_offsets[request.exec_id] = 0
+        await stream.send_message(sr_pb2.TaskExecStartResponse())
+
+    async def TaskExecStdioRead(self, stream) -> None:
+        request: sr_pb2.TaskExecStdioReadRequest = await stream.recv_message()
+        proc = self._task_state(request.task_id).procs[request.exec_id]
+        if request.file_descriptor == sr_pb2.TASK_EXEC_STDIO_FILE_DESCRIPTOR_STDOUT:
+            # Inject shell prompt as the first output chunk, matching the behavior of
+            # MockClientServicer.ContainerExecGetOutput for interactive shell tests.
+            if self.shell_prompt and request.offset == 0:
+                await stream.send_message(sr_pb2.TaskExecStdioReadResponse(data=self.shell_prompt))
+            proc_stream = proc.stdout
+        elif request.file_descriptor == sr_pb2.TASK_EXEC_STDIO_FILE_DESCRIPTOR_STDERR:
+            proc_stream = proc.stderr
+        else:
+            raise ValueError("Unsupported file descriptor")
+
+        while True:
+            chunk = await proc_stream.read(4096)
+            if not chunk:
+                return
+            await stream.send_message(sr_pb2.TaskExecStdioReadResponse(data=chunk))
+
+    async def TaskExecStdinWrite(self, stream) -> None:
+        request: sr_pb2.TaskExecStdinWriteRequest = await stream.recv_message()
+        task_state = self._task_state(request.task_id)
+        proc = task_state.procs[request.exec_id]
+        # Simple offset handling: ignore if offset is behind current.
+        current = task_state.stdin_offsets[request.exec_id]
+        if request.offset != current:
+            # For tests, assume sequential writes; ignore mismatches.
+            pass
+        if request.data:
+            try:
+                proc.stdin.write(request.data)
+                await proc.stdin.drain()
+            except ConnectionError:
+                # Ignore broken pipes/connection errors
+                pass
+            task_state.stdin_offsets[request.exec_id] = current + len(request.data)
+        if request.eof:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            task_state.stdin_closed.add(request.exec_id)
+        await stream.send_message(sr_pb2.TaskExecStdinWriteResponse())
+
+    async def TaskExecStdinStatus(self, stream) -> None:
+        request: sr_pb2.TaskExecStdinStatusRequest = await stream.recv_message()
+        task_state = self._task_state(request.task_id)
+        await stream.send_message(
+            sr_pb2.TaskExecStdinStatusResponse(
+                num_bytes_written=task_state.stdin_offsets.get(request.exec_id, 0),
+                closed=request.exec_id in task_state.stdin_closed,
+            )
+        )
+
+    async def TaskExecStdinWriteStream(self, stream) -> None:
+        self.stdin_stream_attempt_count += 1
+        request: sr_pb2.TaskExecStdinWriteStreamRequest = await stream.recv_message()
+        if request.WhichOneof("payload") != "start":
+            raise GRPCError(Status.INVALID_ARGUMENT, "first stdin write stream message must be start")
+        start = request.start
+        task_state = self._task_state(start.task_id)
+        proc = task_state.procs[start.exec_id]
+        current = task_state.stdin_offsets[start.exec_id]
+        if start.offset != current:
+            raise GRPCError(Status.FAILED_PRECONDITION, "stdin offset mismatch")
+        if self.stdin_stream_reject:
+            self.stdin_stream_reject = False
+            raise GRPCError(Status.FAILED_PRECONDITION, "injected stdin stream rejection")
+        while request := await stream.recv_message():
+            which = request.WhichOneof("payload")
+            if which == "end":
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                task_state.stdin_closed.add(start.exec_id)
+                if self.stdin_stream_drop_response:
+                    self.stdin_stream_drop_response = False
+                    raise GRPCError(Status.UNAVAILABLE, "injected response loss after End")
+                break
+            if which != "data":
+                raise GRPCError(Status.INVALID_ARGUMENT, "stdin write stream message must contain data")
+            if request.data:
+                try:
+                    proc.stdin.write(request.data)
+                    await proc.stdin.drain()
+                except ConnectionError:
+                    pass
+                current += len(request.data)
+                task_state.stdin_offsets[start.exec_id] = current
+            if (
+                self.stdin_stream_fail_after_bytes is not None
+                and self.stdin_stream_failures_remaining > 0
+                and current >= self.stdin_stream_fail_after_bytes
+            ):
+                self.stdin_stream_failures_remaining -= 1
+                raise GRPCError(Status.UNAVAILABLE, "injected stdin stream failure")
+        await stream.send_message(sr_pb2.TaskExecStdinWriteStreamResponse())
+
+    async def TaskExecPoll(self, stream) -> None:
+        request: sr_pb2.TaskExecPollRequest = await stream.recv_message()
+        proc = self._task_state(request.task_id).procs[request.exec_id]
+        if proc.returncode is None:
+            await stream.send_message(sr_pb2.TaskExecPollResponse())
+        else:
+            await stream.send_message(sr_pb2.TaskExecPollResponse(code=proc.returncode))
+        if self.exec_poll_warnings:
+            await stream.send_trailing_metadata(
+                metadata=[("x-modal-warning", quote(message, safe="")) for message in self.exec_poll_warnings]
+            )
+
+    async def TaskExecWait(self, stream) -> None:
+        request: sr_pb2.TaskExecWaitRequest = await stream.recv_message()
+        proc = self._task_state(request.task_id).procs[request.exec_id]
+        await proc.wait()
+        await stream.send_message(sr_pb2.TaskExecWaitResponse(code=proc.returncode))
+
+    async def TaskMountDirectory(self, stream) -> None:
+        request: sr_pb2.TaskMountDirectoryRequest = await stream.recv_message()
+        if not hasattr(self, "_mount_requests"):
+            self._mount_requests = []
+        self._mount_requests.append(request)
+        await stream.send_message(Empty())
+
+    async def TaskUnmountDirectory(self, stream) -> None:
+        request: sr_pb2.TaskUnmountDirectoryRequest = await stream.recv_message()
+        if not hasattr(self, "_unmount_requests"):
+            self._unmount_requests = []
+        self._unmount_requests.append(request)
+        await stream.send_message(Empty())
+
+    async def TaskReloadVolumes(self, stream) -> None:
+        request: sr_pb2.TaskReloadVolumesRequest = await stream.recv_message()
+        if not hasattr(self, "_reload_volumes_requests"):
+            self._reload_volumes_requests = []
+        self._reload_volumes_requests.append(request)
+        await stream.send_message(sr_pb2.TaskReloadVolumesResponse())
+
+    async def TaskSetNetworkAccess(self, stream) -> None:
+        request: sr_pb2.TaskSetNetworkAccessRequest = await stream.recv_message()
+        if not hasattr(self, "_set_network_access_requests"):
+            self._set_network_access_requests = []
+        self._set_network_access_requests.append(request)
+        await stream.send_message(sr_pb2.TaskSetNetworkAccessResponse())
+
+    async def TaskSetOutboundPolicy(self, stream) -> None:
+        request: sr_pb2.TaskSetExperimentalOutboundPolicyRequest = await stream.recv_message()
+        if not hasattr(self, "_set_outbound_policy_requests"):
+            self._set_outbound_policy_requests = []
+        self._set_outbound_policy_requests.append(request)
+        await stream.send_message(sr_pb2.TaskSetExperimentalOutboundPolicyResponse())
+
+    async def TaskSnapshotDirectory(self, stream) -> None:
+        request: sr_pb2.TaskSnapshotDirectoryRequest = await stream.recv_message()
+        if not hasattr(self, "_snapshot_requests"):
+            self._snapshot_requests = []
+        self._snapshot_requests.append(request)
+        await stream.send_message(sr_pb2.TaskSnapshotDirectoryResponse(image_id="im-snapshot-123"))
+
+    async def TaskSnapshotFilesystem(self, stream) -> None:
+        request: sr_pb2.TaskSnapshotFilesystemRequest = await stream.recv_message()
+        self.last_snapshot_filesystem_request = request
+        if not hasattr(self, "_snapshot_filesystem_requests"):
+            self._snapshot_filesystem_requests = []
+        self._snapshot_filesystem_requests.append(request)
+        await stream.send_message(sr_pb2.TaskSnapshotFilesystemResponse(image_id="im-snapshot-fs-123"))
+
+    async def TaskSnapshotMemory(self, stream) -> None:
+        request: sr_pb2.TaskSnapshotMemoryRequest = await stream.recv_message()
+        self.last_snapshot_memory_request = request
+        if not hasattr(self, "_snapshot_memory_requests"):
+            self._snapshot_memory_requests = []
+        self._snapshot_memory_requests.append(request)
+        await stream.send_message(sr_pb2.TaskSnapshotMemoryResponse(snapshot_id="sn-01BX5ZZKBKACTAV9WEVGEMMVRY"))
+
+    def _container_result(
+        self, task_state: TaskCommandRouterTaskState, container_id: str
+    ) -> api_pb2.GenericResult | None:
+        if container_id in task_state.container_results:
+            return task_state.container_results[container_id]
+
+        proc = task_state.container_procs[container_id]
+        if proc.returncode is None:
+            return None
+
+        if container_id in task_state.container_termination_requested:
+            result = api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_TERMINATED)
+        elif proc.returncode == 0:
+            result = api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS)
+        else:
+            result = api_pb2.GenericResult(
+                status=api_pb2.GenericResult.GENERIC_STATUS_FAILURE,
+                exitcode=proc.returncode,
+            )
+        task_state.container_results[container_id] = result
+        self._release_container_name_if_current(task_state, container_id)
+        return result
+
+    def _release_container_name_if_current(self, task_state: TaskCommandRouterTaskState, container_id: str) -> None:
+        container_name = task_state.container_names[container_id]
+        if task_state.container_name_to_id.get(container_name) == container_id:
+            task_state.container_name_to_id.pop(container_name, None)
+
+    def _container_status(self, task_state: TaskCommandRouterTaskState, container_id: str) -> str:
+        result = self._container_result(task_state, container_id)
+        if result is not None:
+            if result.status == api_pb2.GenericResult.GENERIC_STATUS_SUCCESS:
+                return "success"
+            if result.status == api_pb2.GenericResult.GENERIC_STATUS_TERMINATED:
+                return "terminated"
+            return "failure"
+        if container_id in task_state.container_termination_requested:
+            return "stopping"
+        return "running"
+
+    async def create_container(
+        self, *, task_id: str, container_name: str, args: Sequence[str], workdir: str | None
+    ) -> str:
+        """Start a container as a local subprocess and return its container id."""
+        task_state = self._task_state(task_id)
+        if container_name in task_state.container_name_to_id:
+            raise GRPCError(Status.INVALID_ARGUMENT, "container name already in use")
+
+        self._next_container_id += 1
+        container_id = f"ctr-test-{self._next_container_id:06d}"
+        proc = await asyncio.subprocess.create_subprocess_exec(
+            *list(args),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+            cwd=(workdir or None),
+        )
+        task_state.container_procs[container_id] = proc
+        task_state.container_names[container_id] = container_name
+        task_state.container_name_to_id[container_name] = container_id
+        task_state.latest_container_name_to_id[container_name] = container_id
+        return container_id
+
+    async def TaskContainerCreate(self, stream) -> None:
+        request: sr_pb2.TaskContainerCreateRequest = await stream.recv_message()
+        self.last_container_create_request = request
+        container_id = await self.create_container(
+            task_id=request.task_id,
+            container_name=request.container_name,
+            args=request.args,
+            workdir=request.workdir,
+        )
+        await stream.send_message(
+            sr_pb2.TaskContainerCreateResponse(
+                container_id=container_id,
+                container_name=request.container_name,
+            )
+        )
+
+    async def TaskContainerGet(self, stream) -> None:
+        request: sr_pb2.TaskContainerGetRequest = await stream.recv_message()
+        task_state = self._task_state(request.task_id)
+        if request.include_terminated:
+            container_ids = task_state.latest_container_name_to_id
+        else:
+            container_ids = task_state.container_name_to_id
+        container_id = container_ids.get(request.container_name)
+        if container_id is None:
+            raise GRPCError(Status.NOT_FOUND, "container not found")
+
+        result = self._container_result(task_state, container_id)
+        container = sr_pb2.TaskContainerInfo(
+            container_id=container_id,
+            container_name=request.container_name,
+            status=self._container_status(task_state, container_id),
+        )
+        if result is not None:
+            container.result.CopyFrom(result)
+        await stream.send_message(sr_pb2.TaskContainerGetResponse(container=container))
+
+    async def TaskContainerList(self, stream) -> None:
+        request: sr_pb2.TaskContainerListRequest = await stream.recv_message()
+        task_state = self._task_state(request.task_id)
+        containers = []
+        for container_id, container_name in task_state.container_names.items():
+            if not request.include_terminated and task_state.container_name_to_id.get(container_name) != container_id:
+                continue
+            result = self._container_result(task_state, container_id)
+            container = sr_pb2.TaskContainerInfo(
+                container_id=container_id,
+                container_name=container_name,
+                status=self._container_status(task_state, container_id),
+            )
+            if result is not None:
+                container.result.CopyFrom(result)
+            containers.append(container)
+        await stream.send_message(sr_pb2.TaskContainerListResponse(containers=containers))
+
+    async def TaskContainerTerminate(self, stream) -> None:
+        request: sr_pb2.TaskContainerTerminateRequest = await stream.recv_message()
+        task_state = self._task_state(request.task_id)
+        container_id = request.container_id
+        if container_id not in task_state.container_procs:
+            raise GRPCError(Status.NOT_FOUND, "container not found")
+
+        task_state.container_termination_requested.add(container_id)
+        proc = task_state.container_procs[container_id]
+        if proc.returncode is None:
+            proc.terminate()
+        else:
+            self._release_container_name_if_current(task_state, container_id)
+        await stream.send_message(sr_pb2.TaskContainerTerminateResponse())
+
+    async def TaskContainerWait(self, stream) -> None:
+        request: sr_pb2.TaskContainerWaitRequest = await stream.recv_message()
+        task_state = self._task_state(request.task_id)
+        container_id = request.container_id
+        if container_id not in task_state.container_procs:
+            raise GRPCError(Status.NOT_FOUND, "container not found")
+
+        deadline = time.monotonic() + request.timeout
+        while True:
+            result = self._container_result(task_state, container_id)
+            if result is not None:
+                await stream.send_message(sr_pb2.TaskContainerWaitResponse(result=result))
+                return
+            if request.timeout == 0 or time.monotonic() >= deadline:
+                await stream.send_message(sr_pb2.TaskContainerWaitResponse())
+                return
+            await asyncio.sleep(0.05)
+
+    async def cleanup(self) -> None:
+        procs: list[asyncio.subprocess.Process] = []
+        for task_state in self._task_states.values():
+            procs.extend(task_state.procs.values())
+            procs.extend(task_state.container_procs.values())
+            if task_state.entrypoint_proc is not None:
+                procs.append(task_state.entrypoint_proc)
+            for pump in task_state.entrypoint_pumps:
+                pump.cancel()
+        for proc in procs:
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
+        for proc in procs:
+            if proc.returncode is None:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(proc.wait(), timeout=1)
+        for proc in procs:
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+
+
+@pytest.fixture(autouse=True)
+def _clear_environment_cache():
+    """Clear the module-level environment cache around every test.
+
+    ``modal._environments.ENVIRONMENT_CACHE`` is keyed by environment name
+    (default ``""``) and stores the hydrated metadata, including
+    ``image_builder_version``.  ``image_test.py`` patches the mock servicer
+    to return specific builder versions (``2023.12``, ``2024.04``, …) for
+    parametrized tests; the cache entry survives across files unless
+    explicitly cleared, so subsequent unrelated tests would build images
+    with whatever builder the last image test selected.  That stale value
+    becomes a hard failure on Python 3.13/3.14 when the leaked builder is
+    ``2024.04`` (which only supports 3.10–3.12).  Yielding around the test
+    keeps the cache empty in both directions so test order cannot affect
+    image builder resolution.
+    """
+    from modal._environments import ENVIRONMENT_CACHE
+
+    ENVIRONMENT_CACHE.clear()
+    yield
+    ENVIRONMENT_CACHE.clear()
+
+
+@contextlib.contextmanager
+def sandbox_subprocess_intercept(servicer):
+    """Context manager that replaces sandbox mock RPCs with subprocess-backed implementations.
+
+    By default, SandboxCreate just records arguments without spawning a subprocess.
+    Use this context manager (or the ``sandbox_subprocess`` fixture) for tests
+    that need actual I/O (stdin/stdout/stderr, exit codes, timing).
+    """
+    proc_holder: dict[str, asyncio.subprocess.Process] = {}
+
+    async def _spawn_entrypoint(entrypoint_args) -> asyncio.subprocess.Process:
+        proc = await asyncio.subprocess.create_subprocess_exec(
+            *(entrypoint_args or ["sleep", f"{48 * 3600}"]),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE,
+        )
+        proc_holder["proc"] = proc
+        return proc
+
+    async def _SandboxCreate(servicer_self, stream):
+        request: api_pb2.SandboxCreateRequest = await stream.recv_message()
+        sandbox_id = "sb-nGEijt9WbBMlGrsPH9FOaC"
+        servicer_self.sandbox_tags[sandbox_id] = {tag.tag_name: tag.tag_value for tag in request.tags}
+        await _spawn_entrypoint(request.definition.entrypoint_args)
+        servicer_self._sandbox_terminated = False
+        servicer_self.sandbox_app_id = request.app_id
+        servicer_self.sandbox_defs.append(request.definition)
+        await stream.send_message(
+            api_pb2.SandboxCreateResponse(
+                sandbox_id=sandbox_id,
+                metadata=api_pb2.SandboxHandleMetadata(app_id=request.app_id),
+            )
+        )
+
+    async def _SandboxCreateV2(servicer_self, stream):
+        request: api_pb2.SandboxCreateV2Request = await stream.recv_message()
+        sandbox_id = "sb-v2-123"
+        task_id = "ta-v2-123"
+        servicer_self._sandbox_terminated = False
+        servicer_self.sandbox_app_id = request.app_id
+        servicer_self.sandbox_defs.append(request.definition)
+        servicer_self.sandbox_create_v2_requests.append(request)
+        servicer_self.sandbox_tags[sandbox_id] = {tag.tag_name: tag.tag_value for tag in request.tags}
+        servicer_self.sandbox_task_ids[sandbox_id] = task_id
+        proc = await _spawn_entrypoint(request.definition.entrypoint_args)
+        servicer_self.task_command_router.register_entrypoint(task_id, proc)
+        await stream.send_message(
+            api_pb2.SandboxCreateV2Response(
+                sandbox_id=sandbox_id,
+                task_id=task_id,
+                metadata=api_pb2.SandboxHandleMetadata(app_id=request.app_id),
+                command_router_access=api_pb2.CommandRouterAccess(
+                    url=servicer_self.task_command_router_url, jwt="fake-jwt-token"
+                ),
+            )
+        )
+
+    async def _SandboxGetLogs(servicer_self, stream):
+        request: api_pb2.SandboxGetLogsRequest = await stream.recv_message()
+        proc = proc_holder.get("proc")
+        if proc is None:
+            await stream.send_message(api_pb2.TaskLogsBatch(eof=True))
+            return
+        f: asyncio.StreamReader
+        if request.file_descriptor == api_pb2.FILE_DESCRIPTOR_STDOUT:
+            f = proc.stdout
+        else:
+            f = proc.stderr
+        async for message in f:
+            await stream.send_message(
+                api_pb2.TaskLogsBatch(
+                    items=[api_pb2.TaskLogs(data=message.decode("utf-8"), file_descriptor=request.file_descriptor)]
+                )
+            )
+        await stream.send_message(api_pb2.TaskLogsBatch(eof=True))
+
+    async def _SandboxWait(servicer_self, stream):
+        request: api_pb2.SandboxWaitRequest = await stream.recv_message()
+        proc = proc_holder.get("proc")
+        if proc is None:
+            result = api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS)
+            servicer_self.sandbox_result = result
+            await stream.send_message(
+                api_pb2.SandboxWaitResponse(
+                    result=result,
+                    metadata=api_pb2.SandboxHandleMetadata(result=result, app_id=servicer_self.sandbox_app_id),
+                )
+            )
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), request.timeout)
+        except asyncio.TimeoutError:
+            pass
+        if proc.returncode is None:
+            await stream.send_message(
+                api_pb2.SandboxWaitResponse(metadata=api_pb2.SandboxHandleMetadata(app_id=servicer_self.sandbox_app_id))
+            )
+            return
+        elif proc.returncode != 0:
+            result = api_pb2.GenericResult(
+                status=api_pb2.GenericResult.GENERIC_STATUS_FAILURE, exitcode=proc.returncode
+            )
+        else:
+            result = api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS)
+        servicer_self.sandbox_result = result
+        await stream.send_message(
+            api_pb2.SandboxWaitResponse(
+                result=result,
+                metadata=api_pb2.SandboxHandleMetadata(result=result, app_id=servicer_self.sandbox_app_id),
+            )
+        )
+
+    async def _SandboxTerminate(servicer_self, stream):
+        servicer_self._sandbox_terminated = True
+        proc = proc_holder.get("proc")
+        if proc is not None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        await stream.send_message(api_pb2.SandboxTerminateResponse())
+
+    async def _SandboxStdinWrite(servicer_self, stream):
+        request: api_pb2.SandboxStdinWriteRequest = await stream.recv_message()
+        proc = proc_holder.get("proc")
+        if proc is None or proc.returncode is not None:
+            raise GRPCError(Status.FAILED_PRECONDITION, "Sandbox has already terminated")
+        proc.stdin.write(request.input)
+        await proc.stdin.drain()
+        if request.eof:
+            proc.stdin.close()
+        await stream.send_message(api_pb2.SandboxStdinWriteResponse())
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("SandboxCreate", _SandboxCreate)
+        ctx.set_responder("SandboxGetLogs", _SandboxGetLogs)
+        ctx.set_responder("SandboxWait", _SandboxWait)
+        ctx.set_responder("SandboxTerminate", _SandboxTerminate)
+        ctx.set_responder("SandboxStdinWrite", _SandboxStdinWrite)
+        ctx.set_responder("SandboxCreateV2", _SandboxCreateV2)
+        ctx.set_responder("SandboxWaitV2", _SandboxWait)
+        ctx.set_responder("SandboxTerminateV2", _SandboxTerminate)
+        yield ctx
+
+
+@pytest.fixture
+def sandbox_subprocess(servicer):
+    """Enable real subprocess spawning for sandbox mock RPCs.
+
+    By default, SandboxCreate just records arguments without spawning a
+    subprocess.  Tests that need actual I/O (stdin/stdout/stderr, exit
+    codes, timing) should request this fixture.
+    """
+    with sandbox_subprocess_intercept(servicer):
+        yield
+
+
+@dataclasses.dataclass
+class Volume:
+    version: api_pb2.VolumeFsVersion.ValueType
+    files: dict[str, VolumeFile]
+
+
+@dataclasses.dataclass
+class VolumeFile:
+    data: bytes
+    mode: int
+    data_blob_id: str | None = None
+    data_sha256_hex: str | None = None
+    block_hashes: list[bytes] | None = None
+
+
+@dataclasses.dataclass
+class GrpcErrorAndCount:
+    """Helper class that holds a gRPC error and the number of times it should be raised."""
+
+    grpc_error: Status
+    count: int
+
+
+@pytest.fixture(scope="function", autouse=True)
+def set_env(monkeypatch):
+    # We seem to be leaking this across tests, probably because of `ensure_env`?
+    monkeypatch.delenv("MODAL_ENVIRONMENT", raising=False)
+
+
+@pytest.fixture(scope="function", autouse=True)
+def ignore_local_config():
+    # When running tests locally, we don't want to pick up the local .modal.toml file
+    config._user_config = {}
+    yield
+
+
+@pytest.fixture
+def tmp_path_with_content(tmp_path):
+    (tmp_path / "data.txt").write_text("hello")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "sub").write_text("world")
+    (tmp_path / "module").mkdir()
+    (tmp_path / "module" / "__init__.py").write_text("foo")
+    (tmp_path / "module" / "sub.py").write_text("bar")
+    (tmp_path / "module" / "sub").mkdir()
+    (tmp_path / "module" / "sub" / "__init__.py").write_text("baz")
+    (tmp_path / "module" / "sub" / "foo.pyc").write_text("baz")
+    (tmp_path / "module" / "sub" / "sub.py").write_text("qux")
+
+    return tmp_path
+
+
+class FunctionsRegistry:
+    def __init__(self):
+        self._functions: dict[str, api_pb2.Function] = {}
+        self._functions_data: dict[str, api_pb2.FunctionData] = {}
+        # Every registered function has a definition, including ones a test injects directly.
+        # Callers that share a definition across functions (parameter binding) overwrite the entry.
+        self.definition_ids: dict[str, str] = {}
+        self._n_definitions = 0
+
+    def __getitem__(self, key):
+        if key in self._functions:
+            return self._functions[key]
+        return self._functions_data[key]
+
+    def __setitem__(self, key, value):
+        if isinstance(value, api_pb2.FunctionData):
+            self._functions_data[key] = value
+        else:
+            self._functions[key] = value
+        self._n_definitions += 1
+        self.definition_ids[key] = f"de-{self._n_definitions}"
+
+    def __len__(self):
+        return len(self._functions) + len(self._functions_data)
+
+    def __contains__(self, key):
+        return key in self._functions or key in self._functions_data
+
+    def get(self, key, default=None):
+        try:
+            return self._functions[key]
+        except KeyError:
+            return self._functions_data.get(key, default)
+
+    def values(self):
+        return list(self._functions.values()) + list(self._functions_data.values())
+
+    def items(self):
+        return list(self._functions.items()) + list(self._functions_data.items())
+
+
+@patch_mock_servicer
+class MockClientServicer(api_grpc.ModalClientBase):
+    # TODO(erikbern): add more annotations
+    container_inputs: list[api_pb2.FunctionGetInputsResponse]
+    container_outputs: list[api_pb2.FunctionPutOutputsRequest]
+    fc_data_in: defaultdict[str, asyncio.Queue[api_pb2.DataChunk]]
+    fc_data_out: defaultdict[str, asyncio.Queue[api_pb2.DataChunk]]
+
+    # Set when the server runs
+    client_addr: str
+    container_addr: str
+    task_command_router: MockTaskCommandRouterServicer
+    task_command_router_url: str
+
+    def __init__(self, blob_host, blobs, blocks, files_sha2data, credentials):
+        self.default_published_client_mount = "mo-123"
+        self.default_username = "test-user"
+        self.use_blob_outputs = False
+        self.put_outputs_barrier = threading.Barrier(
+            1, timeout=10
+        )  # set to non-1 to get lock-step of output pushing within a test
+        self.get_inputs_barrier = threading.Barrier(
+            1, timeout=10
+        )  # set to non-1 to get lock-step of input releases within a test
+
+        self.app_state_history = defaultdict(list)
+        self.app_heartbeats: dict[str, int] = defaultdict(int)
+        self.container_snapshot_requests = 0
+        self.n_blobs = 0
+        self.blob_host = blob_host
+        self.blobs = blobs  # shared dict
+        self.blocks = blocks  # shared dict
+        self.requests = []
+        self.done = False
+        self.app_done_event = asyncio.Event()
+        self.rate_limit_sleep_duration = None
+        self.fail_get_inputs = False
+        self.fail_put_inputs_with_grpc_error: GrpcErrorAndCount | None = None
+        self.fail_put_inputs_with_stream_terminated_error = 0
+        self.failure_status = api_pb2.GenericResult.GENERIC_STATUS_FAILURE
+        self.slow_put_inputs = False
+        self.container_inputs = []
+        self.container_outputs = []
+        self.fail_get_data_out = []
+        self.fc_data_in = defaultdict(lambda: asyncio.Queue())  # unbounded
+        self.fc_data_out = defaultdict(lambda: asyncio.Queue())  # unbounded
+        self.queue: dict[bytes, list[bytes]] = {b"": []}
+        self.deployed_apps: dict[tuple[str, str], str] = {}
+        self.app_environments: dict[str, str] = {}
+        self.app_deployment_history: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+        # The currently live version of each App, which can lag behind the newest version in the
+        # deployment history (e.g. after a rollback, or when a newer version has not been promoted).
+        self.app_live_version: dict[str, int] = {}
+        self.app_deployment_history["ap-x"] = [
+            {
+                "app_id": "ap-x",
+                "deployed_at": datetime.datetime.now().timestamp(),
+                "version": 1,
+                "client_version": str(Version(__version__)),
+                "deployed_by": "foo-user",
+                "tag": "latest",
+            }
+        ]
+        self.app_objects = {}
+        self.app_servers: dict[str, dict[str, str]] = {}
+        self.object_suggestions: dict[int, list[api_pb2.ObjectSuggestion]] = {}
+        self.command_suggestion = api_pb2.CliCommandSuggestResponse()
+        self.app_tags: dict[str, dict[str, str]] = {}
+        self.app_unindexed_objects = {}
+        self.max_object_size_bytes = MAX_OBJECT_SIZE_BYTES
+        self.n_inputs = 0
+        self.n_entry_ids = 0
+        self.n_queues = 0
+        self.n_dict_heartbeats = 0
+        self.n_queue_heartbeats = 0
+        self.n_nfs_heartbeats = 0
+        self.n_vol_heartbeats = 0
+        self.n_mounts = 0
+        self.n_mount_files = 0
+        self.mount_contents = {self.default_published_client_mount: {"/pkg/modal_client.py": "0x1337"}}
+        self.files_name2sha = {}
+        self.files_sha2data = files_sha2data
+        self.function_id_for_function_call = {}
+        self.function_call_inputs = {}
+        self.function_call_inputs_update_event = asyncio.Event()
+        self.sync_client_retries_enabled = False
+        self.function_is_running = False
+        self.n_functions = 0
+        self.n_schedules = 0
+        self.function2schedule = {}
+        self.function_create_error: BaseException | None = None
+        self.heartbeat_status_code = None
+        self.n_apps = 0
+        self.classes = []
+        self.environments = {"main": "en-1"}
+        self.environment_managed: dict[str, bool] = {}
+        self.environment_image_builder_version: dict[str, str] = {}
+        self.environment_type: "dict[str, api_pb2.EnvironmentType.ValueType]" = {}
+        # Workspace principals that can be assigned roles in restricted Environments
+        self.workspace_users: dict[str, str] = {"us-1": "alice", "us-2": "bob", "us-3": "carol"}
+        self.workspace_service_users: dict[str, api_pb2.ServiceUser | None] = {
+            "sv-1": api_pb2.ServiceUser(name="alice-bot", token_id="ak-SU1", created_by="user"),
+            "sv-2": api_pb2.ServiceUser(name="ops-bot", token_id="ak-SU2", created_by="user"),
+        }
+        # env_id -> {principal_id: role_proto}
+        self.environment_members: dict[str, dict[str, api_pb2.EnvironmentRole.ValueType]] = {}
+        # Proxy auth (webhook) tokens, including the metadata returned by list operations
+        self.webhook_tokens: dict[str, dict] = {}
+        # token_id -> set of environment_ids the token is associated with
+        self.webhook_token_environments: dict[str, set[str]] = {}
+        self.workspace_image_builder_version: str = "2024.10"
+        self.workspace_default_environment_name: str = "main"
+        self.audit_log_entries: list[api_pb2.AuditLogEntry] = []
+        self.workspace_members: list[api_pb2.WorkspaceMembersListItem] = [
+            api_pb2.WorkspaceMembersListItem(
+                user_id="us-1",
+                member_displayname="Alice",
+                email="alice@example.com",
+                member_role=api_pb2.MEMBER_ROLE_OWNER,
+                joined_at=1577836800.0,  # 2020-01-01 UTC
+                last_active_at=1609459200.0,  # 2021-01-01 UTC
+            ),
+            api_pb2.WorkspaceMembersListItem(
+                user_id="us-2",
+                member_displayname="Bob",
+                email="bob@example.com",
+                member_role=api_pb2.MEMBER_ROLE_USER,
+                joined_at=1577836800.0,  # 2020-01-01 UTC
+                # last_active_at left unset: Bob has never been active
+            ),
+        ]
+        self.workspace_member_tokens: dict[str, api_pb2.TokensListResponse.Token | None] = {
+            "ak-MT1": api_pb2.TokensListResponse.Token(
+                token_id="ak-MT1",
+                user_id="us-1",
+                member_displayname="Alice",
+                created_at=1577836800.0,  # 2020-01-01 UTC
+                last_used_at=1609459200.0,  # 2021-01-01 UTC
+                identity_provider_type=api_pb2.IDENTITY_PROVIDER_TYPE_GITHUB,
+            ),
+            "ak-MT2": api_pb2.TokensListResponse.Token(
+                token_id="ak-MT2",
+                user_id="us-2",
+                member_displayname="Bob",
+                created_at=1577836800.0,  # 2020-01-01 UTC
+                identity_provider_type=api_pb2.IDENTITY_PROVIDER_TYPE_GOOGLE_OAUTH,
+                name="named-token",
+                expires_at=1609459200.0,  # 2021-01-01 UTC
+            ),
+        }
+        self.resource_creation_timestamps = {}
+
+        self.task_result = None
+        self.task_list_calls = 0
+
+        self.nfs_files: dict[str, dict[str, api_pb2.SharedVolumePutFileRequest]] = defaultdict(dict)
+        self.volumes: dict[str, Volume] = {}
+        self.images = {}
+        self.image_build_function_ids = {}
+        self.image_builder_versions = {}
+        self.image_python_version_info: str | None = None
+        self.force_built_images = []
+        self.image_tags: dict[str, str] = {}  # full name:tag -> image_id
+        self.image_list_tags_requests: list[api_pb2.ImageListTagsRequest] = []
+        self.image_tag_revision_count = 0
+        self.image_tag_revision_ids: dict[str, str] = {}
+        self.image_tag_metadata: dict[str, tuple[str, float, float]] = {}
+        self.image_tag_revisions: dict[str, list[tuple[str, str, float]]] = {}
+        self.fail_blob_create = []
+        self.blob_create_metadata = None
+        self.blob_multipart_threshold = 10_000_000
+
+        self.precreated_functions = set()
+
+        self.app_functions: FunctionsRegistry = FunctionsRegistry()
+        self.bound_functions: dict[bytes, str] = {}
+        self.function_params: dict[str, tuple[tuple, dict[str, Any]]] = {}
+        self.function_serialized_params: dict[str, bytes] = {}
+        self.function_options: dict[str, api_pb2.FunctionOptions] = {}
+        self.function_variants: dict[str, list[str]] = {}  # base function ID -> bound function IDs
+        self.function_variants_page_size: int | None = None  # None serves every variant in one page
+        self.function_variant_task_counts: dict[str, int] = {}  # bound function ID -> running containers
+        self.function_call_num_inputs: dict[str, int] = {}
+        self.fcidx = 0
+
+        self.function_serialized = None
+        self.class_serialized = None
+
+        self.client_hello_metadata = None
+
+        self.dicts = {}
+        self.secrets = {}
+
+        self.deployed_dicts = {}
+        self.default_published_client_mount = "mo-123"
+        self.deployed_mounts = {
+            (client_mount_name(), api_pb2.DEPLOYMENT_NAMESPACE_GLOBAL): self.default_published_client_mount,
+            **{
+                (
+                    python_standalone_mount_name(version, builder_version, arch),
+                    api_pb2.DEPLOYMENT_NAMESPACE_GLOBAL,
+                ): f"mo-py{version.replace('.', '')}" + ("" if arch == "x86_64" else f"-{arch}")
+                for builder_version, standalone_versions in PYTHON_STANDALONE_VERSIONS.items()
+                for version in standalone_versions
+                for arch in ("x86_64", "aarch64")
+            },
+        }
+
+        self.deployed_nfss = {}
+        self.deployed_queues = {}
+        self.deployed_secrets = {}
+        self.secret_use_times = {}
+        self.deployed_volumes = {}
+
+        self.secret_environment_names = {}
+
+        self.cleared_function_calls = set()
+
+        self.cancelled_calls = []
+
+        self.app_client_disconnect_count = 0
+        self.app_get_logs_initial_count = 0
+        self.app_set_objects_count = 0
+        self.app_publish_count = 0
+        self.app_publish_is_noop = False
+
+        self.volume_counter = 0
+        # Volume-id -> commit/reload count
+        self.volume_commits: dict[str, int] = defaultdict(int)
+        self.volume_reloads: dict[str, int] = defaultdict(int)
+
+        self.sandbox_defs = []
+        self.sandbox_app_id = None
+        self.sandbox_task_ids: dict[str, str] = {}
+        # Set True to make SandboxCreateV2 omit command_router_access, as a scheduler
+        # that could not mint a token does.
+        self.sandbox_create_v2_omits_router_access = False
+        self.sandbox_create_v2_requests: list[api_pb2.SandboxCreateV2Request] = []
+        self.persistent_sandbox_create_requests: list[api_pb2.PersistentSandboxCreateRequest] = []
+        self.persistent_sandbox_terminated: set[str] = set()
+        self.persistent_sandbox_resumes = 0
+        self.sandbox_token_metadata: dict[str, str | None] = {}
+        self.sandbox_restore_v2_requests = []
+        self.sandbox_result: api_pb2.GenericResult | None = None
+        self._sandbox_terminated = False
+        self.sandbox_tags: dict[str, dict[str, str]] = {}
+        self.sandbox_stats_requests: list[api_pb2.SandboxGetTimeRangeStatsRequest] = []
+        self.sandbox_stats_pages = 1
+        self.sandbox_get_stats: dict[str, api_pb2.SandboxGetStatsResponse] = {}
+        self.sandbox_stats_throttle_remaining = 0
+        self.sandbox_names: dict[str, str] = {}
+        self.sandbox_outbound_policies: dict[str, api_pb2.OutboundPolicy] = {}
+
+        self.shell_prompt = None
+        self.container_exec: asyncio.subprocess.Process = None
+        self.container_exec_result: api_pb2.GenericResult | None = None
+
+        self.token_flow_localhost_port = None
+        self.queue_max_len = 100
+
+        self.container_heartbeat_response = None
+        self.container_heartbeat_abort = threading.Event()
+        self.container_hello_event = threading.Event()
+        self.container_server_lifecycle_ready_count = 0
+        self.container_stop_requests = []
+        self.container_stop_ids = []
+
+        self.image_join_sleep_duration = None
+
+        token_id, token_secret = credentials
+        self.required_creds = {token_id: token_secret}  # Any of this will be accepted
+        self.last_metadata = None
+
+        self.function_get_server_warnings = None
+        # Messages sent back in the `x-modal-warning` trailing metadata of every ClientHello.
+        self.client_hello_warnings: list[str] = []
+        # When set, ClientHello fails with this message instead of returning a response.
+        self.client_hello_error: str | None = None
+        self.resp_jitter_secs: float = 0.0
+        # Set a list of custom, fixed responses for the AttemptAwait RPC.
+        # This mock server will return responses in order. The regular behavior will resume once this list is exhausted.
+        self.attempt_await_responses: list[api_pb2.AttemptAwaitResponse] = []
+        # Value returned by AuthTokenGet
+        self.auth_token = jwt.encode(
+            {"exp": int(time.time()) + 3600}, "your-super-flexible-and-long-shared-secret-key", algorithm="HS256"
+        )
+        self.auth_tokens_generated = 0
+        self.auth_token_per_request = False
+        self.snapshot_auth_events: list[tuple[str, str | bytes | None]] = []
+        self.flash_endpoint_auth_token = "flash-endpoint-auth-token"
+        self.cli_get_flash_endpoint_auth_token_requests: list[api_pb2.CurlAuthTokenRequest] = []
+        self.function_id_to_app_id: dict[str, str] = {}
+        self.auth_token_delay = 0.0
+        # Number of times AttemptAwait was called.
+        self.attempt_await_count = 0
+        # Number of times the user's function was called.
+        self.function_call_count = 0
+        self.function_call_result: Any = None
+
+        self.flash_container_registrations = {}
+        self.flash_rpc_calls: list[str] = []  # Track Flash RPC calls in order
+        self.endpoint_create_requests: list[api_pb2.EndpointCreateRequest] = []
+        self.endpoint_create_model_name = ""
+        self.endpoint_list_requests: list[api_pb2.EndpointListRequest] = []
+        self.endpoint_models: list[api_pb2.EndpointModel] = []
+        self.endpoint_list_items: list[api_pb2.EndpointListItem] = []
+        self.endpoint_list_item_environments: dict[str, str] = {}
+        self.endpoint_get_by_name_requests: list[api_pb2.EndpointGetByNameRequest] = []
+        self.endpoint_get_lifecycle_requests: list[api_pb2.EndpointGetLifecycleRequest] = []
+        self.endpoint_stop_requests: list[api_pb2.EndpointStopRequest] = []
+        self.endpoint_ids_by_name: defaultdict[str, dict[str, str]] = defaultdict(dict)
+        self.endpoint_lifecycles: dict[str, api_pb2.EndpointLifecycle] = {}
+        self.n_endpoints = 0
+
+        @self.function_body
+        def default_function_body(*args, **kwargs):
+            return sum(arg**2 for arg in args) + sum(value**2 for key, value in kwargs.items())
+
+    def get_data_chunks(self, function_call_id) -> list[api_pb2.DataChunk]:
+        # ugly - get data chunks associated with the first input to this servicer
+        data_chunks: list[api_pb2.DataChunk] = []
+        if function_call_id in self.fc_data_out:
+            try:
+                while True:
+                    chunk = self.fc_data_out[function_call_id].get_nowait()
+                    data_chunks.append(chunk)
+            except asyncio.QueueEmpty:
+                pass
+        return data_chunks
+
+    def set_resp_jitter(self, secs: float) -> None:
+        # TODO: It'd be great to make this easy to apply to all gRPC method handlers.
+        # Some way to decorate `stream.send_message`.
+        self.resp_jitter_secs = secs
+
+    async def cleanup(self) -> None:
+        self.container_heartbeat_abort.set()
+
+    async def recv_request(self, event: RecvRequest):
+        method_name = event.method_name.rsplit("/", 1)[-1]
+        if self.auth_token_per_request and method_name in {
+            "ContainerCheckpoint",
+            "AttemptStart",
+            "MapStartOrContinue",
+            "SandboxCreateV2",
+            "SandboxWaitV2",
+        }:
+            self.snapshot_auth_events.append((method_name, event.metadata.get("x-modal-auth-token")))
+        # Make sure metadata is correct
+        self.last_metadata = event.metadata
+        for header in [
+            "x-modal-python-version",
+            "x-Alingo-Modal-Core-version",
+            "x-Alingo-Modal-Core-type",
+        ]:
+            if header not in event.metadata:
+                raise GRPCError(Status.FAILED_PRECONDITION, f"Missing {header} header")
+
+        client_version = event.metadata["x-Alingo-Modal-Core-version"]
+        assert isinstance(client_version, str)
+        if client_version == "unauthenticated":
+            raise GRPCError(Status.UNAUTHENTICATED, "failed authentication")
+        elif client_version == "timeout":
+            await asyncio.sleep(60)
+        elif client_version == "deprecated":
+            pass  # dumb magic fixture constant
+        elif (
+            Version(client_version) < Version(__version__)
+            and event.method_name != "/modal.client.ModalClient/CliCommandSuggest"
+        ):
+            raise GRPCError(Status.FAILED_PRECONDITION, "Old client")
+
+        if event.metadata["x-Alingo-Modal-Core-type"] == str(api_pb2.CLIENT_TYPE_CLIENT):
+            if event.method_name in [
+                "/modal.client.ModalClient/TokenFlowCreate",
+                "/modal.client.ModalClient/TokenFlowWait",
+                "/modal.client.ModalClient/CliCommandSuggest",
+            ]:
+                pass  # Methods that don't require authentication
+            else:
+                token_id = event.metadata.get("x-modal-token-id")
+                token_secret = event.metadata.get("x-modal-token-secret")
+                refresh_token = event.metadata.get("x-modal-refresh-token")
+                if refresh_token:
+                    assert isinstance(refresh_token, str)
+                    if token_id or token_secret:
+                        raise GRPCError(Status.UNAUTHENTICATED, "OAuth and Modal credentials cannot be combined")
+                    try:
+                        token_id, token_secret = refresh_token.split(".")
+                    except ValueError:
+                        raise GRPCError(Status.UNAUTHENTICATED, "Malformed OAuth refresh token") from None
+                if not token_id or not token_secret:
+                    raise GRPCError(Status.UNAUTHENTICATED, f"No credentials for method {event.method_name}")
+                elif token_id not in self.required_creds:
+                    raise GRPCError(Status.UNAUTHENTICATED, f"Invalid {token_id=!r} for method {event.method_name}")
+                elif self.required_creds[token_id] != token_secret:
+                    raise GRPCError(Status.UNAUTHENTICATED, f"Invalid token secret for for method {event.method_name}")
+        elif event.metadata["x-Alingo-Modal-Core-type"] == str(api_pb2.CLIENT_TYPE_CONTAINER):
+            for header in [
+                "x-modal-token-id",
+                "x-modal-token-secret",
+                "x-modal-refresh-token",
+                "x-modal-task-id",  # old
+                "x-modal-task-secret",  # old
+            ]:
+                if header in event.metadata:
+                    raise GRPCError(Status.FAILED_PRECONDITION, f"Container client should not set header {header}")
+        else:
+            raise GRPCError(Status.FAILED_PRECONDITION, "Unknown client type")
+
+    def function_body(self, func):
+        """Decorator for setting the function that will be called for any FunctionGetOutputs calls"""
+        self._function_body = func
+        return func
+
+    def function_by_name(self, name: str, params: tuple[tuple, dict[str, Any]] | None = None) -> api_pb2.Function:
+        matches = []
+        all_names = []
+        for function_id, fun in self.app_functions.items():
+            all_names.append(fun.function_name)
+            if fun.function_name != name:
+                continue
+            if fun.is_class and params:
+                if self.function_params.get(function_id, ((), {})) != params:
+                    continue
+
+            matches.append(fun)
+        if len(matches) == 1:
+            return matches[0]
+
+        if len(matches) > 1:
+            raise ValueError("More than 1 matching function")
+        raise ValueError(f"No function with name {name=} {params=} ({all_names=})")
+
+    def container_heartbeat_return_now(self, response: api_pb2.ContainerHeartbeatResponse):
+        self.container_heartbeat_response = response
+        self.container_heartbeat_abort.set()
+
+    def _get_experimental_flash_urls(self, definition: api_pb2.Function | api_pb2.FunctionData) -> list[str]:
+        """Generate mock flash URLs for functions with http_config."""
+        if not definition.HasField("http_config") or not definition.http_config.proxy_regions:
+            return []
+        # Generate URLs in format: https://modal-labs--{function-name}.modal-{region}.modal.direct
+        function_name = definition.function_name.lower().replace("_", "-")
+        urls = []
+        for region in definition.http_config.proxy_regions:
+            urls.append(f"https://modal-labs--{function_name}.modal-{region}.modal.direct")
+        return urls
+
+    def get_function_metadata(self, function_id: str) -> api_pb2.FunctionHandleMetadata:
+        function_proto: api_pb2.Function = self.app_functions[function_id]
+        definition_id = self.app_functions.definition_ids[function_id]
+
+        return api_pb2.FunctionHandleMetadata(
+            function_name=function_proto.function_name,
+            function_type=function_proto.function_type,
+            web_url=function_proto.web_url,
+            is_method=function_proto.is_method,
+            class_parameter_info=function_proto.class_parameter_info,
+            method_handle_metadata={
+                method_name: api_pb2.FunctionHandleMetadata(
+                    function_name=method_definition.function_name,
+                    function_type=method_definition.function_type,
+                    web_url=method_definition.web_url,
+                    is_method=True,
+                    use_method_name=method_name,
+                    function_schema=method_definition.function_schema,
+                    input_plane_url=self.client_addr if function_proto.routing_region else None,
+                    input_plane_region=function_proto.routing_region,
+                    supported_input_formats=method_definition.supported_input_formats,
+                    supported_output_formats=method_definition.supported_output_formats,
+                    app_id=self.function_id_to_app_id.get(function_id, ""),
+                )
+                for method_name, method_definition in function_proto.method_definitions.items()
+            },
+            function_schema=function_proto.function_schema,
+            input_plane_url=self.client_addr if function_proto.routing_region else None,
+            input_plane_region=function_proto.routing_region,
+            max_object_size_bytes=self.max_object_size_bytes,
+            definition_id=definition_id,
+            supported_input_formats=function_proto.supported_input_formats,
+            supported_output_formats=function_proto.supported_output_formats,
+            _experimental_flash_urls=self._get_experimental_flash_urls(function_proto),
+            app_id=self.function_id_to_app_id.get(function_id, ""),
+        )
+
+    def get_object_metadata(self, object_id) -> api_pb2.Object:
+        if object_id.startswith("fu-"):
+            res = api_pb2.Object(function_handle_metadata=self.get_function_metadata(object_id))
+
+        elif object_id.startswith("cs-"):
+            res = api_pb2.Object(class_handle_metadata=api_pb2.ClassHandleMetadata())
+
+        elif object_id.startswith("mo-"):
+            mount_handle_metadata = api_pb2.MountHandleMetadata(content_checksum_sha256_hex="abc123")
+            res = api_pb2.Object(mount_handle_metadata=mount_handle_metadata)
+
+        elif object_id.startswith("sb-"):
+            sandbox_handle_metadata = api_pb2.SandboxHandleMetadata(
+                result=self.sandbox_result,
+                app_id=self.sandbox_app_id,
+            )
+            res = api_pb2.Object(sandbox_handle_metadata=sandbox_handle_metadata)
+
+        elif object_id.startswith("vo-"):
+            volume_metadata = api_pb2.VolumeMetadata(version=self.volumes[object_id].version)
+            res = api_pb2.Object(volume_metadata=volume_metadata)
+
+        else:
+            res = api_pb2.Object()
+
+        res.object_id = object_id
+        return res
+
+    def get_environment(self, environment_name: str | None = None) -> str:
+        if not environment_name:
+            return next(iter(self.environments))  # Use first environment as default
+        return environment_name
+
+    def mounts_excluding_published_client(self):
+        return {
+            mount_id: content
+            for mount_id, content in self.mount_contents.items()
+            if mount_id != self.default_published_client_mount
+        }
+
+    def app_get_layout(self, app_id):
+        # Returns the app layout for any deployed app
+        app_objects = self.app_objects.get(app_id, {})
+        function_ids = {}
+        class_ids = {}
+        object_ids = set(app_objects.values()) | set(self.app_unindexed_objects.get(app_id, []))
+        for tag, object_id in app_objects.items():
+            if _Function._is_id_type(object_id):
+                function_ids[tag] = object_id
+                function_proto = self.app_functions[object_id]
+                if isinstance(function_proto, api_pb2.FunctionData):
+                    for ranked_fn in function_proto.ranked_functions:
+                        object_ids |= {obj.object_id for obj in ranked_fn.function.object_dependencies}
+                else:
+                    object_ids |= {obj.object_id for obj in function_proto.object_dependencies}
+            elif _Cls._is_id_type(object_id):
+                class_ids[tag] = object_id
+
+        return api_pb2.AppLayout(
+            function_ids=function_ids,
+            class_ids=class_ids,
+            objects=[self.get_object_metadata(object_id) for object_id in object_ids],
+        )
+
+    ### App
+
+    async def AppCreate(self, stream):
+        request: api_pb2.AppCreateRequest = await stream.recv_message()
+        self.requests.append(request)
+        self.n_apps += 1
+        app_id = f"ap-{self.n_apps}"
+        self.app_state_history[app_id].append(api_pb2.APP_STATE_INITIALIZING)
+        self.app_environments[app_id] = self.get_environment(request.environment_name)
+        await stream.send_message(
+            api_pb2.AppCreateResponse(
+                app_id=app_id,
+                app_page_url="https://modaltest.com/apps/ap-123",
+                app_logs_url="https://modaltest.com/apps/ap-123?activeTab=logs",
+            )
+        )
+
+    async def AppGetOrCreate(self, stream):
+        request: api_pb2.AppGetOrCreateRequest = await stream.recv_message()
+        self.requests.append(request)
+
+        if is_app_id(request.app_name):
+            # A lookup by ID ignores environment_name and object_creation_type.
+            app_id = request.app_name
+            if app_id not in self.app_state_history:
+                raise GRPCError(Status.NOT_FOUND, f"App {app_id!r} not found")
+            app_state = self.app_state_history[app_id][-1]
+            handle_metadata = api_pb2.AppHandleMetadata(
+                app_id=app_id,
+                environment_name=self.app_environments[app_id],
+                lifecycle=api_pb2.AppLifecycle(app_state=app_state),
+            )
+            await stream.send_message(api_pb2.AppGetOrCreateResponse(app_id=app_id, handle_metadata=handle_metadata))
+            return
+
+        environment_name = self.get_environment(request.environment_name)
+        try:
+            app_id = self.deployed_apps[(environment_name, request.app_name)]
+        except KeyError:
+            if request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_CREATE_IF_MISSING:
+                app_id = f"ap-{self.n_apps}"
+                self.deployed_apps[(environment_name, request.app_name)] = app_id
+                self.app_state_history[app_id].append(api_pb2.APP_STATE_DEPLOYED)
+                self.app_environments[app_id] = environment_name
+            else:
+                raise GRPCError(Status.NOT_FOUND, f"App '{request.app_name}' not found")
+
+        await stream.send_message(api_pb2.AppGetOrCreateResponse(app_id=app_id))
+
+    async def AppClientDisconnect(self, stream):
+        request: api_pb2.AppClientDisconnectRequest = await stream.recv_message()
+        self.requests.append(request)
+        self.done = True
+        self.app_done_event.set()
+        self.app_client_disconnect_count += 1
+        state_history = self.app_state_history[request.app_id]
+        if state_history[-1] not in [api_pb2.APP_STATE_DETACHED, api_pb2.APP_STATE_DEPLOYED]:
+            state_history.append(api_pb2.APP_STATE_STOPPED)
+        await stream.send_message(Empty())
+        # introduce jitter to simulate network latency
+        await asyncio.sleep(random.uniform(0.0, self.resp_jitter_secs))
+
+    async def AppGetLayout(self, stream):
+        request: api_pb2.AppGetLayoutRequest = await stream.recv_message()
+        app_layout = self.app_get_layout(request.app_id)
+        await stream.send_message(api_pb2.AppGetLayoutResponse(app_layout=app_layout))
+
+    async def AppGetLogs(self, stream):
+        request: api_pb2.AppGetLogsRequest = await stream.recv_message()
+        if not request.last_entry_id:
+            # Just count initial requests
+            self.app_get_logs_initial_count += 1
+            last_entry_id = "1"
+        else:
+            last_entry_id = str(int(request.last_entry_id) + 1)
+
+        if not self.done:
+            await self.app_done_event.wait()
+
+        log = api_pb2.TaskLogs(data=f"hello, world ({last_entry_id})\n", file_descriptor=api_pb2.FILE_DESCRIPTOR_STDOUT)
+        await stream.send_message(api_pb2.TaskLogsBatch(entry_id=last_entry_id, items=[log]))
+        await stream.send_message(api_pb2.TaskLogsBatch(app_done=True))
+
+    def _max_history_version(self, app_id: str) -> int:
+        return max((h["version"] for h in self.app_deployment_history[app_id]), default=0)
+
+    async def AppPromote(self, stream):
+        request: api_pb2.AppPromoteRequest = await stream.recv_message()
+        history = self.app_deployment_history[request.app_id]
+        current_version = self.app_live_version.get(request.app_id, self._max_history_version(request.app_id))
+
+        if request.version <= 0:
+            raise GRPCError(Status.INVALID_ARGUMENT, "Invalid promote version request.")
+        if request.version <= current_version:
+            raise GRPCError(
+                Status.INVALID_ARGUMENT,
+                f"Promote version must be newer than the current App version ({current_version}).",
+            )
+
+        promote_history = next((h for h in history if h["version"] == request.version), None)
+        if promote_history is None:
+            raise GRPCError(Status.NOT_FOUND, "Promote version not found in App history.")
+
+        # Mirrors the server: the new version clears every row in history, not just the live one,
+        # so promoting the immediately-next version does not reuse its version number.
+        new_version = max(current_version, self._max_history_version(request.app_id)) + 1
+        deployed_at = datetime.datetime.now().timestamp()
+        self.app_deployment_history[request.app_id].append(
+            {
+                "app_id": request.app_id,
+                "deployed_at": deployed_at,
+                "version": new_version,
+                "client_version": promote_history["client_version"],
+                "deployed_by": "foo-user",
+                "tag": promote_history["tag"],
+                "rollback_version": request.version,
+                "definition_ids": promote_history["definition_ids"],
+                "function_ids": promote_history["function_ids"],
+                "commit_info": promote_history.get("commit_info", None),
+            }
+        )
+        self.app_live_version[request.app_id] = new_version
+        self.app_objects[request.app_id] = dict(promote_history["function_ids"])
+        self.app_state_history[request.app_id].append(api_pb2.APP_STATE_DEPLOYED)
+        response = api_pb2.AppPromoteResponse(
+            url="http://test.modal.com/foo/bar",
+            server_warnings=[],
+            deployed_at=deployed_at,
+        )
+        await stream.send_message(response)
+
+    async def AppRollback(self, stream):
+        request: api_pb2.AppRollbackRequest = await stream.recv_message()
+        history = self.app_deployment_history[request.app_id]
+        # Mirrors the server: relative versions resolve against the App's live version, which can trail
+        # staged rows in history.
+        current_version = self.app_live_version.get(request.app_id, self._max_history_version(request.app_id))
+        if request.version < 0:
+            rollback_version = current_version + request.version
+            if rollback_version <= 0:
+                raise GRPCError(Status.INVALID_ARGUMENT, "Rollback request exceeds number of App deployments.")
+        elif request.version > 0:
+            rollback_version = request.version
+        else:
+            raise GRPCError(Status.INVALID_ARGUMENT, "Invalid rollback version request.")
+
+        rollback_history = next((h for h in history if h["version"] == rollback_version), None)
+        if rollback_history is None:
+            raise GRPCError(Status.NOT_FOUND, "Rollback version not found in App history.")
+        rollback_client = rollback_history["client_version"]
+        # Mirrors the server: the new version sits above every row in history, not just the live one.
+        new_version = max(current_version, self._max_history_version(request.app_id)) + 1
+        deployed_at = datetime.datetime.now().timestamp()
+        self.app_deployment_history[request.app_id].append(
+            {
+                "app_id": request.app_id,
+                "deployed_at": deployed_at,
+                "version": new_version,
+                "client_version": rollback_client,
+                "deployed_by": "foo-user",
+                "tag": "latest",
+                "rollback_version": rollback_version,
+                "definition_ids": rollback_history["definition_ids"],
+                "function_ids": rollback_history["function_ids"],
+                "commit_info": rollback_history.get("commit_info", None),
+            }
+        )
+        self.app_live_version[request.app_id] = new_version
+
+        self.app_state_history[request.app_id].append(api_pb2.APP_STATE_DEPLOYED)
+        response = api_pb2.AppRollbackResponse(
+            url="http://test.modal.com/foo/bar",
+            server_warnings=[],
+            deployed_at=deployed_at,
+        )
+        await stream.send_message(response)
+
+    async def AppRollover(self, stream):
+        request: api_pb2.AppRolloverRequest = await stream.recv_message()
+
+        # Get app name from app_id for publish call
+        app_name = None
+        for (_, app_name_), app_id in self.deployed_apps.items():
+            if app_id == request.app_id:
+                app_name = app_name_
+                break
+        else:  # no break
+            raise GRPCError(Status.INVALID_ARGUMENT)
+
+        recent_history = self.app_deployment_history[request.app_id][-1]
+        new_publish_request = api_pb2.AppPublishRequest(
+            app_id=request.app_id,
+            name=app_name,
+            deployment_tag=recent_history["tag"],
+            client_version=recent_history["client_version"],
+            app_state=api_pb2.APP_STATE_DEPLOYED,
+            definition_ids=recent_history["definition_ids"],
+            function_ids=recent_history["function_ids"],
+            commit_info=recent_history.get("commit_info", None),
+            rollback_version=recent_history["version"],
+        )
+        publish_response = await self._app_publish(new_publish_request)
+        response = api_pb2.AppRolloverResponse(
+            url=publish_response.url,
+            server_warnings=publish_response.server_warnings,
+            deployed_at=publish_response.deployed_at,
+        )
+        await stream.send_message(response)
+
+    async def AppPublish(self, stream):
+        request: api_pb2.AppPublishRequest = await stream.recv_message()
+        response = await self._app_publish(request)
+        await stream.send_message(response)
+
+    async def _app_publish(self, request: api_pb2.AppPublishRequest):
+        for key, val in request.definition_ids.items():
+            assert key.startswith("fu-")
+            assert val.startswith("de-")
+        # TODO(michael) add some other assertions once we make the mock server represent real RPCs more accurately
+        self.app_publish_count += 1
+
+        if request.app_state == api_pb2.AppState.APP_STATE_DEPLOYED:
+            app_key = (self.app_environments[request.app_id], request.name)
+            self.deployed_apps[app_key] = request.app_id
+            if self.app_publish_is_noop:
+                deployed_at = 0.0
+            else:
+                deployed_at = datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+            response = api_pb2.AppPublishResponse(
+                url="http://test.modal.com/foo/bar",
+                deployed_at=deployed_at,
+            )
+            if self.app_publish_is_noop:
+                # Early exit for noop deployment
+                return response
+        else:
+            response = api_pb2.AppPublishResponse(deployed_at=datetime.datetime.now(datetime.timezone.utc).timestamp())
+
+        self.app_objects[request.app_id] = {**request.function_ids, **request.class_ids}
+        self.app_state_history[request.app_id].append(request.app_state)
+        current_version = self._max_history_version(request.app_id)
+
+        self.app_deployment_history[request.app_id].append(
+            {
+                "app_id": request.app_id,
+                "deployed_at": datetime.datetime.now().timestamp(),
+                "version": current_version + 1,
+                "client_version": str(Version(__version__)),
+                "deployed_by": "foo-user",
+                "tag": "latest",
+                "rollback_version": None,
+                "commit_info": request.commit_info,
+                "definition_ids": dict(request.definition_ids),
+                "function_ids": dict(request.function_ids),
+            }
+        )
+        self.app_live_version[request.app_id] = current_version + 1
+        return response
+
+    async def AppGetByDeploymentName(self, stream):
+        request: api_pb2.AppGetByDeploymentNameRequest = await stream.recv_message()
+        app_key = (self.get_environment(request.environment_name), request.name)
+        app_id = self.deployed_apps.get(app_key)
+        environment_name = self.get_environment(request.environment_name)
+        lifecycle = api_pb2.AppLifecycle()
+        if app_id and self.app_state_history[app_id]:
+            lifecycle = api_pb2.AppLifecycle(app_state=self.app_state_history[app_id][-1])
+        await stream.send_message(
+            api_pb2.AppGetByDeploymentNameResponse(
+                app_id=app_id, environment_name=environment_name, lifecycle=lifecycle
+            )
+        )
+
+    async def AppGetLifecycle(self, stream):
+        request: api_pb2.AppGetLifecycleRequest = await stream.recv_message()
+        if request.app_id not in self.app_state_history:
+            raise GRPCError(Status.NOT_FOUND, f"App '{request.app_id}' not found")
+        lifecycle = api_pb2.AppLifecycle(app_state=self.app_state_history[request.app_id][-1])
+        await stream.send_message(api_pb2.AppGetLifecycleResponse(lifecycle=lifecycle))
+
+    async def CliCommandSuggest(self, stream):
+        await stream.recv_message()
+        await stream.send_message(self.command_suggestion)
+
+    async def ObjectSuggest(self, stream):
+        request: api_pb2.ObjectSuggestRequest = await stream.recv_message()
+        await stream.send_message(
+            api_pb2.ObjectSuggestResponse(suggestions=self.object_suggestions.get(request.kind, []))
+        )
+
+    async def AppGetInfo(self, stream):
+        request: api_pb2.AppGetInfoRequest = await stream.recv_message()
+        app_id = request.app_id
+        if app_id not in self.app_state_history:
+            raise GRPCError(Status.NOT_FOUND, f"App '{app_id}' not found")
+
+        name = next((app_name for (_, app_name), id_ in self.deployed_apps.items() if id_ == app_id), "")
+        history = self.app_deployment_history.get(app_id) or []
+        lifecycle = api_pb2.AppLifecycle(
+            app_state=self.app_state_history[app_id][-1],
+            created_at=history[0]["deployed_at"] if history else 0.0,
+            created_by=self.default_username,
+            deployed_at=history[-1]["deployed_at"] if history else 0.0,
+            deployed_by=history[-1]["deployed_by"] if history else "",
+            version=history[-1]["version"] if history else 0,
+        )
+        # `app_objects` also holds class ids. The mock servicer cannot classify servers itself, so
+        # tests that need them populate `app_servers` and everything else lands in `functions`.
+        servers = self.app_servers.get(app_id, {})
+        functions = {
+            tag: object_id
+            for tag, object_id in self.app_objects.get(app_id, {}).items()
+            if object_id.startswith("fu-") and tag not in servers
+        }
+        info = api_pb2.AppHandleMetadata(
+            description=name,
+            app_id=app_id,
+            lifecycle=lifecycle,
+            functions=functions,
+            servers=servers,
+        )
+        await stream.send_message(api_pb2.AppGetInfoResponse(info=info))
+
+    async def AppHeartbeat(self, stream):
+        request: api_pb2.AppHeartbeatRequest = await stream.recv_message()
+        self.requests.append(request)
+        if self.app_state_history[request.app_id][-1] == api_pb2.APP_STATE_STOPPED:
+            raise GRPCError(Status.FAILED_PRECONDITION, "App is stopped")
+        else:
+            self.app_heartbeats[request.app_id] += 1
+            await stream.send_message(Empty())
+
+    async def AppDeploymentHistory(self, stream):
+        request: api_pb2.AppHeartbeatRequest = await stream.recv_message()
+        app_deployment_histories = []
+
+        for app_deployment_history in self.app_deployment_history.get(request.app_id, []):
+            app_deployment_histories.append(
+                api_pb2.AppDeploymentHistory(
+                    app_id=request.app_id,
+                    deployed_at=app_deployment_history["deployed_at"],
+                    version=app_deployment_history["version"],
+                    client_version=app_deployment_history["client_version"],
+                    deployed_by=app_deployment_history["deployed_by"],
+                    tag=app_deployment_history["tag"],
+                    commit_info=app_deployment_history.get("commit_info", None),
+                )
+            )
+
+        await stream.send_message(
+            api_pb2.AppDeploymentHistoryResponse(app_deployment_histories=app_deployment_histories)
+        )
+
+    async def AppList(self, stream):
+        req = await stream.recv_message()
+        apps = []
+        requested_environment = self.get_environment(req.environment_name)
+        for (environment_name, app_name), app_id in self.deployed_apps.items():
+            if environment_name != requested_environment:
+                continue
+            apps.append(
+                api_pb2.AppListResponse.AppListItem(
+                    name=app_name,
+                    description=app_name,
+                    app_id=app_id,
+                    state=api_pb2.APP_STATE_DEPLOYED,
+                )
+            )
+        await stream.send_message(api_pb2.AppListResponse(apps=apps))
+
+    async def AppSetTags(self, stream):
+        request: api_pb2.AppSetTagsRequest = await stream.recv_message()
+        self.app_tags[request.app_id] = dict(request.tags)
+        await stream.send_message(Empty())
+
+    async def AppStop(self, stream):
+        request: api_pb2.AppStopRequest = await stream.recv_message()
+        self.deployed_apps = {k: v for k, v in self.deployed_apps.items() if v != request.app_id}
+        await stream.send_message(Empty())
+
+    async def AuthTokenGet(self, stream):
+        await asyncio.sleep(self.auth_token_delay)
+        self.auth_tokens_generated += 1
+        token = self.auth_token
+        if self.auth_token_per_request:
+            token = jwt.encode(
+                {"exp": 4102444800, "jti": str(self.auth_tokens_generated)},
+                "your-super-flexible-and-long-shared-secret-key",
+                algorithm="HS256",
+            )
+            self.snapshot_auth_events.append(("AuthTokenGet", token))
+        response = api_pb2.AuthTokenGetResponse(token=token)
+        await stream.send_message(response)
+
+    async def CurlGetAuthToken(self, stream):
+        request: api_pb2.CurlAuthTokenRequest = await stream.recv_message()
+        self.cli_get_flash_endpoint_auth_token_requests.append(request)
+        response = api_pb2.CurlAuthTokenResponse(token=self.flash_endpoint_auth_token)
+        await stream.send_message(response)
+
+    ### Checkpoint
+
+    async def ContainerCheckpoint(self, stream):
+        request: api_pb2.ContainerCheckpointRequest = await stream.recv_message()
+        self.requests.append(request)
+        self.container_snapshot_requests += 1
+        await stream.send_message(Empty())
+
+    async def ContainerExecPutInput(self, stream):
+        request = await stream.recv_message()
+
+        self.container_exec.stdin.write(request.input.message)
+        await self.container_exec.stdin.drain()
+
+        if request.input.eof:
+            self.container_exec.stdin.close()
+
+        await stream.send_message(Empty())
+
+    ### Blob
+
+    async def BlobCreate(self, stream):
+        req = await stream.recv_message()
+        # This is used to test retry_transient_errors, see grpc_utils_test.py
+        self.blob_create_metadata = stream.metadata
+        if len(self.fail_blob_create) > 0:
+            raise self.fail_blob_create.pop()
+        elif req.content_length > self.blob_multipart_threshold:
+            blob_id = await self.next_blob_id()
+            num_parts = (req.content_length + self.blob_multipart_threshold - 1) // self.blob_multipart_threshold
+            upload_urls = []
+            for part_number in range(num_parts):
+                upload_url = f"{self.blob_host}/upload?blob_id={blob_id}&part_number={part_number}"
+                upload_urls.append(upload_url)
+
+            multipart = api_pb2.MultiPartUpload(
+                part_length=self.blob_multipart_threshold,
+                upload_urls=upload_urls,
+                completion_url=f"{self.blob_host}/complete_multipart?blob_id={blob_id}",
+            )
+            await stream.send_message(
+                api_pb2.BlobCreateResponse(
+                    blob_ids=[blob_id, blob_id],
+                    multiparts=api_pb2.MultiPartUploadList(items=[multipart, multipart]),
+                )
+            )
+        else:
+            blob_id = await self.next_blob_id()
+            upload_url = f"{self.blob_host}/upload?blob_id={blob_id}"
+            await stream.send_message(
+                api_pb2.BlobCreateResponse(
+                    blob_ids=[blob_id, blob_id],
+                    upload_urls=api_pb2.UploadUrlList(items=[upload_url, upload_url]),
+                )
+            )
+
+    async def next_blob_id(self):
+        self.n_blobs += 1
+        blob_id = f"bl-{self.n_blobs}"
+        return blob_id
+
+    def next_entry_id(self) -> str:
+        entry_id = f"1738286390000-{self.n_entry_ids}"
+        self.n_entry_ids += 1
+        return entry_id
+
+    async def BlobGet(self, stream):
+        request: api_pb2.BlobGetRequest = await stream.recv_message()
+        download_url = f"{self.blob_host}/download?blob_id={request.blob_id}"
+        await stream.send_message(api_pb2.BlobGetResponse(download_url=download_url))
+
+    async def FunctionBlobGet(self, stream):
+        raise GRPCError(Status.UNIMPLEMENTED, "FunctionBlobGet is not mocked")
+
+    ### Class
+
+    async def ClassCreate(self, stream):
+        request: api_pb2.ClassCreateRequest = await stream.recv_message()
+        assert request.app_id
+        class_id = "cs-" + str(len(self.classes))
+        self.classes.append(class_id)
+        await stream.send_message(api_pb2.ClassCreateResponse(class_id=class_id))
+
+    async def ClassGet(self, stream):
+        request: api_pb2.ClassGetRequest = await stream.recv_message()
+        app_key = (self.get_environment(request.environment_name), request.app_name)
+        if not (app_id := self.deployed_apps.get(app_key)):
+            raise GRPCError(Status.NOT_FOUND, f"can't find app {request.app_name}")
+        app_objects = self.app_objects[app_id]
+        object_id = app_objects.get(request.object_tag)
+        if object_id is None:
+            raise GRPCError(Status.NOT_FOUND, f"can't find object {request.object_tag}")
+        await stream.send_message(api_pb2.ClassGetResponse(class_id=object_id))
+
+    ### Client
+
+    async def ClientHello(self, stream):
+        request: Empty = await stream.recv_message()
+        self.requests.append(request)
+        if stream.metadata["x-Alingo-Modal-Core-version"] == "deprecated":
+            warnings = [
+                api_pb2.Warning(
+                    type=api_pb2.Warning.WARNING_TYPE_CLIENT_DEPRECATION,
+                    message="SUPER OLD",
+                )
+            ]
+        else:
+            warnings = []
+        # One entry per warning; gRPC metadata allows a key to repeat.
+        trailing_metadata = [("x-modal-warning", quote(message, safe="")) for message in self.client_hello_warnings]
+
+        if self.client_hello_error is not None:
+            # No message sent first, so this goes out as a trailers-only response, the way
+            # the real server's `abort()` does.
+            await stream.send_trailing_metadata(
+                status=Status.INTERNAL, status_message=self.client_hello_error, metadata=trailing_metadata
+            )
+            return
+
+        resp = api_pb2.ClientHelloResponse(server_warnings=warnings)
+        await stream.send_message(resp)
+        if trailing_metadata:
+            await stream.send_trailing_metadata(metadata=trailing_metadata)
+
+    # Container
+
+    async def ContainerHeartbeat(self, stream):
+        request: api_pb2.ContainerHeartbeatRequest = await stream.recv_message()
+        self.requests.append(request)
+        # Return earlier than the usual 15-second heartbeat to avoid suspending tests.
+        await asyncify(self.container_heartbeat_abort.wait)(5)
+        if self.container_heartbeat_response:
+            await stream.send_message(self.container_heartbeat_response)
+            self.container_heartbeat_response = None
+        else:
+            await stream.send_message(api_pb2.ContainerHeartbeatResponse())
+
+    async def ContainerExec(self, stream):
+        request: api_pb2.ContainerExecRequest = await stream.recv_message()
+        self.container_exec = await asyncio.subprocess.create_subprocess_exec(
+            *request.command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE,
+        )
+        await stream.send_message(api_pb2.ContainerExecResponse(exec_id="container_exec_id"))
+
+    async def ContainerExecWait(self, stream):
+        request: api_pb2.ContainerExecWaitRequest = await stream.recv_message()
+        try:
+            await asyncio.wait_for(self.container_exec.wait(), request.timeout)
+        except asyncio.TimeoutError:
+            pass
+
+        if self.container_exec.returncode is None:
+            await stream.send_message(api_pb2.ContainerExecWaitResponse(completed=False))
+        else:
+            await stream.send_message(
+                api_pb2.ContainerExecWaitResponse(completed=True, exit_code=self.container_exec.returncode)
+            )
+
+    async def ContainerExecGetOutput(self, stream):
+        request: api_pb2.ContainerExecGetOutputRequest = await stream.recv_message()
+        if request.file_descriptor == api_pb2.FILE_DESCRIPTOR_STDOUT:
+            if self.shell_prompt:
+                await stream.send_message(
+                    api_pb2.RuntimeOutputBatch(
+                        items=[
+                            api_pb2.RuntimeOutputMessage(
+                                file_descriptor=request.file_descriptor,
+                                message_bytes=self.shell_prompt,
+                            )
+                        ]
+                    )
+                )
+            read_stream = self.container_exec.stdout
+        else:
+            read_stream = self.container_exec.stderr
+
+        async for message in read_stream:
+            await stream.send_message(
+                api_pb2.RuntimeOutputBatch(
+                    items=[
+                        api_pb2.RuntimeOutputMessage(
+                            message=message.decode("utf-8"),
+                            file_descriptor=request.file_descriptor,
+                            message_bytes=message,
+                        )
+                    ]
+                )
+            )
+
+        await stream.send_message(api_pb2.RuntimeOutputBatch(exit_code=0))
+
+    async def ContainerHello(self, stream):
+        await stream.recv_message()
+        self.container_hello_event.set()
+        await stream.send_message(Empty())
+
+    async def ContainerServerLifecycleReady(self, stream):
+        await stream.recv_message()
+        self.container_server_lifecycle_ready_count += 1
+        await stream.send_message(Empty())
+
+    async def ContainerStop(self, stream):
+        req: api_pb2.ContainerStopRequest = await stream.recv_message()
+        self.container_stop_requests.append(req)
+        self.container_stop_ids.append(req.task_id)
+        if req.graceful:
+            self.container_inputs.insert(
+                0,
+                api_pb2.FunctionGetInputsResponse(inputs=[api_pb2.FunctionGetInputsItem(kill_switch=True)]),
+            )
+        await stream.send_message(api_pb2.ContainerStopResponse())
+
+    ### Dict
+
+    async def DictGetOrCreate(self, stream):
+        request: api_pb2.DictGetOrCreateRequest = await stream.recv_message()
+        k = (request.deployment_name, self.get_environment(request.environment_name))
+        if k in self.deployed_dicts:
+            if request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_CREATE_FAIL_IF_EXISTS:
+                raise GRPCError(Status.ALREADY_EXISTS, f"Dict {k[0]!r} already exists")
+            dict_id = self.deployed_dicts[k]
+        elif request.object_creation_type in (
+            api_pb2.OBJECT_CREATION_TYPE_CREATE_IF_MISSING,
+            api_pb2.OBJECT_CREATION_TYPE_CREATE_FAIL_IF_EXISTS,
+        ):
+            dict_id = f"di-{len(self.dicts)}"
+            self.dicts[dict_id] = {entry.key: entry.value for entry in request.data}
+            self.deployed_dicts[k] = dict_id
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_EPHEMERAL:
+            dict_id = f"di-{len(self.dicts)}"
+            self.dicts[dict_id] = {entry.key: entry.value for entry in request.data}
+        else:
+            raise GRPCError(Status.NOT_FOUND, f"Dict {k} not found")
+        self.resource_creation_timestamps[dict_id] = timestamp = datetime.datetime.now().timestamp()
+        creation_info = api_pb2.CreationInfo(created_at=timestamp, created_by=self.default_username)
+        metadata = api_pb2.DictMetadata(name=request.deployment_name, creation_info=creation_info)
+        await stream.send_message(api_pb2.DictGetOrCreateResponse(dict_id=dict_id, metadata=metadata))
+
+    async def DictGetById(self, stream):
+        request: api_pb2.DictGetByIdRequest = await stream.recv_message()
+        # Look up the dict by ID
+        dict_name = None
+        for (name, _env), did in self.deployed_dicts.items():
+            if did == request.dict_id:
+                dict_name = name
+                break
+
+        if request.dict_id not in self.resource_creation_timestamps:
+            raise GRPCError(Status.NOT_FOUND, f"Dict {request.dict_id!r} not found")
+
+        timestamp = self.resource_creation_timestamps[request.dict_id]
+        creation_info = api_pb2.CreationInfo(created_at=timestamp, created_by=self.default_username)
+        metadata = api_pb2.DictMetadata(name=dict_name or "", creation_info=creation_info)
+        await stream.send_message(api_pb2.DictGetByIdResponse(dict_id=request.dict_id, metadata=metadata))
+
+    async def DictHeartbeat(self, stream):
+        await stream.recv_message()
+        self.n_dict_heartbeats += 1
+        await stream.send_message(Empty())
+
+    async def DictDelete(self, stream):
+        request: api_pb2.DictDeleteRequest = await stream.recv_message()
+        self.deployed_dicts = {k: v for k, v in self.deployed_dicts.items() if v != request.dict_id}
+        await stream.send_message(Empty())
+
+    async def DictClear(self, stream):
+        request: api_pb2.DictGetRequest = await stream.recv_message()
+        self.dicts[request.dict_id] = {}
+        await stream.send_message(Empty())
+
+    async def DictGet(self, stream):
+        request: api_pb2.DictGetRequest = await stream.recv_message()
+        d = self.dicts[request.dict_id]
+        await stream.send_message(api_pb2.DictGetResponse(value=d.get(request.key), found=bool(request.key in d)))
+
+    async def DictLen(self, stream):
+        request: api_pb2.DictLenRequest = await stream.recv_message()
+        await stream.send_message(api_pb2.DictLenResponse(len=len(self.dicts[request.dict_id])))
+
+    async def DictList(self, stream):
+        request: api_pb2.DictListRequest = await stream.recv_message()
+        dicts = []
+        environment = self.get_environment(request.environment_name)
+        for (name, environment_name), obj_id in self.deployed_dicts.items():
+            timestamp = self.resource_creation_timestamps[obj_id]
+            if environment_name != environment:
+                continue
+            elif timestamp >= request.pagination.created_before:
+                continue
+
+            creation_info = api_pb2.CreationInfo(created_at=timestamp, created_by=self.default_username)
+            metadata = api_pb2.DictMetadata(name=name, creation_info=creation_info)
+            dicts.append(api_pb2.DictListResponse.DictInfo(name=name, dict_id=obj_id, metadata=metadata))
+            if request.pagination.max_objects and len(dicts) >= request.pagination.max_objects:
+                break
+
+        dicts = sorted(dicts, key=lambda x: x.metadata.creation_info.created_at, reverse=True)
+        await stream.send_message(api_pb2.DictListResponse(dicts=dicts))
+
+    async def DictUpdate(self, stream):
+        request: api_pb2.DictUpdateRequest = await stream.recv_message()
+        if len(request.updates) == 1:
+            if request.if_not_exists and request.updates[0].key in self.dicts[request.dict_id]:
+                await stream.send_message(api_pb2.DictUpdateResponse(created=False))
+                return
+        else:
+            if request.if_not_exists:
+                raise GRPCError(Status.INVALID_ARGUMENT)
+
+        for update in request.updates:
+            self.dicts[request.dict_id][update.key] = update.value
+        await stream.send_message(api_pb2.DictUpdateResponse(created=True))
+
+    async def DictPop(self, stream):
+        request: api_pb2.DictPopRequest = await stream.recv_message()
+        d = self.dicts[request.dict_id]
+        if request.key in d:
+            value = d.pop(request.key)
+            await stream.send_message(api_pb2.DictPopResponse(found=True, value=value))
+        else:
+            await stream.send_message(api_pb2.DictPopResponse(found=False))
+
+    async def DictContains(self, stream):
+        request: api_pb2.DictContainsRequest = await stream.recv_message()
+        d = self.dicts[request.dict_id]
+        found = request.key in d
+        await stream.send_message(api_pb2.DictContainsResponse(found=found))
+
+    async def DictContents(self, stream):
+        request: api_pb2.DictGetRequest = await stream.recv_message()
+        for k, v in self.dicts[request.dict_id].items():
+            await stream.send_message(api_pb2.DictEntry(key=k, value=v))
+
+    ### Endpoint
+
+    async def EndpointCreate(self, stream):
+        request: api_pb2.EndpointCreateRequest = await stream.recv_message()
+        self.endpoint_create_requests.append(request)
+        self.n_endpoints += 1
+        endpoint_id = f"ep-{self.n_endpoints:022d}"
+        environment_name = self.get_environment(request.environment_name)
+        endpoint_name = request.name
+        if not endpoint_name:
+            if request.model.WhichOneof("source") == "custom":
+                if request.model.custom.WhichOneof("location") == "huggingface":
+                    model_name = request.model.custom.huggingface.repo_id
+                else:
+                    model_name = request.model.custom.base_model_repo_id
+            else:
+                model_name = request.model.base_model_repo_id
+            endpoint_name = (
+                re.sub(r"[^a-z0-9]+", "-", model_name.rsplit("/", 1)[-1].lower()).strip("-")[:64].rstrip("-")
+            )
+        self.endpoint_ids_by_name[environment_name][endpoint_name] = endpoint_id
+        self.endpoint_lifecycles[endpoint_id] = api_pb2.EndpointLifecycle(
+            status=api_pb2.ENDPOINT_LIFECYCLE_STATUS_ACTIVE,
+            created_at=datetime.datetime.now().timestamp(),
+            created_by="test-user",
+            environment_name=environment_name,
+        )
+        self.endpoint_list_items.append(
+            api_pb2.EndpointListItem(
+                endpoint_id=endpoint_id,
+                name=endpoint_name,
+                description=request.description,
+                active_deployment_id=f"ed-{self.n_endpoints}",
+                updated_at=datetime.datetime.now().timestamp(),
+                app_state=api_pb2.APP_STATE_DEPLOYED,
+                provisioning_status=api_pb2.ENDPOINT_PROVISIONING_STATUS_SUCCEEDED,
+                status="live",
+                metadata=api_pb2.EndpointMetadata(
+                    name=endpoint_name,
+                    creation_info=api_pb2.CreationInfo(
+                        created_at=datetime.datetime.now().timestamp(),
+                        created_by="test-user",
+                    ),
+                ),
+            )
+        )
+        self.endpoint_list_item_environments[endpoint_id] = environment_name
+        endpoint_page_url = f"https://modal.com/endpoints/test-user/{environment_name}/{endpoint_id}"
+        await stream.send_message(
+            api_pb2.EndpointCreateResponse(
+                endpoint_id=endpoint_id,
+                endpoint_page_url=endpoint_page_url,
+                name=endpoint_name,
+                model_name=self.endpoint_create_model_name,
+            )
+        )
+
+    async def EndpointGetLibrary(self, stream):
+        await stream.recv_message()
+        await stream.send_message(api_pb2.EndpointGetLibraryResponse(models=self.endpoint_models))
+
+    async def EndpointList(self, stream):
+        request: api_pb2.EndpointListRequest = await stream.recv_message()
+        self.endpoint_list_requests.append(request)
+        environment_name = self.get_environment(request.environment_name)
+        created_before = request.pagination.created_before or float("inf")
+        max_objects = request.pagination.max_objects or len(self.endpoint_list_items)
+        items = sorted(
+            (
+                item
+                for item in self.endpoint_list_items
+                if self.endpoint_list_item_environments.get(item.endpoint_id, "main") == environment_name
+                and item.metadata.creation_info.created_at < created_before
+            ),
+            key=lambda item: item.metadata.creation_info.created_at,
+            reverse=True,
+        )
+        await stream.send_message(
+            api_pb2.EndpointListResponse(items=items[:max_objects], environment_name=environment_name)
+        )
+
+    async def EndpointGetByName(self, stream):
+        request: api_pb2.EndpointGetByNameRequest = await stream.recv_message()
+        self.endpoint_get_by_name_requests.append(request)
+        environment_name = self.get_environment(request.environment_name)
+        endpoint_id = self.endpoint_ids_by_name[environment_name].get(request.name, "")
+        lifecycle = self.endpoint_lifecycles.get(endpoint_id)
+        if lifecycle is not None and lifecycle.status == api_pb2.ENDPOINT_LIFECYCLE_STATUS_STOPPED:
+            endpoint_id = ""
+        await stream.send_message(
+            api_pb2.EndpointGetByNameResponse(
+                endpoint_id=endpoint_id,
+                environment_name=environment_name,
+            )
+        )
+
+    async def EndpointGetLifecycle(self, stream):
+        request: api_pb2.EndpointGetLifecycleRequest = await stream.recv_message()
+        self.endpoint_get_lifecycle_requests.append(request)
+        lifecycle = self.endpoint_lifecycles.get(request.endpoint_id)
+        if lifecycle is None:
+            raise GRPCError(Status.NOT_FOUND, f"Endpoint '{request.endpoint_id}' not found")
+        await stream.send_message(api_pb2.EndpointGetLifecycleResponse(lifecycle=lifecycle))
+
+    async def EndpointStop(self, stream):
+        request: api_pb2.EndpointStopRequest = await stream.recv_message()
+        self.endpoint_stop_requests.append(request)
+        lifecycle = self.endpoint_lifecycles.get(request.endpoint_id)
+        if lifecycle is None:
+            raise GRPCError(Status.NOT_FOUND, f"Endpoint '{request.endpoint_id}' not found")
+        if lifecycle.status != api_pb2.ENDPOINT_LIFECYCLE_STATUS_STOPPED:
+            lifecycle.status = api_pb2.ENDPOINT_LIFECYCLE_STATUS_STOPPED
+            lifecycle.stopped_at = datetime.datetime.now().timestamp()
+            lifecycle.stopped_by = "test-user"
+        await stream.send_message(api_pb2.EndpointStopResponse())
+
+    ### Environment
+
+    async def EnvironmentBillingSummary(self, stream):
+        request = await stream.recv_message()
+        assert isinstance(request, api_pb2.EnvironmentBillingSummaryRequest)
+
+        resp = api_pb2.EnvironmentBillingSummaryResponse(
+            start_timestamp=request.start_timestamp,
+            metered_cost="5.0",
+            metered_cost_breakdown={
+                "Deployed Apps": "1.0",
+                "Ephemeral Apps": "1.0",
+                "Notebooks": "1.0",
+                "Volumes": "1.0",
+                "LLM Tokens": "1.0",
+            },
+        )
+
+        resp.end_timestamp.FromDatetime(add_months(request.start_timestamp.ToDatetime(), 1))
+
+        await stream.send_message(resp)
+
+    async def EnvironmentCreate(self, stream):
+        request: api_pb2.EnvironmentCreateRequest = await stream.recv_message()
+        if request.default_member_role_str and not request.is_managed:
+            raise GRPCError(
+                Status.INVALID_ARGUMENT,
+                "Default member role can only be set for a Restricted environment.",
+            )
+        name = request.name
+        if name not in self.environments:
+            env_id = f"en-{len(self.environments) + 1}"
+            self.environments[name] = env_id
+            self.environment_type[env_id] = request.environment_type
+            if request.is_managed:
+                self.environment_managed[env_id] = True
+
+        await stream.send_message(Empty())
+
+    async def EnvironmentDelete(self, stream):
+        request: api_pb2.EnvironmentDeleteRequest = await stream.recv_message()
+        self.environments.pop(request.name, None)
+        await stream.send_message(Empty())
+
+    async def EnvironmentList(self, stream):
+        await stream.recv_message()
+        items = [
+            api_pb2.EnvironmentListItem(
+                name=name,
+                environment_id=env_id,
+                webhook_suffix=f"{name}-suffix",
+                default=name == "main",
+                is_managed=self.environment_managed.get(env_id, False),
+                environment_type=self.environment_type.get(env_id, api_pb2.ENVIRONMENT_TYPE_UNSPECIFIED),
+                image_builder_version=self.environment_image_builder_version.get(env_id),
+            )
+            for name, env_id in self.environments.items()
+        ]
+        await stream.send_message(api_pb2.EnvironmentListResponse(items=items))
+
+    async def EnvironmentSetManaged(self, stream):
+        request: api_pb2.EnvironmentSetManagedRequest = await stream.recv_message()
+        self.environment_managed[request.environment_id] = request.managed
+        await stream.send_message(Empty())
+
+    async def EnvironmentGetManaged(self, stream):
+        request: api_pb2.EnvironmentGetManagedRequest = await stream.recv_message()
+        env_id = request.environment_id
+        members = self.environment_members.get(env_id, {})
+        Principal = api_pb2.EnvironmentGetManagedResponse.PrincipalEnvRole
+        principal_roles = []
+        for principal_id, role in members.items():
+            if principal_id in self.workspace_users:
+                principal_roles.append(
+                    Principal(user_id=principal_id, user_name=self.workspace_users[principal_id], role=role)
+                )
+            elif principal_id in self.workspace_service_users:
+                principal_roles.append(
+                    Principal(
+                        service_user_id=principal_id,
+                        service_user_name=self.workspace_service_users[principal_id].name,
+                        role=role,
+                    )
+                )
+        additional_roles = []
+        for user_id, user_name in self.workspace_users.items():
+            if user_id not in members:
+                additional_roles.append(Principal(user_id=user_id, user_name=user_name))
+        for sv_id, sv in self.workspace_service_users.items():
+            if sv_id not in members:
+                additional_roles.append(Principal(service_user_id=sv_id, service_user_name=sv.name))
+        await stream.send_message(
+            api_pb2.EnvironmentGetManagedResponse(
+                environment_id=env_id,
+                principal_roles=principal_roles,
+                additional_roles=additional_roles,
+            )
+        )
+
+    async def EnvironmentGetRoles(self, stream):
+        request: api_pb2.EnvironmentGetRolesRequest = await stream.recv_message()
+        env_id = request.environment_id
+        members = self.environment_members.get(env_id, {})
+        Principal = api_pb2.EnvironmentGetRolesResponse.Principal
+
+        def role_str(role):
+            return {
+                api_pb2.ENVIRONMENT_ROLE_NO_ACCESS: "no-access",
+                api_pb2.ENVIRONMENT_ROLE_VIEWER: "viewer",
+                api_pb2.ENVIRONMENT_ROLE_CONTRIBUTOR: "contributor",
+            }.get(role, "unspecified")
+
+        default_role = (
+            api_pb2.ENVIRONMENT_ROLE_VIEWER
+            if self.environment_managed.get(env_id)
+            else api_pb2.ENVIRONMENT_ROLE_CONTRIBUTOR
+        )
+        principal_roles = []
+        for user_id, user_name in self.workspace_users.items():
+            role = members.get(user_id, default_role)
+            principal_roles.append(Principal(user_id=user_id, user_name=user_name, role=role, role_str=role_str(role)))
+        for sv_id, sv in self.workspace_service_users.items():
+            if sv is None:
+                continue
+
+            role = members.get(sv_id, default_role)
+            principal_roles.append(
+                Principal(service_user_id=sv_id, service_user_name=sv.name, role=role, role_str=role_str(role))
+            )
+        await stream.send_message(api_pb2.EnvironmentGetRolesResponse(name="", principal_roles=principal_roles))
+
+    async def EnvironmentRoleSet(self, stream):
+        request: api_pb2.EnvironmentRoleSetRequest = await stream.recv_message()
+
+        for name, id in self.environments.items():
+            if name == request.environment_name or id == request.environment_id:
+                env_id = id
+                env_name = name
+                break
+
+        assert env_id
+        assert env_name
+
+        members = self.environment_members.setdefault(env_id, {})
+        principal_id: str | None = None
+
+        service_user: api_pb2.ServiceUser | None = None
+        if request.user_id:
+            principal_id = request.user_id
+        elif request.service_user_id:
+            principal_id = request.service_user_id
+        elif request.service_user_name:
+            for sv_id, sv in self.workspace_service_users.items():
+                if sv is None:
+                    continue
+
+                if sv.name != request.service_user_name:
+                    continue
+
+                service_user = sv
+                principal_id = sv_id
+                break
+
+        if not principal_id:
+            raise GRPCError(Status.INVALID_ARGUMENT, "Principal not found")
+
+        role = request.role
+        if request.role_str:
+            role = {
+                "no-access": api_pb2.ENVIRONMENT_ROLE_NO_ACCESS,
+                "viewer": api_pb2.ENVIRONMENT_ROLE_VIEWER,
+                "contributor": api_pb2.ENVIRONMENT_ROLE_CONTRIBUTOR,
+            }.get(request.role_str)
+
+            if role is None:
+                raise GRPCError(Status.INVALID_ARGUMENT, f"Unknown role: {request.role_str!r}")
+
+        if role == api_pb2.ENVIRONMENT_ROLE_UNSPECIFIED:
+            members.pop(principal_id, None)
+        else:
+            members[principal_id] = role
+
+        if service_user is not None:
+            existing_role: api_pb2.ServiceUser.EnvironmentRoleEntry | None = None
+            for environment_role in service_user.environment_roles:
+                if environment_role.environment_id != env_id:
+                    continue
+
+                existing_role = environment_role
+                break
+
+            if existing_role:
+                service_user.environment_roles.remove(existing_role)
+
+            if role != api_pb2.ENVIRONMENT_ROLE_UNSPECIFIED:
+                service_user.environment_roles.append(
+                    api_pb2.ServiceUser.EnvironmentRoleEntry(
+                        environment_id=env_id,
+                        role=role,
+                        environment_name=env_name,
+                        role_str=request.role_str,
+                    )
+                )
+
+        await stream.send_message(Empty())
+
+    async def EnvironmentUpdate(self, stream):
+        request: api_pb2.EnvironmentUpdateRequest = await stream.recv_message()
+        env_id = self.environments.get(request.current_name)
+        if env_id and request.HasField("image_builder_version"):
+            if request.image_builder_version:
+                self.environment_image_builder_version[env_id] = request.image_builder_version
+            else:
+                self.environment_image_builder_version.pop(env_id, None)
+        await stream.send_message(api_pb2.EnvironmentListItem())
+
+    async def EnvironmentGetOrCreate(self, stream):
+        request: api_pb2.EnvironmentGetOrCreateRequest = await stream.recv_message()
+        name = request.deployment_name
+        if not name:
+            # Simulate server behavior: resolve empty name to the default environment
+            name = next(iter(self.environments))
+        if name in self.environments:
+            environment_id = self.environments[name]
+        elif name == "does-not-exist":
+            raise GRPCError(Status.INVALID_ARGUMENT, "Environment 'does-not-exist' not found")
+        else:
+            environment_id = f"en-{len(self.environments) + 1}"
+            self.environments[name] = environment_id
+        # Default to the newest builder version that supports the local Python
+        local_series = "{}.{}".format(*sys.version_info)
+        builder_versions = get_args(ImageBuilderVersion)
+        image_builder_version = max(
+            (v for v in builder_versions if local_series in SUPPORTED_PYTHON_SERIES.get(v, [])),
+            default=max(builder_versions),
+        )
+        settings = api_pb2.EnvironmentSettings(image_builder_version=image_builder_version)
+        metadata = api_pb2.EnvironmentMetadata(name=name, settings=settings)
+        await stream.send_message(
+            api_pb2.EnvironmentGetOrCreateResponse(environment_id=environment_id, metadata=metadata)
+        )
+
+    ### Function
+
+    async def FunctionBindParams(self, stream):
+        request: api_pb2.FunctionBindParamsRequest = await stream.recv_message()
+        assert request.function_id
+        base_function = self.app_functions[request.function_id]
+        if base_function.is_class:
+            # Backwards compatibility: Cls() always sends serialized empty args/kwargs
+            # even when it is not parameterized. True Function variants will not have this debt.
+            assert request.serialized_params
+        bind_params_key = request.SerializeToString(deterministic=True)
+        existing_func_id = self.bound_functions.get(bind_params_key, None)
+        if existing_func_id:
+            function_id = existing_func_id
+        else:
+            self.n_functions += 1
+            function_id = f"fu-{self.n_functions}"
+
+            bound_func = api_pb2.Function()
+            bound_func.CopyFrom(base_function)
+            if request.function_options.HasField("routing_region"):
+                bound_func.routing_region = request.function_options.routing_region
+            self.app_functions[function_id] = bound_func
+            self.app_functions.definition_ids[function_id] = self.app_functions.definition_ids[request.function_id]
+            self.function_id_to_app_id[function_id] = self.function_id_to_app_id.get(request.function_id, "")
+            self.bound_functions[bind_params_key] = function_id
+            self.function_params[function_id] = deserialize_params(request.serialized_params, bound_func, None)
+            self.function_serialized_params[function_id] = request.serialized_params
+            self.function_options[function_id] = request.function_options
+            self.function_variants.setdefault(request.function_id, []).append(function_id)
+
+        handle_metadata = self.get_function_metadata(function_id)
+        await stream.send_message(
+            api_pb2.FunctionBindParamsResponse(
+                bound_function_id=function_id,
+                handle_metadata=handle_metadata,
+            )
+        )
+
+    async def FunctionListVariants(self, stream):
+        request: api_pb2.FunctionListVariantsRequest = await stream.recv_message()
+        variant_ids = self.function_variants.get(request.function_id, [])
+        # Variants are registered oldest first, so their position stands in for created_at.
+        created_at = {variant_id: position for position, variant_id in enumerate(variant_ids)}
+        ordered_by_task_count = 0 < request.limit <= MAX_SORTED_FUNCTION_VARIANTS_LIMIT
+        if ordered_by_task_count:
+            # Small enough limits are answered in one ranked page, busiest first, so they never
+            # hand back a cursor.
+            counts = self.function_variant_task_counts
+            page = sorted(variant_ids, key=lambda fid: (-counts.get(fid, 0), fid))[: request.limit]
+            has_more = False
+        else:
+            # Keyed the way the server keys it, so a cursor the server would reject can't pass here.
+            remaining = sorted(variant_ids, key=lambda fid: (created_at[fid], fid), reverse=True)
+            if request.HasField("cursor"):
+                bound = (request.cursor.created_before, request.cursor.function_id)
+                remaining = [fid for fid in remaining if (created_at[fid], fid) < bound]
+            page_size = self.function_variants_page_size or len(remaining)
+            page, has_more = remaining[:page_size], len(remaining) > page_size
+        infos = [
+            api_pb2.FunctionVariantInfo(
+                function_id=variant_id,
+                serialized_params=self.function_serialized_params.get(variant_id, b""),
+                function_options=self.function_options.get(variant_id) or api_pb2.FunctionOptions(),
+            )
+            for variant_id in page
+        ]
+        response = api_pb2.FunctionListVariantsResponse(infos=infos, ordered_by_task_count=ordered_by_task_count)
+        if has_more:
+            response.next_cursor.CopyFrom(
+                api_pb2.FunctionVariantCursor(created_before=created_at[page[-1]], function_id=page[-1])
+            )
+        await stream.send_message(response)
+
+    @contextlib.contextmanager
+    def input_lockstep(self) -> Iterator[threading.Barrier]:
+        self.get_inputs_barrier = threading.Barrier(2, timeout=10)
+        yield self.get_inputs_barrier
+        self.get_inputs_barrier = threading.Barrier(1)
+
+    @contextlib.contextmanager
+    def output_lockstep(self) -> Iterator[threading.Barrier]:
+        self.put_outputs_barrier = threading.Barrier(2, timeout=10)
+        yield self.put_outputs_barrier
+        self.put_outputs_barrier = threading.Barrier(1)
+
+    async def FunctionGetDynamicConcurrency(self, stream):
+        await stream.send_message(api_pb2.FunctionGetDynamicConcurrencyResponse(concurrency=5))
+
+    async def FunctionGetFlashAuthToken(self, stream):
+        await stream.recv_message()
+        await stream.send_message(api_pb2.FunctionGetFlashAuthTokenResponse(token="flash-jwt"))
+
+    async def FunctionGetInputs(self, stream):
+        await asyncio.get_running_loop().run_in_executor(None, self.get_inputs_barrier.wait)
+        request: api_pb2.FunctionGetInputsRequest = await stream.recv_message()
+        assert request.function_id
+        if self.fail_get_inputs:
+            raise GRPCError(Status.INTERNAL)
+        elif self.rate_limit_sleep_duration is not None:
+            s = self.rate_limit_sleep_duration
+            self.rate_limit_sleep_duration = None
+            await stream.send_message(api_pb2.FunctionGetInputsResponse(rate_limit_sleep_duration=s))
+        elif not self.container_inputs:
+            await asyncio.sleep(10.0)
+            await stream.send_message(api_pb2.FunctionGetInputsResponse(inputs=[]))
+        else:
+            await stream.send_message(self.container_inputs.pop(0))
+
+    async def FunctionPutOutputs(self, stream):
+        await asyncio.get_running_loop().run_in_executor(None, self.put_outputs_barrier.wait)
+        request: api_pb2.FunctionPutOutputsRequest = await stream.recv_message()
+        self.container_outputs.append(request)
+        await stream.send_message(Empty())
+
+    async def FunctionPrecreate(self, stream):
+        req: api_pb2.FunctionPrecreateRequest = await stream.recv_message()
+        if not req.existing_function_id:
+            self.n_functions += 1
+            function_id = f"fu-{self.n_functions}"
+        else:
+            function_id = req.existing_function_id
+
+        self.precreated_functions.add(function_id)
+        self.function_id_to_app_id[function_id] = req.app_id
+
+        web_url = "http://xyz.internal" if req.HasField("webhook_config") and req.webhook_config.type else None
+
+        # This loop is for class service functions, where req.method_definitions will be non-empty
+        method_handle_metadata: dict[str, api_pb2.FunctionHandleMetadata] = {}
+        for method_name, method_definition in req.method_definitions.items():
+            method_web_url = (
+                f"http://{method_name}.internal"
+                if method_definition.HasField("webhook_config") and method_definition.webhook_config.type
+                else None
+            )
+            method_handle_metadata[method_name] = api_pb2.FunctionHandleMetadata(
+                function_name=method_definition.function_name,
+                function_type=method_definition.function_type,
+                web_url=method_web_url,
+                function_schema=method_definition.function_schema,
+                supported_input_formats=method_definition.supported_input_formats,
+                supported_output_formats=method_definition.supported_output_formats,
+                app_id=req.app_id,
+            )
+        await stream.send_message(
+            api_pb2.FunctionPrecreateResponse(
+                function_id=function_id,
+                handle_metadata=api_pb2.FunctionHandleMetadata(
+                    function_name=req.function_name,
+                    function_type=req.function_type,
+                    web_url=web_url,
+                    method_handle_metadata=method_handle_metadata,
+                    function_schema=req.function_schema,
+                    app_id=req.app_id,
+                ),
+            )
+        )
+
+    async def FunctionCreate(self, stream):
+        request: api_pb2.FunctionCreateRequest = await stream.recv_message()
+        if self.function_create_error:
+            raise self.function_create_error
+        if request.function.resources.gpu_config.count > 0:
+            if request.function.resources.gpu_config.gpu_type not in VALID_GPU_TYPES:
+                raise GRPCError(Status.INVALID_ARGUMENT, "Not a valid GPU type")
+        if request.function.cloud_provider_str:
+            if request.function.cloud_provider_str.upper() not in VALID_CLOUD_PROVIDERS:
+                raise GRPCError(Status.INVALID_ARGUMENT, "Not a valid cloud provider")
+
+        if request.existing_function_id:
+            function_id = request.existing_function_id
+        else:
+            self.n_functions += 1
+            function_id = f"fu-{self.n_functions}"
+        function: api_pb2.Function | None = None
+        function_data: api_pb2.FunctionData | None = None
+        if len(request.function_data.ranked_functions) > 0:
+            function_data = api_pb2.FunctionData()
+            function_data.CopyFrom(request.function_data)
+        else:
+            assert request.function
+            function = api_pb2.Function()
+            function.CopyFrom(request.function)
+
+        assert (function is None) != (function_data is None)
+        function_defn: api_pb2.Function | api_pb2.FunctionData = function or function_data
+        assert function_defn
+        if function_defn.webhook_config.type:
+            function_defn.web_url = "http://xyz.internal"
+        for method_name, method_definition in function_defn.method_definitions.items():
+            if method_definition.webhook_config.type:
+                method_definition.web_url = f"http://{method_name}.internal"
+        self.app_functions[function_id] = function_defn
+        self.function_id_to_app_id[function_id] = request.app_id
+
+        if function_defn.schedule:
+            self.function2schedule[function_id] = function_defn.schedule
+
+        warnings = []
+        if int(function_defn.experimental_options.get("warn_me", "0")):
+            warnings.append(api_pb2.Warning(message="You have been warned!"))
+
+        if function_data is None:
+            assert function is not None
+            function_data = api_pb2.FunctionData(
+                function_name=function.function_name,
+                module_name=function.module_name,
+                function_type=function.function_type,
+                warm_pool_size=function.warm_pool_size,
+                concurrency_limit=function.concurrency_limit,
+                task_idle_timeout_secs=function.task_idle_timeout_secs,
+                _experimental_group_size=function._experimental_group_size,
+                _experimental_fabric_size=function._experimental_fabric_size,
+                _experimental_buffer_containers=function._experimental_buffer_containers,
+                _experimental_custom_scaling=function._experimental_custom_scaling,
+                _experimental_enable_gpu_snapshot=function._experimental_enable_gpu_snapshot,
+                worker_id=function.worker_id,
+                timeout_secs=function.timeout_secs,
+                web_url=function.web_url,
+                web_url_info=function.web_url_info,
+                webhook_config=function.webhook_config,
+                custom_domain_info=function.custom_domain_info,
+                method_definitions=function.method_definitions,
+                method_definitions_set=function.method_definitions_set,
+                is_class=function.is_class,
+                class_parameter_info=function.class_parameter_info,
+                is_method=function.is_method,
+                ranked_functions=[api_pb2.FunctionData.RankedFunction(rank=1, function=function)],
+                schedule=function.schedule,
+                untrusted=function.untrusted,
+                snapshot_debug=function.snapshot_debug,
+                runtime_perf_record=function.runtime_perf_record,
+                autoscaler_settings=function.autoscaler_settings,
+                function_schema=function.function_schema,
+                experimental_options=function.experimental_options,
+                flash_service_urls=function.flash_service_urls,
+                flash_service_label=function.flash_service_label,
+                startup_timeout_secs=function.startup_timeout_secs,
+                supported_input_formats=function.supported_input_formats,
+                supported_output_formats=function.supported_output_formats,
+                http_config=function.http_config,
+                localized_config=function.localized_config if function.HasField("localized_config") else None,
+                implementation_name=function.implementation_name,
+                is_server=function.is_server,
+                routing_region=function.routing_region,
+                is_sessioned=function.is_sessioned,
+            )
+
+        await stream.send_message(
+            api_pb2.FunctionCreateResponse(
+                function_id=function_id,
+                function=function,
+                handle_metadata=self.get_function_metadata(function_id),
+                server_warnings=warnings,
+                function_data=function_data,
+            )
+        )
+
+    async def FunctionGet(self, stream):
+        request: api_pb2.FunctionGetRequest = await stream.recv_message()
+        app_key = (self.get_environment(request.environment_name), request.app_name)
+        if not (app_id := self.deployed_apps.get(app_key)):
+            raise GRPCError(Status.NOT_FOUND, f"can't find app {request.app_name}")
+
+        app_objects = self.app_objects[app_id]
+        object_id = app_objects.get(request.object_tag)
+        if object_id is None:
+            raise GRPCError(Status.NOT_FOUND, f"can't find object {request.object_tag}")
+        function_metadata = self.get_function_metadata(object_id)
+        function_proto: api_pb2.FunctionData | api_pb2.Function = self.app_functions[object_id]
+
+        if isinstance(function_proto, api_pb2.FunctionData):
+            function_data = function_proto
+        else:
+            function_data = api_pb2.FunctionData(
+                function_name=function_proto.function_name,
+                module_name=function_proto.module_name,
+                function_type=function_proto.function_type,
+                warm_pool_size=function_proto.warm_pool_size,
+                concurrency_limit=function_proto.concurrency_limit,
+                task_idle_timeout_secs=function_proto.task_idle_timeout_secs,
+                _experimental_group_size=function_proto._experimental_group_size,
+                _experimental_fabric_size=function_proto._experimental_fabric_size,
+                _experimental_buffer_containers=function_proto._experimental_buffer_containers,
+                _experimental_custom_scaling=function_proto._experimental_custom_scaling,
+                _experimental_enable_gpu_snapshot=function_proto._experimental_enable_gpu_snapshot,
+                worker_id=function_proto.worker_id,
+                timeout_secs=function_proto.timeout_secs,
+                web_url=function_proto.web_url,
+                web_url_info=function_proto.web_url_info,
+                webhook_config=function_proto.webhook_config,
+                custom_domain_info=function_proto.custom_domain_info,
+                method_definitions=function_proto.method_definitions,
+                method_definitions_set=function_proto.method_definitions_set,
+                is_class=function_proto.is_class,
+                class_parameter_info=function_proto.class_parameter_info,
+                is_method=function_proto.is_method,
+                ranked_functions=[api_pb2.FunctionData.RankedFunction(rank=1, function=function_proto)],
+                schedule=function_proto.schedule,
+                untrusted=function_proto.untrusted,
+                snapshot_debug=function_proto.snapshot_debug,
+                runtime_perf_record=function_proto.runtime_perf_record,
+                autoscaler_settings=function_proto.autoscaler_settings,
+                function_schema=function_proto.function_schema,
+                experimental_options=function_proto.experimental_options,
+                flash_service_urls=function_proto.flash_service_urls,
+                flash_service_label=function_proto.flash_service_label,
+                startup_timeout_secs=function_proto.startup_timeout_secs,
+                supported_input_formats=function_proto.supported_input_formats,
+                supported_output_formats=function_proto.supported_output_formats,
+                http_config=function_proto.http_config,
+                localized_config=(
+                    function_proto.localized_config if function_proto.HasField("localized_config") else None
+                ),
+                implementation_name=function_proto.implementation_name,
+                is_server=function_proto.is_server,
+                routing_region=function_proto.routing_region,
+                is_sessioned=function_proto.is_sessioned,
+            )
+
+        await stream.send_message(
+            api_pb2.FunctionGetResponse(
+                function_id=object_id,
+                handle_metadata=function_metadata,
+                server_warnings=self.function_get_server_warnings,
+                function=function_data,
+            )
+        )
+
+    async def FunctionGetById(self, stream):
+        request: api_pb2.FunctionGetByIdRequest = await stream.recv_message()
+        try:
+            function: api_pb2.FunctionData | api_pb2.Function = self.app_functions[request.function_id]
+        except KeyError:
+            raise GRPCError(Status.NOT_FOUND, "Function not found")
+
+        if isinstance(function, api_pb2.Function):
+            function = api_pb2.FunctionData(
+                function_name=function.function_name,
+                module_name=function.module_name,
+                function_type=function.function_type,
+                warm_pool_size=function.warm_pool_size,
+                concurrency_limit=function.concurrency_limit,
+                task_idle_timeout_secs=function.task_idle_timeout_secs,
+                _experimental_group_size=function._experimental_group_size,
+                _experimental_fabric_size=function._experimental_fabric_size,
+                _experimental_buffer_containers=function._experimental_buffer_containers,
+                _experimental_custom_scaling=function._experimental_custom_scaling,
+                _experimental_enable_gpu_snapshot=function._experimental_enable_gpu_snapshot,
+                worker_id=function.worker_id,
+                timeout_secs=function.timeout_secs,
+                web_url=function.web_url,
+                web_url_info=function.web_url_info,
+                webhook_config=function.webhook_config,
+                custom_domain_info=function.custom_domain_info,
+                method_definitions=function.method_definitions,
+                method_definitions_set=function.method_definitions_set,
+                is_class=function.is_class,
+                class_parameter_info=function.class_parameter_info,
+                is_method=function.is_method,
+                ranked_functions=[api_pb2.FunctionData.RankedFunction(rank=1, function=function)],
+                schedule=function.schedule,
+                untrusted=function.untrusted,
+                snapshot_debug=function.snapshot_debug,
+                runtime_perf_record=function.runtime_perf_record,
+                autoscaler_settings=function.autoscaler_settings,
+                function_schema=function.function_schema,
+                experimental_options=function.experimental_options,
+                flash_service_urls=function.flash_service_urls,
+                flash_service_label=function.flash_service_label,
+                startup_timeout_secs=function.startup_timeout_secs,
+                supported_input_formats=function.supported_input_formats,
+                supported_output_formats=function.supported_output_formats,
+                http_config=function.http_config,
+                localized_config=function.localized_config if function.HasField("localized_config") else None,
+                implementation_name=function.implementation_name,
+                is_server=function.is_server,
+                routing_region=function.routing_region,
+                is_sessioned=function.is_sessioned,
+            )
+
+        await stream.send_message(
+            api_pb2.FunctionGetByIdResponse(
+                function=function, handle_metadata=self.get_function_metadata(request.function_id)
+            )
+        )
+
+    async def FunctionMap(self, stream):
+        self.fcidx += 1
+        request: api_pb2.FunctionMapRequest = await stream.recv_message()
+        function_call_id = f"fc-{self.fcidx}"
+        self.function_id_for_function_call[function_call_id] = request.function_id
+        fn_definition = self.app_functions.get(request.function_id)
+        retry_policy = None
+        if fn_definition and hasattr(fn_definition, "retry_policy"):
+            retry_policy = fn_definition.retry_policy
+        function_call_jwt = encode_function_call_jwt(request.function_id, function_call_id)
+
+        response_inputs = []
+        for input_item in request.pipelined_inputs:
+            input_id = f"in-{self.n_inputs}"
+            self.n_inputs += 1
+            self.add_function_call_input(function_call_id, input_item, input_id, 0)
+            response_inputs.append(
+                api_pb2.FunctionPutInputsResponseItem(
+                    idx=self.fcidx,
+                    input_id=input_id,
+                    input_jwt=encode_input_jwt(self.fcidx, input_id, function_call_id, self.next_entry_id(), 0),
+                )
+            )
+
+        await stream.send_message(
+            api_pb2.FunctionMapResponse(
+                function_call_id=function_call_id,
+                retry_policy=retry_policy,
+                function_call_jwt=function_call_jwt,
+                pipelined_inputs=response_inputs,
+                sync_client_retries_enabled=self.sync_client_retries_enabled,
+                max_inputs_outstanding=1000,
+            )
+        )
+
+    async def FunctionRetryInputs(self, stream):
+        request: api_pb2.FunctionRetryInputsRequest = await stream.recv_message()
+        function_id, function_call_id = decode_function_call_jwt(request.function_call_jwt)
+        function_call_inputs = self.function_call_inputs.setdefault(function_call_id, [])
+        input_jwts = []
+        for item in request.inputs:
+            if item.input.WhichOneof("args_oneof") == "args":
+                args, kwargs = deserialize(item.input.args, None)
+            else:
+                args, kwargs = deserialize(self.blobs[item.input.args_blob_id], None)
+            self.n_inputs += 1
+            idx, input_id, function_call_id, _, _ = decode_input_jwt(item.input_jwt)
+            input_jwts.append(encode_input_jwt(idx, input_id, function_call_id, self.next_entry_id(), item.retry_count))
+            function_call_inputs.append(((idx, input_id, item.retry_count), (args, kwargs)))
+            self.function_call_inputs_update_event.set()
+        await stream.send_message(api_pb2.FunctionRetryInputsResponse(input_jwts=input_jwts))
+
+    async def FunctionPutInputs(self, stream):
+        if self.fail_put_inputs_with_grpc_error and self.fail_put_inputs_with_grpc_error.count > 0:
+            self.fail_put_inputs_with_grpc_error.count = self.fail_put_inputs_with_grpc_error.count - 1
+            raise GRPCError(self.fail_put_inputs_with_grpc_error.grpc_error)
+        if self.fail_put_inputs_with_stream_terminated_error > 0:
+            self.fail_put_inputs_with_stream_terminated_error = self.fail_put_inputs_with_stream_terminated_error - 1
+            await stream.cancel()
+        request: api_pb2.FunctionPutInputsRequest = await stream.recv_message()
+        self.function_id_for_function_call[request.function_call_id] = request.function_id
+        response_items = []
+
+        for item in request.inputs:
+            input_id = f"in-{self.n_inputs}"
+            self.n_inputs += 1
+            response_items.append(
+                api_pb2.FunctionPutInputsResponseItem(
+                    input_id=input_id,
+                    idx=item.idx,
+                    input_jwt=encode_input_jwt(item.idx, input_id, request.function_call_id, self.next_entry_id(), 0),
+                )
+            )
+            self.add_function_call_input(request.function_call_id, item, input_id, 0)
+        if self.slow_put_inputs:
+            await asyncio.sleep(0.001)
+        await stream.send_message(api_pb2.FunctionPutInputsResponse(inputs=response_items))
+
+    async def FunctionFinishInputs(self, stream):
+        request: api_pb2.FunctionFinishInputsRequest = await stream.recv_message()
+        self.function_call_num_inputs[request.function_call_id] = request.num_inputs
+        await stream.send_message(Empty())
+
+    async def FunctionCallFromId(self, stream):
+        request: api_pb2.FunctionCallFromIdRequest = await stream.recv_message()
+        function_id = self.function_id_for_function_call.get(request.function_call_id, "")
+        num_inputs = self.function_call_num_inputs.get(
+            request.function_call_id,
+            len(self.function_call_inputs.get(request.function_call_id, [])) or 1,
+        )
+        await stream.send_message(
+            api_pb2.FunctionCallFromIdResponse(
+                function_call_id=request.function_call_id,
+                num_inputs=num_inputs,
+                metadata=api_pb2.FunctionCallHandleMetadata(
+                    app_id=self.function_id_to_app_id.get(function_id, ""),
+                    function_id=function_id,
+                ),
+            )
+        )
+
+    def add_function_call_input(self, function_call_id, item: api_pb2.FunctionPutInputsItem, input_id, retry_count):
+        if item.input.WhichOneof("args_oneof") == "args":
+            args, kwargs = deserialize_data_format(item.input.args, item.input.data_format, None)
+        else:
+            args, kwargs = deserialize_data_format(self.blobs[item.input.args_blob_id], item.input.data_format, None)
+        function_call_inputs = self.function_call_inputs.setdefault(function_call_id, [])
+        function_call_inputs.append(((item.idx, input_id, retry_count), (args, kwargs)))
+        self.function_call_inputs_update_event.set()
+
+    async def FunctionGetOutputs(self, stream):
+        request: api_pb2.FunctionGetOutputsRequest = await stream.recv_message()
+        if request.clear_on_success:
+            self.cleared_function_calls.add(request.function_call_id)
+
+        fc_inputs = self.function_call_inputs.setdefault(request.function_call_id, [])
+        if fc_inputs and not self.function_is_running:
+            if not request.HasField("start_idx"):
+                # Sync outputs don't always come in order.
+                popidx = len(fc_inputs) // 2  # simulate that results don't always come in order
+                (idx, input_id, retry_count), (args, kwargs) = fc_inputs.pop(popidx)
+            else:
+                # Async outputs always fetch a specific output.
+                (idx, input_id, retry_count), (args, kwargs) = fc_inputs[request.start_idx]
+            output_exc = None
+            try:
+                res = self._function_body(*args, **kwargs)
+
+                if inspect.iscoroutine(res):
+                    result = await res
+                    result_data_format = api_pb2.DATA_FORMAT_PICKLE
+                elif inspect.isgenerator(res):
+                    count = 0
+                    for item in res:
+                        count += 1
+                        await self.fc_data_out[request.function_call_id].put(
+                            api_pb2.DataChunk(
+                                data_format=api_pb2.DATA_FORMAT_PICKLE,
+                                data=serialize_data_format(item, api_pb2.DATA_FORMAT_PICKLE),
+                                index=count,
+                            )
+                        )
+                    result = api_pb2.GeneratorDone(items_total=count)
+                    result_data_format = api_pb2.DATA_FORMAT_GENERATOR_DONE
+                else:
+                    result = res
+                    result_data_format = api_pb2.DATA_FORMAT_PICKLE
+            except Exception as exc:
+                serialized_exc = cloudpickle.dumps(exc)
+                result = api_pb2.GenericResult(
+                    status=self.failure_status,
+                    data=serialized_exc,
+                    exception=repr(exc),
+                    traceback="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                )
+                output_exc = api_pb2.FunctionGetOutputsItem(
+                    input_id=input_id,
+                    idx=idx,
+                    result=result,
+                    data_format=api_pb2.DATA_FORMAT_PICKLE,
+                    retry_count=retry_count,
+                )
+
+            if output_exc:
+                output = output_exc
+            else:
+                serialized_data = serialize_data_format(result, result_data_format)
+                if self.use_blob_outputs:
+                    blob_id = await self.next_blob_id()
+                    self.blobs[blob_id] = serialized_data
+                    data_kwargs = {
+                        "data_blob_id": blob_id,
+                    }
+                else:
+                    data_kwargs = {"data": serialized_data}
+                output = api_pb2.FunctionGetOutputsItem(
+                    input_id=input_id,
+                    idx=idx,
+                    result=api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS, **data_kwargs),
+                    data_format=result_data_format,
+                    retry_count=retry_count,
+                )
+
+            await stream.send_message(api_pb2.FunctionGetOutputsResponse(outputs=[output]))
+        else:
+            # wait for there to be at least one input, since that will allow a subsequent call to
+            # get the associated output using the above branch
+            if len(fc_inputs):
+                await stream.send_message(
+                    api_pb2.FunctionGetOutputsResponse(outputs=[], num_unfinished_inputs=len(fc_inputs))
+                )
+            else:
+                try:
+                    await asyncio.wait_for(self.function_call_inputs_update_event.wait(), timeout=request.timeout)
+                except asyncio.TimeoutError:
+                    pass
+                self.function_call_inputs_update_event.clear()
+                await stream.send_message(
+                    api_pb2.FunctionGetOutputsResponse(outputs=[], num_unfinished_inputs=len(fc_inputs))
+                )
+
+    async def FunctionGetSerialized(self, stream):
+        await stream.send_message(
+            api_pb2.FunctionGetSerializedResponse(
+                function_serialized=self.function_serialized,
+                class_serialized=self.class_serialized,
+            )
+        )
+
+    async def FunctionCallCancel(self, stream):
+        req = await stream.recv_message()
+        self.cancelled_calls.append(req.function_call_id)
+        await stream.send_message(Empty())
+
+    async def FunctionCallGetDataIn(self, stream):
+        req: api_pb2.FunctionCallGetDataRequest = await stream.recv_message()
+        while True:
+            chunk = await self.fc_data_in[req.function_call_id].get()
+            await stream.send_message(chunk)
+
+    async def FunctionCallGetDataOut(self, stream):
+        req: api_pb2.FunctionCallGetDataRequest = await stream.recv_message()
+
+        if len(self.fail_get_data_out) > 0:
+            status_code = self.fail_get_data_out.pop()
+            raise GRPCError(status_code, "foobar")
+
+        while True:
+            chunk = await self.fc_data_out[req.function_call_id].get()
+            await stream.send_message(chunk)
+
+    async def FunctionCallPutDataOut(self, stream):
+        req: api_pb2.FunctionCallPutDataRequest = await stream.recv_message()
+        for chunk in req.data_chunks:
+            await self.fc_data_out[req.function_call_id].put(chunk)
+        await stream.send_message(Empty())
+
+    async def FunctionGetSchedulingParams(self, stream):
+        req: api_pb2.FunctionGetSchedulingParamsRequest = await stream.recv_message()
+        fn_definition: api_pb2.Function = self.app_functions[req.function_id]
+
+        await stream.send_message(
+            api_pb2.FunctionGetSchedulingParamsResponse(
+                autoscaler_configuration=api_pb2.AutoscalerConfiguration(settings=fn_definition.autoscaler_settings)
+            )
+        )
+
+    async def FunctionUpdateSchedulingParams(self, stream):
+        req: api_pb2.FunctionUpdateSchedulingParamsRequest = await stream.recv_message()
+
+        # update function definition
+        fn_definition = self.app_functions[req.function_id]
+        assert isinstance(fn_definition, api_pb2.Function)
+        # Note that this doesn't mock the full server logic very well
+        fn_definition.warm_pool_size = req.warm_pool_size_override
+
+        settings = api_pb2.AutoscalerSettings()
+        settings.CopyFrom(req.settings)
+        if settings.HasField("target_concurrency") and not settings.HasField("target_concurrency_float"):
+            settings.target_concurrency_float = settings.target_concurrency
+        settings.ClearField("target_concurrency")
+        fn_definition.autoscaler_settings.MergeFrom(settings)
+        fn_definition.autoscaler_settings.ClearField("target_concurrency")
+
+        is_flash = fn_definition.is_server
+        if not is_flash:
+            merged = fn_definition.autoscaler_settings
+            flash_only_fields = []
+            if merged.HasField("target_concurrency_float"):
+                flash_only_fields.append("target_concurrency")
+            if merged.HasField("scaleup_window"):
+                flash_only_fields.append("scaleup_window")
+            if merged.HasField("scaledown_rate_limit"):
+                flash_only_fields.append("scaledown_rate_limit")
+            if flash_only_fields:
+                names = ", ".join(f"`{field}`" for field in flash_only_fields)
+                raise GRPCError(Status.INVALID_ARGUMENT, f"{names} can only be used for Servers.")
+
+        # Hacky that we're modifying the function definition directly
+        # In the server we track autoscaler updates separately
+        fn_definition.warm_pool_size = fn_definition.autoscaler_settings.min_containers
+        fn_definition.concurrency_limit = fn_definition.autoscaler_settings.max_containers
+        fn_definition._experimental_buffer_containers = fn_definition.autoscaler_settings.buffer_containers
+        fn_definition.task_idle_timeout_secs = fn_definition.autoscaler_settings.scaledown_window
+
+        current_settings = api_pb2.AutoscalerSettings()
+        current_settings.CopyFrom(fn_definition.autoscaler_settings)
+        if current_settings.HasField("target_concurrency_float"):
+            value = current_settings.target_concurrency_float
+            current_settings.target_concurrency = 0 if value == 0 else max(1, round(value))
+
+        await stream.send_message(
+            api_pb2.FunctionUpdateSchedulingParamsResponse(
+                current_settings=current_settings,
+            )
+        )
+
+    ### Image
+
+    def _image_metadata(self, image_builder_version: str | None) -> api_pb2.ImageMetadata:
+        metadata = api_pb2.ImageMetadata(image_builder_version=image_builder_version)
+        if self.image_python_version_info is not None:
+            metadata.python_version_info = self.image_python_version_info
+        return metadata
+
+    async def ImageGetOrCreate(self, stream):
+        request: api_pb2.ImageGetOrCreateRequest = await stream.recv_message()
+        for image_id, image in self.images.items():
+            if request.image.SerializeToString() == image.SerializeToString():
+                await stream.send_message(
+                    api_pb2.ImageGetOrCreateResponse(
+                        image_id=image_id,
+                        result=None
+                        if request.force_build
+                        else api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS),
+                        metadata=self._image_metadata(self.image_builder_versions[image_id]),
+                    )
+                )
+                return
+        idx = len(self.images) + 1
+        image_id = f"im-{idx}"
+
+        self.images[image_id] = request.image
+        self.image_build_function_ids[image_id] = request.build_function_id
+        self.image_builder_versions[image_id] = request.builder_version
+        if request.force_build:
+            self.force_built_images.append(image_id)
+        await stream.send_message(
+            api_pb2.ImageGetOrCreateResponse(
+                image_id=image_id,
+                metadata=self._image_metadata(request.builder_version),
+            )
+        )
+
+    async def ImageJoinStreaming(self, stream):
+        req = await stream.recv_message()
+
+        if self.image_join_sleep_duration is not None:
+            await asyncio.sleep(self.image_join_sleep_duration)
+
+        task_log_1 = api_pb2.TaskLogs(data="build starting\n", file_descriptor=api_pb2.FILE_DESCRIPTOR_INFO)
+        task_log_2 = api_pb2.TaskLogs(
+            task_progress=api_pb2.TaskProgress(
+                len=1, pos=0, progress_type=api_pb2.IMAGE_SNAPSHOT_UPLOAD, description="xyz"
+            )
+        )
+        task_log_3 = api_pb2.TaskLogs(data="build finished\n", file_descriptor=api_pb2.FILE_DESCRIPTOR_INFO)
+        await stream.send_message(api_pb2.ImageJoinStreamingResponse(task_logs=[task_log_1, task_log_2, task_log_3]))
+        await stream.send_message(
+            api_pb2.ImageJoinStreamingResponse(
+                result=api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS),
+                metadata=self._image_metadata(self.image_builder_versions.get(req.image_id)),
+            )
+        )
+
+    async def ImageDelete(self, stream):
+        request: api_pb2.ImageDeleteRequest = await stream.recv_message()
+        if request.image_id not in self.images:
+            raise GRPCError(Status.NOT_FOUND, f"Image {request.image_id} not found")
+
+        self.images.pop(request.image_id)
+        self.image_build_function_ids.pop(request.image_id, None)
+        self.image_builder_versions.pop(request.image_id, None)
+        if request.image_id in self.force_built_images:
+            self.force_built_images.remove(request.image_id)
+
+        await stream.send_message(Empty())
+
+    async def ImageGetByTag(self, stream):
+        request: api_pb2.ImageGetByTagRequest = await stream.recv_message()
+        if not request.tag:
+            raise GRPCError(Status.INVALID_ARGUMENT, "Image tag cannot be empty")
+        image_id = self.image_tags.get(request.tag)
+        if image_id is None:
+            raise GRPCError(Status.NOT_FOUND, f"Image {request.tag!r} not found")
+        await stream.send_message(api_pb2.ImageGetByTagResponse(image_id=image_id))
+
+    async def ImageFromId(self, stream):
+        request: api_pb2.ImageFromIdRequest = await stream.recv_message()
+        if request.image_id not in self.images:
+            raise GRPCError(Status.NOT_FOUND, f"Image {request.image_id} not found")
+        await stream.send_message(
+            api_pb2.ImageFromIdResponse(
+                image_id=request.image_id,
+                metadata=self._image_metadata(self.image_builder_versions.get(request.image_id)),
+            )
+        )
+
+    async def ImageListTags(self, stream):
+        request: api_pb2.ImageListTagsRequest = await stream.recv_message()
+        self.image_list_tags_requests.append(
+            api_pb2.ImageListTagsRequest(
+                environment_name=request.environment_name,
+                tag_prefix=request.tag_prefix,
+                max_objects=request.max_objects,
+                page_token=request.page_token,
+            )
+        )
+        max_objects = request.max_objects or 100
+        start = int(request.page_token or "0")
+        matching_keys = sorted(key for key in self.image_tags if key.startswith(request.tag_prefix))
+        page_keys = matching_keys[start : start + max_objects]
+        next_offset = start + len(page_keys)
+        next_page_token = str(next_offset) if next_offset < len(matching_keys) else ""
+
+        items = []
+        for key in page_keys:
+            revision_id, created_at, updated_at = self.image_tag_metadata[key]
+            items.append(
+                api_pb2.ImageListTagsItem(
+                    tag=key,
+                    image_id=self.image_tags[key],
+                    revision_id=revision_id,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            )
+
+        await stream.send_message(
+            api_pb2.ImageListTagsResponse(items=items, next_page_token=next_page_token, environment_name="main")
+        )
+
+    async def ImagePublish(self, stream):
+        request: api_pb2.ImagePublishRequest = await stream.recv_message()
+        if request.image_id not in self.images:
+            raise GRPCError(Status.NOT_FOUND, f"Image {request.image_id} not found")
+        if not request.tag:
+            raise GRPCError(Status.INVALID_ARGUMENT, "Image tag cannot be empty")
+        key = request.tag
+        current_image_id = self.image_tags.get(key)
+        if current_image_id == request.image_id:
+            revision_id, _, _ = self.image_tag_metadata[key]
+        else:
+            self.image_tag_revision_count += 1
+            revision_id = f"ir-01KBN09R2V7DSJ1TWS6M5{self.image_tag_revision_count:05d}"
+            now = time.time()
+            created_at = self.image_tag_metadata[key][1] if key in self.image_tag_metadata else now
+            self.image_tags[key] = request.image_id
+            self.image_tag_revision_ids[key] = revision_id
+            self.image_tag_metadata[key] = (revision_id, created_at, now)
+            self.image_tag_revisions.setdefault(key, []).append((revision_id, request.image_id, now))
+        await stream.send_message(
+            api_pb2.ImagePublishResponse(
+                image_id=request.image_id,
+                revision_id=revision_id,
+            )
+        )
+
+    async def ImageTagRevisions(self, stream):
+        request: api_pb2.ImageTagRevisionsRequest = await stream.recv_message()
+        if not request.tag:
+            raise GRPCError(Status.INVALID_ARGUMENT, "Image tag cannot be empty")
+        max_objects = request.max_objects or 100
+        start = int(request.page_token or "0")
+        history = list(reversed(self.image_tag_revisions.get(request.tag, [])))
+        page_items = history[start : start + max_objects]
+        next_offset = start + len(page_items)
+        next_page_token = str(next_offset) if next_offset < len(history) else ""
+        await stream.send_message(
+            api_pb2.ImageTagRevisionsResponse(
+                items=[
+                    api_pb2.ImageTagRevisionsItem(image_id=image_id, revision_id=revision_id, created_at=created_at)
+                    for revision_id, image_id, created_at in page_items
+                ],
+                next_page_token=next_page_token,
+                tag=request.tag,
+                environment_name="main",
+            )
+        )
+
+    ### Mount
+
+    async def MountBatchedCheckExistence(self, stream):
+        request: api_pb2.MountBatchedCheckExistenceRequest = await stream.recv_message()
+
+        # fixme(ayush): turbo hack to make existing mount tests (which only run for a small batch
+        # size) pass
+        if len(request.sha256_hex_hashes) < 10:
+            await stream.send_message(
+                api_pb2.MountBatchedCheckExistenceResponse(
+                    missing_sha256_hex_hashes=request.sha256_hex_hashes,
+                    checked_at=_timestamp_now(),
+                )
+            )
+            return
+
+        missing_hashes = []
+        for i, sha in enumerate(request.sha256_hex_hashes):
+            if i % 2 == 0:
+                continue
+
+            missing_hashes.append(sha)
+
+        await stream.send_message(
+            api_pb2.MountBatchedCheckExistenceResponse(
+                missing_sha256_hex_hashes=missing_hashes,
+                checked_at=_timestamp_now(),
+            )
+        )
+
+    async def MountPutFile(self, stream):
+        request: api_pb2.MountPutFileRequest = await stream.recv_message()
+        if request.WhichOneof("data_oneof") is not None:
+            self.files_sha2data[request.sha256_hex] = {"data": request.data, "data_blob_id": request.data_blob_id}
+            self.n_mount_files += 1
+            await stream.send_message(api_pb2.MountPutFileResponse(exists=True, checked_at=_timestamp_now()))
+        else:
+            await stream.send_message(api_pb2.MountPutFileResponse(exists=False, checked_at=_timestamp_now()))
+
+    async def MountGetOrCreate(self, stream):
+        request: api_pb2.MountGetOrCreateRequest = await stream.recv_message()
+        k = (request.deployment_name, request.namespace)
+        if request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_UNSPECIFIED:
+            if k not in self.deployed_mounts:
+                raise GRPCError(Status.NOT_FOUND, f"Mount {k} not found")
+            mount_id = self.deployed_mounts[k]
+            await stream.send_message(
+                api_pb2.MountGetOrCreateResponse(
+                    mount_id=mount_id,
+                    handle_metadata=api_pb2.MountHandleMetadata(content_checksum_sha256_hex="deadbeef"),
+                )
+            )
+            return
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_CREATE_FAIL_IF_EXISTS:
+            self.n_mounts += 1
+            mount_id = f"mo-{self.n_mounts}"
+            self.deployed_mounts[k] = mount_id
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_ANONYMOUS_OWNED_BY_APP:
+            self.n_mounts += 1
+            mount_id = f"mo-{self.n_mounts}"
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_EPHEMERAL:
+            self.n_mounts += 1
+            mount_id = f"mo-{self.n_mounts}"
+
+        else:
+            raise Exception("unsupported creation type")
+
+        mount_content = self.mount_contents[mount_id] = {}
+        for file in request.files:
+            mount_content[file.filename] = self.files_name2sha[file.filename] = file.sha256_hex
+
+        await stream.send_message(
+            api_pb2.MountGetOrCreateResponse(
+                mount_id=mount_id, handle_metadata=api_pb2.MountHandleMetadata(content_checksum_sha256_hex="deadbeef")
+            )
+        )
+
+    ### Proxy
+
+    async def ProxyGet(self, stream):
+        await stream.recv_message()
+        await stream.send_message(api_pb2.ProxyGetResponse(proxy=api_pb2.Proxy(proxy_id="pr-123")))
+
+    ### Queue
+
+    async def QueueClear(self, stream):
+        request: api_pb2.QueueClearRequest = await stream.recv_message()
+        if request.all_partitions:
+            self.queue = {b"": []}
+        else:
+            if request.partition_key in self.queue:
+                self.queue[request.partition_key] = []
+        await stream.send_message(Empty())
+
+    async def QueueGetOrCreate(self, stream):
+        request: api_pb2.QueueGetOrCreateRequest = await stream.recv_message()
+        k = (request.deployment_name, self.get_environment(request.environment_name))
+        if k in self.deployed_queues:
+            if request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_CREATE_FAIL_IF_EXISTS:
+                raise GRPCError(Status.ALREADY_EXISTS, f"Queue {k[0]!r} already exists")
+            queue_id = self.deployed_queues[k]
+        elif request.object_creation_type in (
+            api_pb2.OBJECT_CREATION_TYPE_CREATE_IF_MISSING,
+            api_pb2.OBJECT_CREATION_TYPE_CREATE_FAIL_IF_EXISTS,
+        ):
+            self.n_queues += 1
+            queue_id = f"qu-{self.n_queues}"
+            self.deployed_queues[k] = queue_id
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_EPHEMERAL:
+            self.n_queues += 1
+            queue_id = f"qu-{self.n_queues}"
+        else:
+            raise GRPCError(Status.NOT_FOUND, f"Queue {k} not found")
+
+        self.resource_creation_timestamps[queue_id] = timestamp = datetime.datetime.now().timestamp()
+        creation_info = api_pb2.CreationInfo(created_at=timestamp, created_by=self.default_username)
+        metadata = api_pb2.QueueMetadata(name=request.deployment_name, creation_info=creation_info)
+        await stream.send_message(api_pb2.QueueGetOrCreateResponse(queue_id=queue_id, metadata=metadata))
+
+    async def QueueGetById(self, stream):
+        request: api_pb2.QueueGetByIdRequest = await stream.recv_message()
+        # Look up the queue by ID
+        queue_name = None
+        for (name, _env), qid in self.deployed_queues.items():
+            if qid == request.queue_id:
+                queue_name = name
+                break
+
+        if request.queue_id not in self.resource_creation_timestamps:
+            raise GRPCError(Status.NOT_FOUND, f"Queue {request.queue_id!r} not found")
+
+        timestamp = self.resource_creation_timestamps[request.queue_id]
+        creation_info = api_pb2.CreationInfo(created_at=timestamp, created_by=self.default_username)
+        metadata = api_pb2.QueueMetadata(name=queue_name or "", creation_info=creation_info)
+        await stream.send_message(api_pb2.QueueGetByIdResponse(queue_id=request.queue_id, metadata=metadata))
+
+    async def QueueDelete(self, stream):
+        request: api_pb2.QueueDeleteRequest = await stream.recv_message()
+        self.deployed_queues = {k: v for k, v in self.deployed_queues.items() if v != request.queue_id}
+        await stream.send_message(Empty())
+
+    async def QueueHeartbeat(self, stream):
+        await stream.recv_message()
+        self.n_queue_heartbeats += 1
+        await stream.send_message(Empty())
+
+    async def QueuePut(self, stream):
+        request: api_pb2.QueuePutRequest = await stream.recv_message()
+        if sum(map(len, self.queue.values())) >= self.queue_max_len:
+            raise GRPCError(Status.RESOURCE_EXHAUSTED, f"Hit servicer's max len for Queues: {self.queue_max_len}")
+        q = self.queue.setdefault(request.partition_key, [])
+        q += request.values
+        await stream.send_message(Empty())
+
+    async def QueueGet(self, stream):
+        request: api_pb2.QueueGetRequest = await stream.recv_message()
+        q = self.queue.get(request.partition_key, [])
+        if len(q) > 0:
+            values = [q.pop(0)]
+        else:
+            values = []
+            await asyncio.sleep(request.timeout)
+        await stream.send_message(api_pb2.QueueGetResponse(values=values))
+
+    async def QueueLen(self, stream):
+        request = await stream.recv_message()
+        if request.total:
+            value = sum(map(len, self.queue.values()))
+        else:
+            q = self.queue.get(request.partition_key, [])
+            value = len(q)
+        await stream.send_message(api_pb2.QueueLenResponse(len=value))
+
+    async def QueueList(self, stream):
+        request: api_pb2.QueueListRequest = await stream.recv_message()
+        # `self.queue` holds the contents of a single queue, so every listed queue reports the same
+        # partition count and size.
+        num_partitions = sum(1 for items in self.queue.values() if items)
+        total_size = sum(map(len, self.queue.values()))
+        if request.total_size_limit:
+            total_size = min(total_size, request.total_size_limit)
+        queues = []
+        environment = self.get_environment(request.environment_name)
+        for (name, environment_name), obj_id in self.deployed_queues.items():
+            timestamp = self.resource_creation_timestamps[obj_id]
+            if environment_name != environment:
+                continue
+            elif timestamp >= request.pagination.created_before:
+                continue
+
+            creation_info = api_pb2.CreationInfo(created_at=timestamp, created_by=self.default_username)
+            metadata = api_pb2.QueueMetadata(name=name, creation_info=creation_info)
+            queues.append(
+                api_pb2.QueueListResponse.QueueInfo(
+                    name=name,
+                    queue_id=obj_id,
+                    metadata=metadata,
+                    num_partitions=num_partitions,
+                    total_size=total_size,
+                )
+            )
+            if request.pagination.max_objects and len(queues) >= request.pagination.max_objects:
+                break
+
+        queues = sorted(queues, key=lambda x: x.metadata.creation_info.created_at, reverse=True)
+        await stream.send_message(api_pb2.QueueListResponse(queues=queues))
+
+    async def QueueNextItems(self, stream):
+        request: api_pb2.QueueNextItemsRequest = await stream.recv_message()
+        next_item_idx = int(request.last_entry_id) + 1 if request.last_entry_id else 0
+        q = self.queue.get(request.partition_key, [])
+        if next_item_idx < len(q):
+            item = api_pb2.QueueItem(value=q[next_item_idx], entry_id=f"{next_item_idx}")
+            await stream.send_message(api_pb2.QueueNextItemsResponse(items=[item]))
+        else:
+            if request.item_poll_timeout > 0:
+                await asyncio.sleep(0.1)
+            await stream.send_message(api_pb2.QueueNextItemsResponse(items=[]))
+
+    ### Sandbox
+
+    async def SandboxCreate(self, stream):
+        request: api_pb2.SandboxCreateRequest = await stream.recv_message()
+        self._sandbox_terminated = False
+        self.sandbox_app_id = request.app_id
+        self.sandbox_defs.append(request.definition)
+        self.sandbox_tags["sb-nGEijt9WbBMlGrsPH9FOaC"] = {tag.tag_name: tag.tag_value for tag in request.tags}
+        self.sandbox_task_ids["sb-nGEijt9WbBMlGrsPH9FOaC"] = "ta-modalcontainerexec"
+        await stream.send_message(
+            api_pb2.SandboxCreateResponse(
+                sandbox_id="sb-nGEijt9WbBMlGrsPH9FOaC",
+                metadata=api_pb2.SandboxHandleMetadata(app_id=request.app_id),
+            )
+        )
+
+    async def SandboxCreateV2(self, stream):
+        request: api_pb2.SandboxCreateV2Request = await stream.recv_message()
+        self._sandbox_terminated = False
+        self.sandbox_app_id = request.app_id
+        self.sandbox_defs.append(request.definition)
+        self.sandbox_create_v2_requests.append(request)
+        self.sandbox_tags["sb-v2-123"] = {tag.tag_name: tag.tag_value for tag in request.tags}
+        self.sandbox_task_ids["sb-v2-123"] = "ta-v2-123"
+
+        # Only encrypted tunnels are known at create time. Unencrypted
+        # tunnels are relay-assigned after the container starts.
+        tunnels = [
+            api_pb2.TunnelData(host=f"sb-v2-123-{spec.port}.modal.host", port=443, container_port=spec.port)
+            for spec in request.definition.open_ports.ports
+            if not spec.unencrypted
+        ]
+
+        await stream.send_message(
+            api_pb2.SandboxCreateV2Response(
+                sandbox_id="sb-v2-123",
+                task_id="ta-v2-123",
+                sandbox_token="sandbox-token-sb-v2-123",
+                tunnels=tunnels,
+                metadata=api_pb2.SandboxHandleMetadata(app_id=request.app_id),
+                command_router_access=(
+                    None
+                    if self.sandbox_create_v2_omits_router_access
+                    else api_pb2.CommandRouterAccess(url=self.task_command_router_url, jwt="fake-jwt-token")
+                ),
+            )
+        )
+
+    async def SandboxContainerCreateV2(self, stream):
+        request: api_pb2.SandboxContainerCreateV2Request = await stream.recv_message()
+        task_id = self.sandbox_task_ids.get(request.sandbox_id, "ta-modalcontainerexec")
+        container_id = await self.task_command_router.create_container(
+            task_id=task_id,
+            container_name=request.container_name,
+            args=request.definition.entrypoint_args,
+            workdir=request.definition.workdir,
+        )
+        await stream.send_message(
+            api_pb2.SandboxContainerCreateV2Response(
+                container_id=container_id,
+                container_name=request.container_name,
+            )
+        )
+
+    async def SandboxGetTunnelsV2(self, stream):
+        await stream.recv_message()
+        tunnels = []
+        for spec in self.sandbox_defs[-1].open_ports.ports:
+            if spec.unencrypted:
+                tunnels.append(
+                    api_pb2.TunnelData(
+                        host="r1.modal.host",
+                        port=443,
+                        unencrypted_host="r1.modal.host",
+                        unencrypted_port=30000 + spec.port,
+                        container_port=spec.port,
+                    )
+                )
+            else:
+                tunnels.append(
+                    api_pb2.TunnelData(host=f"sb-v2-123-{spec.port}.modal.host", port=443, container_port=spec.port)
+                )
+        await stream.send_message(
+            api_pb2.SandboxGetTunnelsResponse(
+                result=api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS),
+                tunnels=tunnels,
+            )
+        )
+
+    async def SandboxGetFromName(self, stream):
+        _request: api_pb2.SandboxGetFromNameRequest = await stream.recv_message()
+        await stream.send_message(
+            api_pb2.SandboxGetFromNameResponse(
+                sandbox_id="sb-nGEijt9WbBMlGrsPH9FOaC",
+                metadata=api_pb2.SandboxHandleMetadata(app_id=self.sandbox_app_id),
+            )
+        )
+
+    async def SandboxGetFromNameV2(self, stream):
+        request: api_pb2.SandboxGetFromNameRequest = await stream.recv_message()
+        for sandbox_id, name in self.sandbox_names.items():
+            if name == request.sandbox_name:
+                await stream.send_message(
+                    api_pb2.SandboxGetFromNameResponse(
+                        sandbox_id=sandbox_id,
+                        metadata=api_pb2.SandboxHandleMetadata(app_id=self.sandbox_app_id),
+                    )
+                )
+                return
+        raise GRPCError(Status.NOT_FOUND, f"sandbox with name {request.sandbox_name!r} not found")
+
+    async def SandboxCreateConnectToken(self, stream):
+        request: api_pb2.SandboxCreateConnectTokenRequest = await stream.recv_message()
+        port = request.port if request.HasField("port") else 8080
+        await stream.send_message(
+            api_pb2.SandboxCreateConnectTokenResponse(
+                url="https://sandbox.modal.host/connect",
+                token=f"token-{port}",
+            )
+        )
+
+    async def SandboxCreateConnectTokenV2(self, stream):
+        request: api_pb2.SandboxCreateConnectTokenRequest = await stream.recv_message()
+        port = request.port if request.HasField("port") else 8080
+        await stream.send_message(
+            api_pb2.SandboxCreateConnectTokenResponse(
+                url="https://sandbox.modal.host/connect/v2",
+                token=f"v2token-{port}",
+            )
+        )
+
+    async def SandboxGetLogs(self, stream):
+        _request: api_pb2.SandboxGetLogsRequest = await stream.recv_message()
+        await stream.send_message(api_pb2.TaskLogsBatch(eof=True))
+
+    async def SandboxWait(self, stream):
+        _request: api_pb2.SandboxWaitRequest = await stream.recv_message()
+        if self._sandbox_terminated:
+            result = api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_TERMINATED, exitcode=-1)
+        else:
+            result = api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS)
+        self.sandbox_result = result
+        await stream.send_message(
+            api_pb2.SandboxWaitResponse(
+                result=result,
+                metadata=api_pb2.SandboxHandleMetadata(result=result, app_id=self.sandbox_app_id),
+            )
+        )
+
+    async def SandboxWaitV2(self, stream):
+        _request: api_pb2.SandboxWaitRequest = await stream.recv_message()
+        self.sandbox_token_metadata["SandboxWaitV2"] = stream.metadata.get("x-modal-sandbox-token")
+        if self._sandbox_terminated:
+            result = api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_TERMINATED, exitcode=-1)
+        else:
+            result = api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS)
+        self.sandbox_result = result
+        await stream.send_message(
+            api_pb2.SandboxWaitResponse(
+                result=result,
+                metadata=api_pb2.SandboxHandleMetadata(result=result, app_id=self.sandbox_app_id),
+            )
+        )
+
+    async def SandboxList(self, stream):
+        request: api_pb2.SandboxListRequest = await stream.recv_message()
+        if self._sandbox_terminated or request.before_timestamp == 1:
+            await stream.send_message(api_pb2.SandboxListResponse(sandboxes=[]))
+            return
+
+        if request.app_id and request.app_id != self.sandbox_app_id:
+            await stream.send_message(api_pb2.SandboxListResponse(sandboxes=[]))
+            return
+
+        sandboxes = [
+            api_pb2.SandboxInfo(
+                id=sandbox_id,
+                created_at=1,
+                task_info=api_pb2.TaskInfo(result=self.sandbox_result),
+                metadata=api_pb2.SandboxHandleMetadata(result=self.sandbox_result, app_id=self.sandbox_app_id),
+            )
+            for sandbox_id, tags in self.sandbox_tags.items()
+            if all(tags.get(tag.tag_name) == tag.tag_value for tag in request.tags)
+        ]
+        await stream.send_message(api_pb2.SandboxListResponse(sandboxes=sandboxes))
+
+    async def SandboxListV2(self, stream):
+        request: api_pb2.SandboxListRequest = await stream.recv_message()
+        if self._sandbox_terminated or request.before_timestamp == 1:
+            await stream.send_message(api_pb2.SandboxListResponse(sandboxes=[]))
+            return
+
+        if request.app_id and request.app_id != self.sandbox_app_id:
+            await stream.send_message(api_pb2.SandboxListResponse(sandboxes=[]))
+            return
+
+        sandboxes = [
+            api_pb2.SandboxInfo(
+                id=sandbox_id,
+                created_at=1,
+                task_info=api_pb2.TaskInfo(result=self.sandbox_result),
+                metadata=api_pb2.SandboxHandleMetadata(result=self.sandbox_result, app_id=self.sandbox_app_id),
+            )
+            for sandbox_id, tags in self.sandbox_tags.items()
+            if all(tags.get(tag.tag_name) == tag.tag_value for tag in request.tags)
+        ]
+        await stream.send_message(api_pb2.SandboxListResponse(sandboxes=sandboxes))
+
+    async def SandboxTagsGet(self, stream):
+        request: api_pb2.SandboxTagsGetRequest = await stream.recv_message()
+        tags = self.sandbox_tags.get(request.sandbox_id, {})
+        await stream.send_message(
+            api_pb2.SandboxTagsGetResponse(tags=[api_pb2.SandboxTag(tag_name=k, tag_value=v) for k, v in tags.items()])
+        )
+
+    async def SandboxGetStats(self, stream):
+        request: api_pb2.SandboxGetStatsRequest = await stream.recv_message()
+        await stream.send_message(self.sandbox_get_stats.get(request.sandbox_id, api_pb2.SandboxGetStatsResponse()))
+
+    async def SandboxGetTimeRangeStats(self, stream):
+        request: api_pb2.SandboxGetTimeRangeStatsRequest = await stream.recv_message()
+        self.sandbox_stats_requests.append(request)
+        if self.sandbox_stats_throttle_remaining > 0:
+            self.sandbox_stats_throttle_remaining -= 1
+            raise GRPCError(Status.UNAVAILABLE, "too many in-flight queries")
+
+        page = int(request.page_token or 0)
+        group = api_pb2.SandboxStatsGroup(
+            tags={
+                name: api_pb2.SandboxStatsGroup.TagValue(value=f"{name}-{page}" if page else None)
+                for name in request.group_by_tags
+            },
+            cost_str="0.12500000",
+            cost_by_resource_str={"CPU": "0.10000000", "Memory": "0.02500000"},
+        )
+        next_page_token = str(page + 1) if page + 1 < self.sandbox_stats_pages else ""
+        await stream.send_message(
+            api_pb2.SandboxGetTimeRangeStatsResponse(groups=[group], next_page_token=next_page_token)
+        )
+
+    async def SandboxTagsSet(self, stream):
+        request: api_pb2.SandboxTagsSetRequest = await stream.recv_message()
+        self.sandbox_tags[request.sandbox_id] = {tag.tag_name: tag.tag_value for tag in request.tags}
+        await stream.send_message(Empty())
+
+    async def SandboxTagsGetV2(self, stream):
+        request: api_pb2.SandboxTagsGetRequest = await stream.recv_message()
+        tags = self.sandbox_tags.get(request.sandbox_id, {})
+        await stream.send_message(
+            api_pb2.SandboxTagsGetResponse(tags=[api_pb2.SandboxTag(tag_name=k, tag_value=v) for k, v in tags.items()])
+        )
+
+    async def SandboxTagsSetV2(self, stream):
+        request: api_pb2.SandboxTagsSetRequest = await stream.recv_message()
+        self.sandbox_tags[request.sandbox_id] = {tag.tag_name: tag.tag_value for tag in request.tags}
+        await stream.send_message(Empty())
+
+    async def SandboxSetName(self, stream):
+        request: api_pb2.SandboxSetNameRequest = await stream.recv_message()
+        if not request.name:
+            raise GRPCError(Status.INVALID_ARGUMENT, "name is required")
+        held = self.sandbox_names.get(request.sandbox_id)
+        if held is not None and held != request.name:
+            raise GRPCError(Status.FAILED_PRECONDITION, f"sandbox {request.sandbox_id} already has a name")
+        for holder_id, held_name in self.sandbox_names.items():
+            if held_name == request.name and holder_id != request.sandbox_id:
+                raise GRPCError(Status.ALREADY_EXISTS, f"sandbox name {request.name!r} is already in use")
+        self.sandbox_names[request.sandbox_id] = request.name
+        await stream.send_message(api_pb2.SandboxSetNameResponse())
+
+    async def SandboxSetOutboundPolicy(self, stream):
+        request: api_pb2.SandboxSetOutboundPolicyRequest = await stream.recv_message()
+        self.sandbox_outbound_policies[request.sandbox_id] = request.outbound_policy
+        await stream.send_message(api_pb2.SandboxSetOutboundPolicyResponse())
+
+    async def SandboxSetOutboundPolicyV2(self, stream):
+        request: api_pb2.SandboxSetOutboundPolicyRequest = await stream.recv_message()
+        self.sandbox_outbound_policies[request.sandbox_id] = request.outbound_policy
+        await stream.send_message(api_pb2.SandboxSetOutboundPolicyResponse())
+
+    async def SandboxTerminate(self, stream):
+        self._sandbox_terminated = True
+        await stream.send_message(api_pb2.SandboxTerminateResponse())
+
+    async def PersistentSandboxCreate(self, stream):
+        request: api_pb2.PersistentSandboxCreateRequest = await stream.recv_message()
+        persistent_sandbox_id = f"sp-{len(self.persistent_sandbox_create_requests) + 1}"
+        self.persistent_sandbox_create_requests.append(request)
+        self._sandbox_terminated = False
+        self.sandbox_app_id = request.app_id
+        self.sandbox_defs.append(request.definition)
+        self.sandbox_task_ids["sb-v2-123"] = "ta-v2-123"
+        await stream.send_message(
+            api_pb2.PersistentSandboxCreateResponse(persistent_sandbox_id=persistent_sandbox_id, sandbox_id="sb-v2-123")
+        )
+
+    async def PersistentSandboxGet(self, stream):
+        request: api_pb2.PersistentSandboxGetRequest = await stream.recv_message()
+        terminated = request.persistent_sandbox_id in self.persistent_sandbox_terminated
+        running = not self._sandbox_terminated and not terminated
+        await stream.send_message(
+            api_pb2.PersistentSandboxGetResponse(
+                persistent_sandbox_id=request.persistent_sandbox_id, sandbox_id="sb-v2-123" if running else ""
+            )
+        )
+
+    async def PersistentSandboxTunnelsList(self, stream):
+        request: api_pb2.PersistentSandboxTunnelsListRequest = await stream.recv_message()
+        index = int(request.persistent_sandbox_id.removeprefix("sp-")) - 1
+        definition = self.persistent_sandbox_create_requests[index].definition
+        tunnels = [
+            api_pb2.TunnelData(
+                host=f"{request.persistent_sandbox_id}-{spec.port}.tunnel.modal.host",
+                port=443,
+                container_port=spec.port,
+            )
+            for spec in definition.open_ports.ports
+            if not spec.unencrypted
+        ]
+        await stream.send_message(api_pb2.PersistentSandboxTunnelsListResponse(tunnels=tunnels))
+
+    async def PersistentSandboxResume(self, stream):
+        request: api_pb2.PersistentSandboxResumeRequest = await stream.recv_message()
+        if request.persistent_sandbox_id in self.persistent_sandbox_terminated:
+            raise GRPCError(Status.FAILED_PRECONDITION, "persistent sandbox is terminated")
+        if self._sandbox_terminated:
+            self.persistent_sandbox_resumes += 1
+        self._sandbox_terminated = False
+        await stream.send_message(api_pb2.PersistentSandboxResumeResponse(sandbox_id="sb-v2-123"))
+
+    async def PersistentSandboxTerminate(self, stream):
+        request: api_pb2.PersistentSandboxTerminateRequest = await stream.recv_message()
+        self.persistent_sandbox_terminated.add(request.persistent_sandbox_id)
+        self._sandbox_terminated = True
+        await stream.send_message(api_pb2.PersistentSandboxTerminateResponse())
+
+    async def SandboxTerminateV2(self, stream):
+        self.sandbox_token_metadata["SandboxTerminateV2"] = stream.metadata.get("x-modal-sandbox-token")
+        self._sandbox_terminated = True
+        await stream.send_message(api_pb2.SandboxTerminateResponse())
+
+    async def SandboxSnapshot(self, stream):
+        _request: api_pb2.SandboxSnapshotRequest = await stream.recv_message()
+        await stream.send_message(api_pb2.SandboxSnapshotResponse(snapshot_id="sn-123"))
+
+    async def SandboxSnapshotFs(self, stream):
+        _request: api_pb2.SandboxSnapshotFsRequest = await stream.recv_message()
+        await stream.send_message(
+            api_pb2.SandboxSnapshotFsResponse(
+                image_id="im-123",
+                result=api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS),
+            )
+        )
+
+    async def SandboxSnapshotWait(self, stream):
+        _request: api_pb2.SandboxSnapshotWaitRequest = await stream.recv_message()
+        await stream.send_message(
+            api_pb2.SandboxSnapshotWaitResponse(
+                result=api_pb2.GenericResult(status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS)
+            )
+        )
+
+    async def SandboxRestore(self, stream):
+        request: api_pb2.SandboxRestoreRequest = await stream.recv_message()
+        if request.snapshot_id == "sn-01BX5ZZKBKACTAV9WEVGEMMVRY":
+            raise GRPCError(
+                Status.FAILED_PRECONDITION,
+                "This snapshot was created from a V2 sandbox and cannot be restored with SandboxRestore",
+            )
+        await stream.send_message(api_pb2.SandboxRestoreResponse(sandbox_id="sb-nGEijt9WbBMlGrsPH9FOaC"))
+
+    async def SandboxRestoreV2(self, stream):
+        request: api_pb2.SandboxRestoreV2Request = await stream.recv_message()
+        self.sandbox_restore_v2_requests.append(request)
+        await stream.send_message(
+            api_pb2.SandboxRestoreV2Response(
+                sandbox_id="sb-01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                task_id="ta-restored-v2-123",
+                tunnels=[api_pb2.TunnelData(host="sb-restored-8080.modal.host", port=443, container_port=8080)],
+                command_router_access=api_pb2.CommandRouterAccess(
+                    url=self.task_command_router_url, jwt="fake-jwt-token"
+                ),
+            )
+        )
+
+    async def TaskGetCommandRouterAccess(self, stream):
+        _request: api_pb2.TaskGetCommandRouterAccessRequest = await stream.recv_message()
+        await stream.send_message(
+            api_pb2.TaskGetCommandRouterAccessResponse(url=self.task_command_router_url, jwt="fake-jwt-token")
+        )
+
+    async def SandboxGetCommandRouterAccess(self, stream):
+        _request: api_pb2.SandboxGetCommandRouterAccessRequest = await stream.recv_message()
+        self.sandbox_token_metadata["SandboxGetCommandRouterAccess"] = stream.metadata.get("x-modal-sandbox-token")
+        await stream.send_message(
+            api_pb2.SandboxGetCommandRouterAccessResponse(url=self.task_command_router_url, jwt="fake-jwt-token")
+        )
+
+    async def TaskGetInfo(self, stream):
+        _request: api_pb2.TaskGetInfoRequest = await stream.recv_message()
+        await stream.send_message(
+            api_pb2.TaskGetInfoResponse(
+                app_id="ap-test-container-app",
+                info=api_pb2.TaskInfo(
+                    id=_request.task_id,
+                    enqueued_at=1700000000.0,
+                    started_at=1700000001.0,
+                    finished_at=1700003600.0,
+                ),
+            )
+        )
+
+    async def TaskList(self, stream):
+        _request: api_pb2.TaskListRequest = await stream.recv_message()
+        self.task_list_calls += 1
+        await stream.send_message(api_pb2.TaskListResponse())
+
+    async def SandboxGetTaskId(self, stream):
+        # only used for `modal shell` / `modal container exec`
+        _request: api_pb2.SandboxGetTaskIdRequest = await stream.recv_message()
+        await stream.send_message(api_pb2.SandboxGetTaskIdResponse(task_id="ta-modalcontainerexec"))
+
+    async def SandboxGetTaskIdV2(self, stream):
+        request: api_pb2.SandboxGetTaskIdRequest = await stream.recv_message()
+        self.sandbox_token_metadata["SandboxGetTaskIdV2"] = stream.metadata.get("x-modal-sandbox-token")
+        task_id = self.sandbox_task_ids.get(request.sandbox_id, "ta-modalcontainerexec")
+        await stream.send_message(api_pb2.SandboxGetTaskIdResponse(task_id=task_id))
+
+    async def SandboxStdinWrite(self, stream):
+        _request: api_pb2.SandboxStdinWriteRequest = await stream.recv_message()
+        if self._sandbox_terminated:
+            raise GRPCError(Status.FAILED_PRECONDITION, "Sandbox has already terminated")
+        await stream.send_message(api_pb2.SandboxStdinWriteResponse())
+
+    ### Secret
+
+    def _use_secret(self, secret_id: str):
+        self.secret_use_times[secret_id] = datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+    async def SecretDelete(self, stream):
+        request: api_pb2.SecretDeleteRequest = await stream.recv_message()
+        self.deployed_secrets = {k: v for k, v in self.deployed_secrets.items() if v != request.secret_id}
+        self.secret_use_times.pop(request.secret_id, None)
+        self.secrets.pop(request.secret_id)
+        self.resource_creation_timestamps.pop(request.secret_id)
+        self.secret_environment_names.pop(request.secret_id)
+        await stream.send_message(Empty())
+
+    async def SecretUpdate(self, stream):
+        request: api_pb2.SecretUpdateRequest = await stream.recv_message()
+        env_dict = dict(self.secrets.get(request.secret_id, {}))
+        for update in request.updates:
+            if update.HasField("value"):
+                env_dict[update.key] = update.value
+            else:
+                env_dict.pop(update.key, None)
+        self.secrets[request.secret_id] = env_dict
+        await stream.send_message(Empty())
+
+    async def SecretGetInfo(self, stream):
+        request: api_pb2.SecretGetInfoRequest = await stream.recv_message()
+
+        try:
+            timestamp = self.resource_creation_timestamps[request.secret_id]
+            environment_name = self.secret_environment_names[request.secret_id]
+            env_dict = self.secrets[request.secret_id]
+        except KeyError:
+            raise GRPCError(Status.NOT_FOUND, f"Secret {request.secret_id!r} not found")
+
+        creation_info = api_pb2.CreationInfo(created_at=timestamp, created_by=self.default_username)
+
+        for (secret_name, _), secret_id in self.deployed_secrets.items():
+            if secret_id != request.secret_id:
+                continue
+
+            metadata = api_pb2.SecretMetadata(
+                name=secret_name,
+                creation_info=creation_info,
+                environment_name=environment_name,
+                keys=list(env_dict.keys()),
+            )
+
+            if last_used := self.secret_use_times.get(secret_id):
+                metadata.last_used_at = last_used
+
+            await stream.send_message(api_pb2.SecretGetInfoResponse(metadata=metadata))
+            return
+
+        metadata = api_pb2.SecretMetadata(
+            creation_info=creation_info, environment_name=environment_name, keys=list(env_dict.keys())
+        )
+
+        if last_used := self.secret_use_times.get(secret_id):
+            metadata.last_used_at = last_used
+
+        await stream.send_message(api_pb2.SecretGetInfoResponse(metadata=metadata))
+
+    async def SecretGetOrCreate(self, stream):
+        request: api_pb2.SecretGetOrCreateRequest = await stream.recv_message()
+        environment_name = self.get_environment(request.environment_name)
+        k = (request.deployment_name, environment_name)
+        env_dict = request.env_dict
+        if request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_ANONYMOUS_OWNED_BY_APP:
+            secret_id = "st-" + str(len(self.secrets))
+            self.secrets[secret_id] = request.env_dict
+            self.secret_environment_names[secret_id] = environment_name
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_EPHEMERAL:
+            secret_id = "st-" + str(len(self.secrets))
+            self.secrets[secret_id] = request.env_dict
+            self.secret_environment_names[secret_id] = environment_name
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_CREATE_FAIL_IF_EXISTS:
+            if k in self.deployed_secrets:
+                raise GRPCError(Status.ALREADY_EXISTS, f"Secret {k} already exists")
+            secret_id = None
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_CREATE_OVERWRITE_IF_EXISTS:
+            secret_id = None
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_UNSPECIFIED:
+            if k not in self.deployed_secrets:
+                raise GRPCError(Status.NOT_FOUND, f"Secret {k} not found")
+            secret_id = self.deployed_secrets[k]
+            env_dict = self.secrets[secret_id]
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_CREATE_IF_MISSING:
+            if k in self.deployed_secrets:
+                secret_id = self.deployed_secrets[k]
+                env_dict = self.secrets[secret_id]
+        else:
+            raise Exception("unsupported creation type")
+
+        if secret_id is None:  # Create one
+            secret_id = "st-" + str(len(self.secrets))
+            self.secrets[secret_id] = request.env_dict
+            self.secret_environment_names[secret_id] = environment_name
+            self.deployed_secrets[k] = secret_id
+
+        self.resource_creation_timestamps[secret_id] = timestamp = datetime.datetime.now().timestamp()
+        creation_info = api_pb2.CreationInfo(created_at=timestamp, created_by=self.default_username)
+        metadata = api_pb2.SecretMetadata(
+            name=request.deployment_name,
+            creation_info=creation_info,
+            environment_name=environment_name,
+            keys=list(env_dict.keys()),
+        )
+        await stream.send_message(api_pb2.SecretGetOrCreateResponse(secret_id=secret_id, metadata=metadata))
+
+    async def SecretList(self, stream):
+        req: api_pb2.SecretListRequest = await stream.recv_message()
+        environment = self.get_environment(req.environment_name)
+        secrets = []
+        for (name, environment_name), obj_id in self.deployed_secrets.items():
+            timestamp = self.resource_creation_timestamps[obj_id]
+            env_dict = self.secrets[obj_id]
+
+            if environment_name != environment:
+                continue
+            elif timestamp >= req.pagination.created_before:
+                continue
+
+            creation_info = api_pb2.CreationInfo(created_by=self.default_username)  # TODO make more realistic
+            metadata = api_pb2.SecretMetadata(
+                name=name,
+                creation_info=creation_info,
+                environment_name=environment_name,
+                keys=list(env_dict.keys()),
+            )
+
+            if last_used := self.secret_use_times.get(obj_id):
+                metadata.last_used_at = last_used
+
+            secrets.append(api_pb2.SecretListItem(label=name, secret_id=obj_id, metadata=metadata))
+            if req.pagination.max_objects and len(secrets) >= req.pagination.max_objects:
+                break
+
+        secrets = sorted(secrets, key=lambda x: x.metadata.creation_info.created_at, reverse=True)
+        await stream.send_message(api_pb2.SecretListResponse(items=secrets))
+
+    ### Service Users
+
+    async def ServiceUserInfo(self, stream):
+        req: api_pb2.ServiceUserInfoRequest = await stream.recv_message()
+
+        service_user: api_pb2.ServiceUser | None = None
+        if req.service_user_name:
+            for su in self.workspace_service_users.values():
+                if su is None:
+                    continue
+
+                if su.name != req.service_user_name:
+                    continue
+
+                service_user = su
+                break
+
+        if service_user is None:
+            raise GRPCError(Status.NOT_FOUND, "Could not find Service User.")
+
+        await stream.send_message(api_pb2.ServiceUserInfoResponse(service_user=service_user))
+
+    async def ServiceUserCreate(self, stream):
+        req: api_pb2.ServiceUserCreateRequest = await stream.recv_message()
+
+        names = set([s.name for s in self.workspace_service_users.values() if s is not None])
+        if req.name in names:
+            raise GRPCError(Status.ALREADY_EXISTS, f"Service user with name '{req.name}' already exists")
+
+        index = len(self.workspace_service_users) + 1
+
+        expires_at: datetime.datetime | None = None
+        if req.expires_in_seconds:
+            expires_at = datetime.datetime.now() + datetime.timedelta(seconds=req.expires_in_seconds)
+
+        token_id = f"ak-SU{index}"
+        token_secret = f"as-SU{index}"
+
+        next_id = f"sv-{index}"
+        self.workspace_service_users[next_id] = api_pb2.ServiceUser(
+            name=req.name,
+            token_id=token_id,
+            created_by="user",
+            created_at=datetime.datetime.now().timestamp(),
+            service_user_id=next_id,
+            expires_at=expires_at.timestamp() if expires_at is not None else None,
+        )
+
+        resp = api_pb2.ServiceUserCreateResponse(token_id=token_id, token_secret=token_secret, service_user_id=next_id)
+        if expires_at is not None:
+            resp.expires_at.FromDatetime(expires_at)
+
+        await stream.send_message(resp)
+
+    async def ServiceUserList(self, stream):
+        _ = await stream.recv_message()  # Empty()
+        await stream.send_message(
+            api_pb2.ServiceUserListResponse(
+                service_users=[su for su in self.workspace_service_users.values() if su is not None]
+            )
+        )
+
+    async def ServiceUserDelete(self, stream):
+        req: api_pb2.ServiceUserDeleteRequest = await stream.recv_message()
+
+        service_user_id = req.service_user_id
+        if req.service_user_name:
+            for sv_id, sv in self.workspace_service_users.items():
+                if sv is None:
+                    continue
+
+                if sv.name != req.service_user_name:
+                    continue
+
+                service_user_id = sv_id
+
+        if service_user_id not in self.workspace_service_users:
+            raise GRPCError(Status.NOT_FOUND, f"Service user {req.service_user_name!r} not found")
+
+        self.workspace_service_users[service_user_id] = None
+        await stream.send_message(Empty())
+
+    ### Snapshot
+
+    async def SandboxSnapshotGet(self, stream):
+        _request: api_pb2.SandboxSnapshotGetRequest = await stream.recv_message()
+        await stream.send_message(api_pb2.SandboxSnapshotGetResponse(snapshot_id="sn-123"))
+
+    ### Network File System (née Shared volume)
+
+    async def SharedVolumeDelete(self, stream):
+        req: api_pb2.SharedVolumeDeleteRequest = await stream.recv_message()
+        self.nfs_files.pop(req.shared_volume_id)
+        self.deployed_nfss = {k: vol_id for k, vol_id in self.deployed_nfss.items() if vol_id != req.shared_volume_id}
+        await stream.send_message(Empty())
+
+    async def SharedVolumeGetOrCreate(self, stream):
+        request: api_pb2.SharedVolumeGetOrCreateRequest = await stream.recv_message()
+        k = (request.deployment_name, self.get_environment(request.environment_name))
+        if request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_UNSPECIFIED:
+            if k not in self.deployed_nfss:
+                if k in self.deployed_volumes:
+                    raise GRPCError(Status.NOT_FOUND, "App has wrong entity vo")
+                raise GRPCError(Status.NOT_FOUND, f"NFS {k} not found")
+            nfs_id = self.deployed_nfss[k]
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_EPHEMERAL:
+            nfs_id = f"sv-{len(self.nfs_files)}"
+            self.nfs_files[nfs_id] = {}
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_CREATE_IF_MISSING:
+            if k not in self.deployed_nfss:
+                nfs_id = f"sv-{len(self.nfs_files)}"
+                self.nfs_files[nfs_id] = {}
+                self.deployed_nfss[k] = nfs_id
+            nfs_id = self.deployed_nfss[k]
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_CREATE_FAIL_IF_EXISTS:
+            if k in self.deployed_nfss:
+                raise GRPCError(Status.ALREADY_EXISTS, f"NFS {k} already exists")
+            nfs_id = f"sv-{len(self.nfs_files)}"
+            self.nfs_files[nfs_id] = {}
+            self.deployed_nfss[k] = nfs_id
+        else:
+            raise GRPCError(Status.INVALID_ARGUMENT, "unsupported object creation type")
+
+        await stream.send_message(api_pb2.SharedVolumeGetOrCreateResponse(shared_volume_id=nfs_id))
+
+    async def SharedVolumeHeartbeat(self, stream):
+        await stream.recv_message()
+        self.n_nfs_heartbeats += 1
+        await stream.send_message(Empty())
+
+    async def SharedVolumeList(self, stream):
+        req = await stream.recv_message()
+        items = []
+        environment = self.get_environment(req.environment_name)
+        for (name, env_name), volume_id in self.deployed_nfss.items():
+            if env_name != environment:
+                continue
+            items.append(api_pb2.SharedVolumeListItem(label=name, shared_volume_id=volume_id, created_at=1))
+        resp = api_pb2.SharedVolumeListResponse(items=items, environment_name=req.environment_name)
+        await stream.send_message(resp)
+
+    async def SharedVolumePutFile(self, stream):
+        req = await stream.recv_message()
+        self.nfs_files[req.shared_volume_id][req.path] = req
+        await stream.send_message(api_pb2.SharedVolumePutFileResponse(exists=True))
+
+    async def SharedVolumeGetFile(self, stream):
+        req = await stream.recv_message()
+        put_req = self.nfs_files.get(req.shared_volume_id, {}).get(req.path)
+        if not put_req:
+            raise GRPCError(Status.NOT_FOUND, f"No such file: {req.path}")
+        if put_req.data_blob_id:
+            await stream.send_message(api_pb2.SharedVolumeGetFileResponse(data_blob_id=put_req.data_blob_id))
+        else:
+            await stream.send_message(api_pb2.SharedVolumeGetFileResponse(data=put_req.data))
+
+    async def SharedVolumeListFilesStream(self, stream):
+        req: api_pb2.SharedVolumeListFilesRequest = await stream.recv_message()
+        for path in self.nfs_files[req.shared_volume_id].keys():
+            entry = api_pb2.FileEntry(path=path, type=api_pb2.FileEntry.FileType.FILE)
+            response = api_pb2.SharedVolumeListFilesResponse(entries=[entry])
+            if req.path == "**" or req.path == "/" or req.path == path:  # hack
+                await stream.send_message(response)
+
+    ### Task
+
+    async def TaskCurrentInputs(self, stream: grpclib.server.Stream[Empty, api_pb2.TaskCurrentInputsResponse]) -> None:
+        await stream.send_message(api_pb2.TaskCurrentInputsResponse(input_ids=[]))  # dummy implementation
+
+    async def TaskResult(self, stream):
+        request: api_pb2.TaskResultRequest = await stream.recv_message()
+        if self.task_result is None:
+            self.task_result = request.result
+        await stream.send_message(Empty())
+
+    ### Token flow
+
+    async def TokenFlowCreate(self, stream):
+        request: api_pb2.TokenFlowCreateRequest = await stream.recv_message()
+        self.token_flow_localhost_port = request.localhost_port
+        self.token_flow_expires_in_seconds = request.expires_in_seconds
+        await stream.send_message(
+            api_pb2.TokenFlowCreateResponse(token_flow_id="tc-123", web_url="https://localhost/xyz/abc")
+        )
+
+    async def TokenFlowWait(self, stream):
+        await stream.send_message(
+            api_pb2.TokenFlowWaitResponse(
+                token_id="abc",
+                token_secret="xyz",
+            )
+        )
+
+    async def TokenInfoGet(self, stream):
+        await stream.recv_message()
+        await stream.send_message(
+            api_pb2.TokenInfoGetResponse(
+                token_id="ak-test123",
+                workspace_id="ws-test456",
+                workspace_name="test-workspace",
+                user_identity=api_pb2.UserIdentity(
+                    user_id="us-test789",
+                    username="test-user",
+                ),
+                token_name="test-token",
+            )
+        )
+
+    async def WorkspaceBillingRates(self, stream):
+        _ = await stream.recv_message()
+
+        self.rates = {
+            "normal_key": "1.0",
+            "warning_key": "1.0",
+        }
+
+        await stream.send_message(
+            api_pb2.WorkspaceBillingRatesResponse(
+                rates=self.rates,
+                deprecation_warnings={"warning_key": "this is a warning"},
+                deprecation_errors={"error_key": "this is an error"},
+                formatted="formatted output",
+            )
+        )
+
+    async def WorkspaceBillingReport(self, stream):
+        # Dummy implementation
+        request = await stream.recv_message()
+
+        messages = [
+            api_pb2.WorkspaceBillingReportItem(
+                object_id="ap-123",
+                description="app1",
+                environment_name="main",
+                cost="100.123456",
+                tags={"team": "eng", "project": "p7r"},
+                cost_by_resource={"CPU": "100", "Memory": "0.123456"},
+            )
+        ]
+        if len(request.environment_ids) == 0:
+            messages.append(
+                api_pb2.WorkspaceBillingReportItem(
+                    object_id="ap-123",
+                    description="app1",
+                    environment_name="test",
+                    cost="100.123456",
+                    tags={"team": "eng", "project": "p7r"},
+                    cost_by_resource={"CPU": "100", "Memory": "0.123456"},
+                )
+            )
+
+        for i, item in enumerate(messages):
+            item.interval.FromDatetime(datetime.datetime(2025, 1, 1, i, 0, 0))
+            await stream.send_message(item)
+
+    async def WorkspaceBillingSummary(self, stream):
+        request = await stream.recv_message()
+        assert isinstance(request, api_pb2.WorkspaceBillingSummaryRequest)
+
+        msg = api_pb2.WorkspaceBillingSummaryResponse(
+            start_timestamp=request.start_timestamp,
+            metered_cost="5.0",
+            adjustments={
+                "Plan Cost": "1.0",
+                "Credits": "-1.0",
+                "Reservation Adjustment": "-1.0",
+                "Free Storage": "-1.0",
+                "Network Egress Allowance": "-0.5",
+            },
+            billed_cost="2.5",
+            metered_cost_breakdown={
+                "Deployed Apps": "1.0",
+                "Ephemeral Apps": "1.0",
+                "Notebooks": "1.0",
+                "Volumes": "1.0",
+                "LLM Tokens": "1.0",
+            },
+        )
+
+        msg.end_timestamp.FromDatetime(add_months(request.start_timestamp.ToDatetime(), 1))
+
+        await stream.send_message(msg)
+
+    async def WorkspaceDashboardUrlGet(self, stream):
+        request = await stream.recv_message()
+        # Return a dashboard URL based on the environment name
+        env_name = request.environment_name or "main"
+        url = f"https://modal.com/apps/{env_name}"
+        await stream.send_message(api_pb2.WorkspaceDashboardUrlResponse(url=url))
+
+    async def WorkspaceNameLookup(self, stream):
+        await stream.send_message(api_pb2.WorkspaceNameLookupResponse(username="test-username"))
+
+    async def WorkspaceMembersList(self, stream):
+        await stream.recv_message()
+        await stream.send_message(api_pb2.WorkspaceMembersListResponse(members=self.workspace_members))
+
+    async def AuditLogSettingsGet(self, stream):
+        await stream.recv_message()
+        await stream.send_message(
+            api_pb2.AuditLogSettingsGetResponse(
+                bucket_size=5000,
+                page_size=5000,
+                max_concurrent_requests=5,
+                max_buffered_buckets=10,
+                request_timeout_secs=30.0,
+                plan_timeout_secs=60.0,
+            )
+        )
+
+    async def AuditLogList(self, stream):
+        request = await stream.recv_message()
+        start = 0
+        if request.HasField("newest_cursor"):
+            start = [entry.id for entry in self.audit_log_entries].index(request.newest_cursor.id) + 1
+        items = self.audit_log_entries[start : start + request.limit]
+        response = api_pb2.AuditLogListResponse(items=items)
+        if items and len(items) == request.limit:
+            response.next_cursor.CopyFrom(api_pb2.AuditLogCursor(id=items[-1].id))
+        await stream.send_message(response)
+
+    async def AuditLogPlan(self, stream):
+        await stream.recv_message()
+        await stream.send_message(api_pb2.AuditLogPlanResponse())
+
+    async def AuditLogCount(self, stream):
+        await stream.recv_message()
+        await stream.send_message(api_pb2.AuditLogCountResponse(count=len(self.audit_log_entries)))
+
+    async def WorkspaceSettings(self, stream):
+        await stream.recv_message()
+        await stream.send_message(
+            api_pb2.WorkspaceSettingsResponse(
+                default_environment_name=self.workspace_default_environment_name,
+                image_builder_version=self.workspace_image_builder_version,
+            )
+        )
+
+    async def WorkspaceSetImageBuilderVersion(self, stream):
+        request: api_pb2.WorkspaceSetImageBuilderVersionRequest = await stream.recv_message()
+        self.workspace_image_builder_version = request.new_image_builder_version
+        await stream.send_message(
+            api_pb2.WorkspaceSetImageBuilderVersionResponse(image_builder_version=request.new_image_builder_version)
+        )
+
+    async def WorkspaceSetDefaultEnvironment(self, stream):
+        request: api_pb2.WorkspaceSetDefaultEnvironmentRequest = await stream.recv_message()
+        self.workspace_default_environment_name = request.environment_name
+        await stream.send_message(Empty())
+
+    ### Member Tokens
+
+    def _create_token(self, name: str, expiration: int | None):
+        token_id = f"ak-MT{len(self.workspace_member_tokens) + 1}"
+        user_id = "us-1"
+        username = self.workspace_users[user_id].capitalize()
+
+        created_at = datetime.datetime.now(datetime.timezone.utc)
+        expires_at: datetime.datetime | None = None
+        if expiration:
+            expires_at = created_at + datetime.timedelta(seconds=expiration)
+
+        token = api_pb2.TokensListResponse.Token(
+            token_id=token_id,
+            user_id=user_id,
+            member_displayname=username,
+            created_at=created_at.timestamp(),
+        )
+        if expires_at:
+            token.expires_at = expires_at.timestamp()
+        if name:
+            token.name = name
+
+        self.workspace_member_tokens[token_id] = token
+
+        return api_pb2.TokenCreateResponse(
+            token_id=token_id,
+            token_secret="as-123",
+        )
+
+    async def TokenDisable(self, stream):
+        msg: api_pb2.TokenDisableRequest = await stream.recv_message()
+
+        for token_id in msg.token_ids:
+            token = self.workspace_member_tokens.get(token_id)
+            if token is None:
+                raise GRPCError(Status.NOT_FOUND, "Token not found")
+
+            token.disabled = True
+
+        await stream.send_message(Empty())
+
+    async def TokenEnable(self, stream):
+        msg: api_pb2.TokenEnableRequest = await stream.recv_message()
+
+        for token_id in msg.token_ids:
+            token = self.workspace_member_tokens.get(token_id)
+            if token is None:
+                raise GRPCError(Status.NOT_FOUND, "Token not found")
+
+            token.disabled = False
+
+        await stream.send_message(Empty())
+
+    async def TokensList(self, stream):
+        await stream.recv_message()  # Empty
+        await stream.send_message(
+            api_pb2.TokensListResponse(tokens=[mt for mt in self.workspace_member_tokens.values() if mt is not None])
+        )
+
+    async def TokenDelete(self, stream):
+        msg: api_pb2.TokenDeleteRequest = await stream.recv_message()
+
+        token_ids = list(msg.token_ids)
+        if msg.token_id:
+            token_ids.append(msg.token_id)
+
+        deleted_token_ids: list[str] = []
+        for token_id in token_ids:
+            token = self.workspace_member_tokens.get(token_id)
+            if token is None:
+                if msg.allow_missing:
+                    continue
+
+                raise GRPCError(Status.NOT_FOUND, "Token not found")
+
+            self.workspace_member_tokens[token_id] = None
+            deleted_token_ids.append(token_id)
+
+        await stream.send_message(api_pb2.TokenDeleteResponse(deleted_token_ids=deleted_token_ids))
+
+    ### Proxy auth (webhook) tokens
+
+    async def WebhookTokenCreate(self, stream):
+        request: api_pb2.WebhookTokenCreateRequest = await stream.recv_message()
+        token_id = f"wt-{len(self.webhook_tokens) + 1}"
+        self.webhook_tokens[token_id] = {
+            "created_at": 1577836800.0,
+            "scoped": request.scoped,
+            "name": request.name,
+            "created_by": api_pb2.UserIdentity(
+                user_id="us-1",
+                username=self.default_username,
+            ),
+        }
+        self.webhook_token_environments[token_id] = set()
+        await stream.send_message(api_pb2.TokenCreateResponse(token_id=token_id, token_secret=f"secret-{token_id}"))
+
+    async def WebhookTokenDelete(self, stream):
+        request: api_pb2.TokenDeleteRequest = await stream.recv_message()
+        self.webhook_tokens.pop(request.token_id, None)
+        self.webhook_token_environments.pop(request.token_id, None)
+        await stream.send_message(Empty())
+
+    async def WebhookTokenUpdate(self, stream):
+        request: api_pb2.WebhookTokenUpdateRequest = await stream.recv_message()
+        token = self.webhook_tokens[request.token_id]
+        token["name"] = request.name
+        await stream.send_message(
+            api_pb2.WebhookToken(
+                token_id=request.token_id,
+                created_at=token["created_at"],
+                scoped=token["scoped"],
+                name=token["name"],
+                created_by=token["created_by"],
+            )
+        )
+
+    async def WebhookTokenList(self, stream):
+        await stream.recv_message()
+        tokens = [
+            api_pb2.WebhookToken(
+                token_id=token_id,
+                created_at=data["created_at"],
+                scoped=data["scoped"],
+                name=data.get("name", ""),
+                created_by=data.get("created_by", api_pb2.UserIdentity()),
+            )
+            for token_id, data in self.webhook_tokens.items()
+        ]
+        await stream.send_message(api_pb2.WebhookTokenListResponse(tokens=tokens))
+
+    async def WebhookTokenEnvironmentAdd(self, stream):
+        request: api_pb2.WebhookTokenEnvironmentAddRequest = await stream.recv_message()
+        if request.token_id not in self.webhook_tokens:
+            raise GRPCError(Status.NOT_FOUND, "Webhook token not found")
+        self.webhook_token_environments.setdefault(request.token_id, set()).add(request.environment_id)
+        await stream.send_message(Empty())
+
+    async def WebhookTokenEnvironmentRemove(self, stream):
+        request: api_pb2.WebhookTokenEnvironmentRemoveRequest = await stream.recv_message()
+        if request.token_id not in self.webhook_tokens:
+            raise GRPCError(Status.NOT_FOUND, "Webhook token not found")
+        self.webhook_token_environments.get(request.token_id, set()).discard(request.environment_id)
+        await stream.send_message(Empty())
+
+    async def WebhookTokenEnvironmentList(self, stream):
+        request: api_pb2.WebhookTokenEnvironmentListRequest = await stream.recv_message()
+        environment_ids = sorted(self.webhook_token_environments.get(request.token_id, set()))
+        await stream.send_message(api_pb2.WebhookTokenEnvironmentListResponse(environment_ids=environment_ids))
+
+    async def WebhookTokenListForEnvironment(self, stream):
+        request: api_pb2.WebhookTokenListForEnvironmentRequest = await stream.recv_message()
+        env_name = request.environment_name or next(iter(self.environments))
+        env_id = self.environments.get(env_name)
+        tokens = [
+            api_pb2.WebhookToken(
+                token_id=token_id,
+                created_at=data["created_at"],
+                scoped=data["scoped"],
+                name=data.get("name", ""),
+                created_by=data.get("created_by", api_pb2.UserIdentity()),
+            )
+            for token_id, data in self.webhook_tokens.items()
+            # Mirror the server: only scoped tokens with an explicit association are returned
+            if data["scoped"] and env_id in self.webhook_token_environments.get(token_id, set())
+        ]
+        await stream.send_message(api_pb2.WebhookTokenListResponse(tokens=tokens))
+
+    ### Tunnel
+
+    async def TunnelStart(self, stream):
+        request: api_pb2.TunnelStartRequest = await stream.recv_message()
+        port = request.port
+        await stream.send_message(api_pb2.TunnelStartResponse(host=f"{port}.modal.test", port=443))
+
+    async def TunnelStop(self, stream):
+        await stream.recv_message()
+        await stream.send_message(api_pb2.TunnelStopResponse(exists=True))
+
+    ### Volume
+    async def VolumeGetOrCreate(self, stream):
+        request: api_pb2.VolumeGetOrCreateRequest = await stream.recv_message()
+        k = (request.deployment_name, self.get_environment(request.environment_name))
+        if request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_UNSPECIFIED:
+            if k not in self.deployed_volumes:
+                raise GRPCError(Status.NOT_FOUND, f"Volume {k} not found")
+            volume_id = self.deployed_volumes[k]
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_EPHEMERAL:
+            volume_id = f"vo-{len(self.volumes)}"
+            self.volumes[volume_id] = Volume(version=request.version, files={})
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_CREATE_IF_MISSING:
+            if k not in self.deployed_volumes:
+                volume_id = f"vo-{len(self.volumes)}"
+                self.volumes[volume_id] = Volume(version=request.version, files={})
+                self.deployed_volumes[k] = volume_id
+            volume_id = self.deployed_volumes[k]
+        elif request.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_CREATE_FAIL_IF_EXISTS:
+            if k in self.deployed_volumes:
+                raise GRPCError(Status.ALREADY_EXISTS, f"Volume {k} already exists")
+            volume_id = f"vo-{len(self.volumes)}"
+            self.volumes[volume_id] = Volume(version=request.version, files={})
+            self.deployed_volumes[k] = volume_id
+        else:
+            raise GRPCError(Status.INVALID_ARGUMENT, "unsupported object creation type")
+
+        if volume_id not in self.resource_creation_timestamps:
+            self.resource_creation_timestamps[volume_id] = datetime.datetime.now().timestamp()
+        timestamp = self.resource_creation_timestamps[volume_id]
+        creation_info = api_pb2.CreationInfo(created_at=timestamp, created_by=self.default_username)
+        volume_version = self.volumes[volume_id].version
+        metadata = api_pb2.VolumeMetadata(
+            name=request.deployment_name, creation_info=creation_info, version=volume_version
+        )
+        response = api_pb2.VolumeGetOrCreateResponse(volume_id=volume_id, version=volume_version, metadata=metadata)
+        await stream.send_message(response)
+
+    async def VolumeGetById(self, stream):
+        request: api_pb2.VolumeGetByIdRequest = await stream.recv_message()
+        # Look up the volume by ID
+        volume_name = None
+        for (name, _env), vid in self.deployed_volumes.items():
+            if vid == request.volume_id:
+                volume_name = name
+                break
+
+        if request.volume_id not in self.resource_creation_timestamps:
+            raise GRPCError(Status.NOT_FOUND, f"Volume {request.volume_id!r} not found")
+
+        timestamp = self.resource_creation_timestamps[request.volume_id]
+        creation_info = api_pb2.CreationInfo(created_at=timestamp, created_by=self.default_username)
+        volume_version = self.volumes[request.volume_id].version if request.volume_id in self.volumes else None
+        metadata = api_pb2.VolumeMetadata(name=volume_name or "", creation_info=creation_info, version=volume_version)
+        await stream.send_message(api_pb2.VolumeGetByIdResponse(volume_id=request.volume_id, metadata=metadata))
+
+    async def VolumeList(self, stream):
+        request: api_pb2.VolumeListRequest = await stream.recv_message()
+        volumes = []
+        environment = self.get_environment(request.environment_name)
+        for (name, environment_name), obj_id in self.deployed_volumes.items():
+            timestamp = self.resource_creation_timestamps[obj_id]
+            if environment_name != environment:
+                continue
+            elif timestamp >= request.pagination.created_before:
+                continue
+
+            creation_info = api_pb2.CreationInfo(created_at=timestamp, created_by=self.default_username)
+            volume_version = self.volumes[obj_id].version
+            metadata = api_pb2.VolumeMetadata(name=name, creation_info=creation_info, version=volume_version)
+            volumes.append(api_pb2.VolumeListItem(label=name, volume_id=obj_id, metadata=metadata))
+            if request.pagination.max_objects and len(volumes) >= request.pagination.max_objects:
+                break
+
+        volumes = sorted(volumes, key=lambda x: x.metadata.creation_info.created_at, reverse=True)
+        await stream.send_message(api_pb2.VolumeListResponse(items=volumes))
+
+    async def VolumeHeartbeat(self, stream):
+        await stream.recv_message()
+        self.n_vol_heartbeats += 1
+        await stream.send_message(Empty())
+
+    async def VolumeCommit(self, stream):
+        req = await stream.recv_message()
+        self.requests.append(req)
+        if not req.volume_id.startswith("vo-"):
+            raise GRPCError(Status.NOT_FOUND, f"invalid volume ID {req.volume_id}")
+        self.volume_commits[req.volume_id] += 1
+        await stream.send_message(api_pb2.VolumeCommitResponse(skip_reload=False))
+
+    async def VolumeDelete(self, stream):
+        req: api_pb2.VolumeDeleteRequest = await stream.recv_message()
+        self.volumes.pop(req.volume_id)
+        self.deployed_volumes = {k: vol_id for k, vol_id in self.deployed_volumes.items() if vol_id != req.volume_id}
+        await stream.send_message(Empty())
+
+    async def VolumeReload(self, stream):
+        req = await stream.recv_message()
+        self.requests.append(req)
+        self.volume_reloads[req.volume_id] += 1
+        await stream.send_message(Empty())
+
+    async def VolumeGetFile(self, stream):
+        req = await stream.recv_message()
+        if req.path not in self.volumes[req.volume_id].files:
+            raise GRPCError(Status.NOT_FOUND, "File not found")
+        vol_file = self.volumes[req.volume_id].files[req.path]
+        if vol_file.data_blob_id:
+            await stream.send_message(api_pb2.VolumeGetFileResponse(data_blob_id=vol_file.data_blob_id))
+        else:
+            size = len(vol_file.data)
+            if req.start or req.len:
+                start = req.start
+                len_ = req.len or len(vol_file.data)
+                await stream.send_message(
+                    api_pb2.VolumeGetFileResponse(data=vol_file.data[start : start + len_], size=size)
+                )
+            else:
+                await stream.send_message(api_pb2.VolumeGetFileResponse(data=vol_file.data, size=size))
+
+    async def VolumeGetFile2(self, stream):
+        req = await stream.recv_message()
+        if req.path not in self.volumes[req.volume_id].files:
+            raise GRPCError(Status.NOT_FOUND, "File not found")
+        vol_file = self.volumes[req.volume_id].files[req.path]
+        get_urls = []
+
+        def ceildiv(a: int, b: int) -> int:
+            return -(a // -b)
+
+        if vol_file.data_blob_id:
+            file_size = len(self.blobs[vol_file.data_blob_id])
+        else:
+            file_size = len(vol_file.data)
+
+        total_start = req.start
+        total_end = req.start + (req.len or file_size)
+
+        def slice_block(block_idx: int):
+            # Crude port of internal `blocks_for_byte_slice` algorithm:
+            slice_start = total_start % BLOCK_SIZE if block_idx == 0 else 0
+            slice_end = (
+                (((total_end - 1) % BLOCK_SIZE) + 1 if total_end > 0 else 0)
+                if block_idx == (block_end - block_start - 1)
+                else BLOCK_SIZE
+            )
+            return slice_start, slice_end
+
+        # Check if file was created using VolumePutFiles instead of VolumePutFiles2, which is supported since
+        # VolumePutFiles2 should support volumefs1 volumes now.
+        if vol_file.block_hashes is None:
+            block_start = min(total_start, file_size) // BLOCK_SIZE
+            block_end = ceildiv(min(total_end, file_size), BLOCK_SIZE)
+            assert vol_file.data_sha256_hex is not None
+
+            for idx in range(block_start, block_end):
+                start, end = slice_block(idx)
+                length = end - start
+                get_urls.append(
+                    f"{self.blob_host}/block/test-get-request:v1:{vol_file.data_sha256_hex}:{idx}:{start}:{length}"
+                )
+        else:
+            block_start = min(total_start // BLOCK_SIZE, len(vol_file.block_hashes))
+            block_end = min(ceildiv(total_end, BLOCK_SIZE), len(vol_file.block_hashes))
+            assert vol_file.data_blob_id is None
+
+            for idx, block_hash in enumerate(vol_file.block_hashes[block_start:block_end]):
+                start, end = slice_block(idx)
+                length = end - start
+                url = f"{self.blob_host}/block/test-get-request:v2:{block_hash.hex()}:{start}:{length}"
+                if req.client_pads_blocks:
+                    url += ":unpadded"
+                get_urls.append(url)
+
+        response = api_pb2.VolumeGetFile2Response(
+            get_urls=get_urls, size=len(vol_file.data), start=total_start, len=total_end - total_start
+        )
+        await stream.send_message(response)
+
+    async def VolumeRemoveFile(self, stream):
+        req = await stream.recv_message()
+        self._volume_remove_file(req)
+        await stream.send_message(Empty())
+
+    async def VolumeRemoveFile2(self, stream):
+        req = await stream.recv_message()
+        self._volume_remove_file(req)
+        await stream.send_message(Empty())
+
+    def _volume_remove_file(self, req: api_pb2.VolumeRemoveFileRequest | api_pb2.VolumeRemoveFile2Request):
+        if req.path not in self.volumes[req.volume_id].files:
+            raise GRPCError(Status.NOT_FOUND, "File not found")
+        del self.volumes[req.volume_id].files[req.path]
+
+    async def VolumeRename(self, stream):
+        req = await stream.recv_message()
+        for key, vol_id in self.deployed_volumes.items():
+            if vol_id == req.volume_id:
+                break
+        self.deployed_volumes[(req.name, *key[1:])] = self.deployed_volumes.pop(key)
+        await stream.send_message(Empty())
+
+    async def VolumeListFiles(self, stream):
+        req = await stream.recv_message()
+        await self._volume_list_files(stream, req, lambda entries: api_pb2.VolumeListFilesResponse(entries=entries))
+
+    async def VolumeListFiles2(self, stream):
+        req = await stream.recv_message()
+        await self._volume_list_files(stream, req, lambda entries: api_pb2.VolumeListFiles2Response(entries=entries))
+
+    async def _volume_list_files(
+        self,
+        stream,
+        req: api_pb2.VolumeListFilesRequest | api_pb2.VolumeListFiles2Request,
+        make_resp: Callable[
+            [list[api_pb2.FileEntry]], api_pb2.VolumeListFilesResponse | api_pb2.VolumeListFiles2Response
+        ],
+    ):
+        path = req.path if req.path else "/"
+        if path.startswith("/"):
+            path = path[1:]
+        if path.endswith("/"):
+            path = path[:-1]
+
+        found_file = False  # empty directory detection is not handled here!
+        for k, vol_file in self.volumes[req.volume_id].files.items():
+            if not path or k == path or (k.startswith(path + "/") and (req.recursive or "/" not in k[len(path) + 1 :])):
+                entry = api_pb2.FileEntry(
+                    path=k, type=api_pb2.FileEntry.FileType.FILE, size=len(vol_file.data), mtime=1_700_000_000
+                )
+                await stream.send_message(make_resp([entry]))
+                found_file = True
+
+        if path and not found_file:
+            raise GRPCError(Status.NOT_FOUND, "No such file")
+
+    async def VolumePutFiles(self, stream):
+        req = await stream.recv_message()
+        for file in req.files:
+            blob_data = self.files_sha2data[file.sha256_hex]
+
+            if file.filename in self.volumes[req.volume_id].files and req.disallow_overwrite_existing_files:
+                raise GRPCError(
+                    Status.ALREADY_EXISTS,
+                    (
+                        f"{file.filename}: already exists "
+                        f"(disallow_overwrite_existing_files={req.disallow_overwrite_existing_files}"
+                    ),
+                )
+
+            self.volumes[req.volume_id].files[file.filename] = VolumeFile(
+                data=blob_data["data"],
+                data_blob_id=blob_data["data_blob_id"],
+                data_sha256_hex=file.sha256_hex,
+                mode=file.mode,
+            )
+        await stream.send_message(Empty())
+
+    async def VolumePutFiles2(self, stream):
+        req = await stream.recv_message()
+        missing_blocks = []
+        files_to_create = {}
+
+        for file_index, file in enumerate(req.files):
+            if file.path in self.volumes[req.volume_id].files and req.disallow_overwrite_existing_files:
+                raise GRPCError(
+                    Status.ALREADY_EXISTS,
+                    (
+                        f"{file.path}: already exists "
+                        f"(disallow_overwrite_existing_files={req.disallow_overwrite_existing_files}"
+                    ),
+                )
+
+            blocks = []
+            block_hashes = []
+            file_missing_blocks = []
+
+            for block_index, block in enumerate(file.blocks):
+                block_hashes.append(block.contents_sha256)
+                actual_block_id = block.contents_sha256.hex()
+                block_data = self.blocks.get(actual_block_id)
+
+                # TODO(dflemstr): here, we assume that all blocks that the user uploads are always new; we could check
+                #  if the block blob already exists, and not generate a MissingBlock for those block blobs, but then it
+                #  would get trickier to validate the put_url response loop here...
+                put_response = block.put_response
+                if put_response:
+                    prefix = b"test-put-response:"
+                    expected_block_id = put_response[len(prefix) :].decode("utf-8")
+                    valid_put_response = put_response.startswith(prefix) and expected_block_id == actual_block_id
+                else:
+                    valid_put_response = False
+
+                if block_data is not None and valid_put_response:
+                    assert len(block_data) <= BLOCK_SIZE
+
+                    # `block_data` may be rstripped when gathering block digests.
+                    # Re-expand every block to its expected logical size.
+                    block_start = block_index * BLOCK_SIZE
+                    expected_block_len = min(BLOCK_SIZE, max(0, file.size - block_start))
+                    expanded_data = block_data.ljust(expected_block_len, b"\0")
+
+                    blocks.append(expanded_data)
+                else:
+                    missing_block = api_pb2.VolumePutFiles2Response.MissingBlock(
+                        file_index=file_index,
+                        block_index=block_index,
+                        put_url=f"{self.blob_host}/block/test-put-request",
+                    )
+                    file_missing_blocks.append(missing_block)
+
+            if file_missing_blocks:
+                missing_blocks.extend(file_missing_blocks)
+            else:
+                files_to_create[file.path] = VolumeFile(
+                    data=b"".join(blocks),
+                    data_blob_id=None,
+                    mode=file.mode,
+                    block_hashes=block_hashes,
+                )
+
+        if not missing_blocks:
+            self.volumes[req.volume_id].files.update(files_to_create)
+
+        await stream.send_message(api_pb2.VolumePutFiles2Response(missing_blocks=missing_blocks))
+
+    async def VolumeCopyFiles(self, stream):
+        req = await stream.recv_message()
+        self._copy_files(req)
+        await stream.send_message(Empty())
+
+    async def VolumeCopyFiles2(self, stream):
+        req = await stream.recv_message()
+        self._copy_files(req)
+        await stream.send_message(Empty())
+
+    def _copy_files(self, req):
+        for src_path in req.src_paths:
+            if src_path not in self.volumes[req.volume_id].files:
+                raise GRPCError(Status.NOT_FOUND, f"Source file not found: {src_path}")
+            src_file = self.volumes[req.volume_id].files[src_path]
+            if len(req.src_paths) > 1:
+                # check to make sure dst is a directory
+                if req.dst_path.endswith(("/", "\\")) or not os.path.splitext(os.path.basename(req.dst_path))[1]:
+                    dst_path = os.path.join(req.dst_path, os.path.basename(src_path))
+                else:
+                    raise GRPCError(Status.INVALID_ARGUMENT, f"{dst_path} is not a directory.")
+            else:
+                dst_path = req.dst_path
+            self.volumes[req.volume_id].files[dst_path] = src_file
+
+    async def AttemptStart(self, stream):
+        request: api_pb2.AttemptStartRequest = await stream.recv_message()
+        fn_definition = self.app_functions.get(request.function_id)
+
+        self.fcidx += 1
+        function_call_id = f"fc-{self.fcidx}"
+        input_id = f"in-{self.n_inputs}"
+        self.n_inputs += 1
+        self.add_function_call_input(function_call_id, request.input, input_id, 0)
+
+        retry_policy = fn_definition.retry_policy if fn_definition else None
+        # TODO(ryan): implement attempt token logic
+        await stream.send_message(
+            api_pb2.AttemptStartResponse(attempt_token="bogus_attempt_token", retry_policy=retry_policy)
+        )
+
+    async def AttemptAwait(self, stream):
+        self.attempt_await_count += 1
+        # TODO(dxia): implement attempt token logic
+
+        if len(self.attempt_await_responses) > 0:
+            await stream.send_message(self.attempt_await_responses.pop(0))
+            return
+
+        status = api_pb2.GenericResult.GENERIC_STATUS_SUCCESS
+
+        if self.function_call_inputs:
+            function_call_id = f"fc-{self.fcidx}"
+            (idx, input_id, retry_count), (args, kwargs) = self.function_call_inputs.pop(function_call_id)[0]
+            self.fcidx -= 1
+            try:
+                self.function_call_count += 1
+                self.function_call_result = self._function_body(*args, **kwargs)
+            except Exception as e:
+                self.function_call_result = e
+                status = api_pb2.GenericResult.GENERIC_STATUS_FAILURE
+        else:
+            input_id = "in-1"
+            idx = 0
+            retry_count = 0
+
+        await stream.send_message(
+            api_pb2.AttemptAwaitResponse(
+                output=api_pb2.FunctionGetOutputsItem(
+                    input_id=input_id,
+                    idx=idx,
+                    result=api_pb2.GenericResult(
+                        status=status,
+                        data=serialize_data_format(self.function_call_result, api_pb2.DATA_FORMAT_PICKLE),
+                    ),
+                    data_format=api_pb2.DATA_FORMAT_PICKLE,
+                    retry_count=retry_count,
+                )
+            )
+        )
+
+    async def AttemptRetry(self, stream):
+        request: api_pb2.AttemptRetryRequest = await stream.recv_message()
+
+        self.fcidx += 1
+        function_call_id = f"fc-{self.fcidx}"
+        input_id = f"in-{self.n_inputs}"
+        self.n_inputs += 1
+        self.add_function_call_input(function_call_id, request.input, input_id, 0)
+
+        await stream.send_message(api_pb2.AttemptRetryResponse(attempt_token=request.attempt_token))
+
+    async def MapStartOrContinue(self, stream):
+        request: api_pb2.MapStartOrContinueRequest = await stream.recv_message()
+
+        # If map_token is provided, this is a continue request, otherwise it's a start
+        if request.map_token:
+            map_token = request.map_token
+        else:
+            self.fcidx += 1
+            map_token = f"test-map-token:{self.fcidx}"
+            self.function_id_for_function_call[map_token] = request.function_id
+
+        # Process inputs and store them for MapAwait to pick up later
+        attempt_tokens = []
+        for item in request.items:
+            retry_count = 0
+            if item.attempt_token != "":
+                retry_count = int(item.attempt_token.split(":")[1]) + 1
+            attempt_tokens.append(f"bogus-attempt-token-{item.input.idx}:{retry_count}")
+            # Store inputs for MapAwait to process
+            input_id = f"in-{self.n_inputs}"
+            self.n_inputs += 1
+            self.add_function_call_input(map_token, item.input, input_id, retry_count)
+
+        # Get retry policy from function definition if available
+        fn_definition = self.app_functions.get(request.function_id)
+        retry_policy = fn_definition.retry_policy if fn_definition else None
+
+        # We don't send fcID since that is what the server will do eventually.
+        response = api_pb2.MapStartOrContinueResponse(
+            function_id=request.function_id,
+            map_token=map_token,
+            max_inputs_outstanding=1000,
+            attempt_tokens=attempt_tokens,
+            retry_policy=retry_policy,
+        )
+
+        # Inherited variable name from Python code PutInputs
+        if self.slow_put_inputs:
+            await asyncio.sleep(0.001)
+        await stream.send_message(response)
+
+    async def MapAwait(self, stream):
+        request: api_pb2.MapAwaitRequest = await stream.recv_message()
+        map_token = request.map_token
+
+        # Check if we have any function call inputs for this function call
+        fc_inputs = self.function_call_inputs.setdefault(map_token, [])
+        outputs = []
+
+        if fc_inputs and not self.function_is_running:
+            popidx = len(fc_inputs) // 2  # simulate that results don't always come in order
+            (idx, input_id, retry_count), (args, kwargs) = fc_inputs.pop(popidx)
+            output_exc = None
+            try:
+                res = self._function_body(*args, **kwargs)
+
+                if inspect.iscoroutine(res):
+                    result = await res
+                    result_data_format = api_pb2.DATA_FORMAT_PICKLE
+                elif inspect.isgenerator(res):
+                    count = 0
+                    for item in res:
+                        count += 1
+                        await self.fc_data_out[map_token].put(
+                            api_pb2.DataChunk(
+                                data_format=api_pb2.DATA_FORMAT_PICKLE,
+                                data=serialize_data_format(item, api_pb2.DATA_FORMAT_PICKLE),
+                                index=count,
+                            )
+                        )
+                    result = api_pb2.GeneratorDone(items_total=count)
+                    result_data_format = api_pb2.DATA_FORMAT_GENERATOR_DONE
+                else:
+                    result = res
+                    result_data_format = api_pb2.DATA_FORMAT_PICKLE
+            except Exception as exc:
+                serialized_exc = cloudpickle.dumps(exc)
+                result = api_pb2.GenericResult(
+                    status=self.failure_status,
+                    data=serialized_exc,
+                    exception=repr(exc),
+                    traceback="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                )
+                output_exc = api_pb2.FunctionGetOutputsItem(
+                    input_id=input_id,
+                    idx=idx,
+                    result=result,
+                    data_format=api_pb2.DATA_FORMAT_PICKLE,
+                    retry_count=retry_count,
+                )
+
+            if output_exc:
+                outputs.append(output_exc)
+            else:
+                serialized_data = serialize_data_format(result, result_data_format)
+                if self.use_blob_outputs:
+                    blob_id = await self.next_blob_id()
+                    self.blobs[blob_id] = serialized_data
+                    data_kwargs = {
+                        "data_blob_id": blob_id,
+                    }
+                else:
+                    data_kwargs = {"data": serialized_data}
+                outputs.append(
+                    api_pb2.FunctionGetOutputsItem(
+                        input_id=input_id,
+                        idx=idx,
+                        result=api_pb2.GenericResult(
+                            status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS, **data_kwargs
+                        ),
+                        data_format=result_data_format,
+                        retry_count=retry_count,
+                    )
+                )
+
+        else:
+            # wait for there to be at least one input, since that will allow a subsequent call to
+            # get the associated output using the above branch
+            if not len(fc_inputs):
+                try:
+                    await asyncio.wait_for(self.function_call_inputs_update_event.wait(), timeout=request.timeout)
+                except asyncio.TimeoutError:
+                    pass
+                self.function_call_inputs_update_event.clear()
+
+        response = api_pb2.MapAwaitResponse(outputs=outputs, last_entry_id=str(len(outputs)))
+        await stream.send_message(response)
+
+    async def MapCheckInputs(self, stream):
+        request: api_pb2.MapCheckInputsRequest = await stream.recv_message()
+
+        # For testing purposes, assume no inputs are lost unless specifically configured
+        # Return False (not lost) for all attempt tokens
+        lost = [False] * len(request.attempt_tokens)
+
+        await stream.send_message(api_pb2.MapCheckInputsResponse(lost=lost))
+
+    async def FlashContainerRegister(self, stream):
+        request: api_pb2.FlashContainerRegisterRequest = await stream.recv_message()
+        self.flash_container_registrations[request.service_name] = f"http://{request.host}:{request.port}"
+        self.flash_rpc_calls.append("register")
+        await stream.send_message(api_pb2.FlashContainerRegisterResponse(url=f"http://{request.host}:{request.port}"))
+
+    async def FlashContainerDeregister(self, stream):
+        request: api_pb2.FlashContainerDeregisterRequest = await stream.recv_message()
+        self.flash_container_registrations.pop(request.service_name, None)
+        self.flash_rpc_calls.append("deregister")
+        await stream.send_message(Empty())
+
+
+@contextlib.contextmanager
+def blob_server_factory():
+    """Utility context manager to create a blob server for testing. Yields (host, blobs, blocks, files_sha2data)."""
+    blobs = {}
+    blob_parts: dict[str, dict[int, bytes]] = defaultdict(dict)
+    blocks = {}
+    files_sha2data: dict[str, dict] = {}
+    flaky_blocks_served: set[str] = set()
+
+    async def upload(request):
+        blob_id = request.query["blob_id"]
+        content = await request.content.read()
+        if content == b"FAILURE":
+            return aiohttp.web.Response(status=500)
+        content_md5 = hashlib.md5(content).hexdigest()
+        etag = f'"{content_md5}"'
+        if "part_number" in request.query:
+            part_number = int(request.query["part_number"])
+            blob_parts[blob_id][part_number] = content
+        else:
+            blobs[blob_id] = content
+        return aiohttp.web.Response(text="Hello, world", headers={"ETag": etag})
+
+    async def complete_multipart(request):
+        blob_id = request.query["blob_id"]
+        blob_nums = range(min(blob_parts[blob_id].keys()), max(blob_parts[blob_id].keys()) + 1)
+        content = b""
+        part_hashes = b""
+        for num in blob_nums:
+            part_content = blob_parts[blob_id][num]
+            content += part_content
+            part_hashes += hashlib.md5(part_content).digest()
+
+        content_md5 = hashlib.md5(part_hashes).hexdigest()
+        etag = f'"{content_md5}-{len(blob_parts[blob_id])}"'
+        blobs[blob_id] = content
+        return aiohttp.web.Response(text=f"<etag>{etag}</etag>")
+
+    async def download(request):
+        blob_id = request.query["blob_id"]
+        if blob_id == "bl-failure":
+            return aiohttp.web.Response(status=500)
+        return aiohttp.web.Response(body=blobs[blob_id])
+
+    async def put_block(request):
+        token = request.match_info["token"]
+        if token != "test-put-request":
+            return aiohttp.web.Response(status=400, text="bad token")
+
+        content = await request.content.read()
+        if content == b"FAILURE":
+            return aiohttp.web.Response(status=500, text="simulated server error")
+
+        if len(content) > BLOCK_SIZE:
+            return aiohttp.web.Response(status=413, text="block too big")
+
+        block_id = hashlib.sha256(content).hexdigest()
+        blocks[block_id] = content
+        return aiohttp.web.Response(text=f"test-put-response:{block_id}")
+
+    async def get_block(request):
+        token = request.match_info["token"]
+
+        magic, version, *rest = token.split(":")
+        if magic != "test-get-request":
+            return aiohttp.web.Response(status=400, text="bad token")
+
+        # Special versions for testing HTTP error handling. The optional trailing delay
+        # lets a test fail one block while its siblings are still mid-download.
+        error_versions = {
+            "error-404": (404, "block not found"),
+            "error-500": (500, "internal server error"),
+            "error-503": (503, "service unavailable"),
+        }
+        if version in error_versions:
+            if rest and rest[0]:
+                await asyncio.sleep(float(rest[0]))
+            status, text = error_versions[version]
+            return aiohttp.web.Response(status=status, text=text)
+
+        if version == "error-drip":
+            # An error whose body keeps arriving, 1 KiB at a time, until the client gives up.
+            (delay,) = rest
+            response = aiohttp.web.StreamResponse(status=500)
+            await response.prepare(request)
+            try:
+                while True:
+                    await response.write(b"e" * 1024)
+                    await asyncio.sleep(float(delay))
+            except (ConnectionError, aiohttp.ClientConnectionError):
+                pass
+            return response
+        if version == "flaky":
+            # The first request for `key` serves a corrupted body of `length` bytes (with a
+            # digest that does not match); every later one serves the correct body.
+            key, byte, length = rest
+            body = bytes([int(byte)]) * int(length)
+            if key not in flaky_blocks_served:
+                flaky_blocks_served.add(key)
+                wrong = base64.b64encode(hashlib.sha256(b"something else").digest()).decode()
+                return aiohttp.web.Response(body=body[: len(body) // 2], headers={"Repr-Digest": f"sha-256=:{wrong}:"})
+            digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
+            return aiohttp.web.Response(body=body, headers={"Repr-Digest": f"sha-256=:{digest}:"})
+
+        if version == "stall":
+            # Accepts the request but never sends a response, until the client gives up.
+            (delay,) = rest
+            await asyncio.sleep(float(delay))
+            return aiohttp.web.Response(body=b"")
+        if version == "drip":
+            # Dribbles the body out one byte at a time, `delay` seconds apart. The body is
+            # shorter than a whole block, which is what a zero-trimmed block looks like.
+            byte, num_chunks, delay = rest
+            response = aiohttp.web.StreamResponse()
+            await response.prepare(request)
+            try:
+                for _ in range(int(num_chunks)):
+                    await response.write(bytes([int(byte)]))
+                    await asyncio.sleep(float(delay))
+            except (ConnectionError, aiohttp.ClientConnectionError):
+                pass
+            return response
+
+        headers = {}
+        if version == "bad-digest":
+            # A body whose advertised digest does not match its content.
+            (length,) = rest
+            body = b"x" * int(length)
+            wrong = base64.b64encode(hashlib.sha256(b"something else").digest()).decode()
+            return aiohttp.web.Response(body=body, headers={"Repr-Digest": f"sha-256=:{wrong}:"})
+        if version == "raw":
+            # A body of `length` copies of `byte`, with a matching digest, regardless of what was asked for.
+            byte, length = rest
+            body = bytes([int(byte)]) * int(length)
+            digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
+            return aiohttp.web.Response(body=body, headers={"Repr-Digest": f"sha-256=:{digest}:"})
+
+        if version == "v1":
+            file_sha256_hex, block_idx, start, length = rest
+            start = BLOCK_SIZE * int(block_idx) + int(start)
+            length = int(length)
+            file_data = files_sha2data[file_sha256_hex]
+            blob_id = file_data["data_blob_id"]
+            if blob_id:
+                body = blobs[blob_id][start : start + length]
+            else:
+                body = file_data["data"][start : start + length]
+        elif version == "v2":
+            block_id, start, length, *flags = rest
+            start = int(start)
+            length = int(length)
+            # Blocks are stored with their trailing zeros trimmed.
+            stored = blocks[block_id].rstrip(b"\0")
+            content = stored[start : start + length]
+            # A client that pads blocks itself gets those stored bytes only.
+            body = content if "unpadded" in flags else content.ljust(length, b"\0")
+            if body == stored:
+                # The body is the whole stored block and nothing else: advertise its digest.
+                encoded = base64.b64encode(hashlib.sha256(stored).digest()).decode()
+                headers["Repr-Digest"] = f"sha-256=:{encoded}:"
+        else:
+            return aiohttp.web.Response(status=404)
+
+        return aiohttp.web.Response(body=body, headers=headers)
+
+    app = aiohttp.web.Application()
+    app.add_routes([aiohttp.web.put("/upload", upload)])
+    app.add_routes([aiohttp.web.get("/download", download)])
+    app.add_routes([aiohttp.web.post("/complete_multipart", complete_multipart)])
+
+    # API used for volume version 2 blocks:
+    app.add_routes([aiohttp.web.get("/block/{token}", get_block)])
+    app.add_routes([aiohttp.web.put("/block/{token}", put_block)])
+
+    started = threading.Event()
+    stop_server = threading.Event()
+
+    host = None
+
+    def run_server_other_thread():
+        loop = asyncio.new_event_loop()
+
+        async def async_main():
+            nonlocal host
+            async with run_temporary_http_server(app) as _host:
+                host = _host
+                started.set()
+                await loop.run_in_executor(None, stop_server.wait)
+
+        loop.run_until_complete(async_main())
+
+        # clean up event loop
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
+
+    # run server on separate thread to not lock up the server event loop in case of blocking calls in tests
+    thread = threading.Thread(target=run_server_other_thread)
+    thread.start()
+    started.wait()
+    try:
+        yield host, blobs, blocks, files_sha2data
+    finally:
+        stop_server.set()
+        thread.join()
+
+
+@pytest.fixture
+def blob_server():
+    with blob_server_factory() as server:
+        yield server
+
+
+@contextlib.asynccontextmanager
+async def run_server(servicer, host=None, port=None, path=None, ssl_context=None):
+    server = None
+
+    async def _start_servicer():
+        nonlocal server
+        server = grpclib.server.Server([servicer], status_details_codec=custom_detail_codec)
+        listen(server, RecvRequest, servicer.recv_request)
+        # `path` starts a Unix socket server, in which case host/port must be unset.
+        # For TCP servers, port 0 asks the kernel to choose a free port atomically.
+        server_port = 0 if path is None and port is None else port
+        await server.start(host=host, port=server_port, path=path, ssl=ssl_context)
+        if path is not None:
+            return None
+        asyncio_server: Any = server._server
+        assert asyncio_server is not None
+        sockets = asyncio_server.sockets
+        assert sockets
+        return sockets[0].getsockname()[1]
+
+    async def _stop_servicer():
+        await servicer.cleanup()
+        assert server is not None
+        server.close()
+        # This is the proper way to close down the asyncio server,
+        # but it causes our tests to hang on 3.12+ because client connections
+        # for clients created through _Client.from_env don't get closed until
+        # asyncio event loop shutdown. Commenting out but perhaps revisit if we
+        # refactor the way that _Client cleanup happens.
+        # await server.wait_closed()
+
+    start_servicer = synchronize_api(_start_servicer)
+    stop_servicer = synchronize_api(_stop_servicer)
+
+    bound_port = await start_servicer.aio()
+    try:
+        yield bound_port
+    finally:
+        await stop_servicer.aio()
+
+
+@pytest.fixture(scope="function")
+def credentials():
+    token_id = "ak-" + str(uuid.uuid4())
+    token_secret = "as-" + str(uuid.uuid4())
+    return (token_id, token_secret)
+
+
+@contextlib.asynccontextmanager
+async def servicer_factory(blob_server, credentials):
+    """
+    Utility function to create a servicer for testing.
+    Returns an async context manager that yields a MockClientServicer.
+    """
+    blob_host, blobs, blocks, files_sha2data = blob_server
+    servicer = MockClientServicer(blob_host, blobs, blocks, files_sha2data, credentials)  # type: ignore
+    task_command_router = MockTaskCommandRouterServicer()
+    servicer.task_command_router = task_command_router
+
+    if platform.system() != "Windows":
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            temporary_sock_path = os.path.join(tmpdirname, "servicer.sock")
+            async with run_server(servicer, host="0.0.0.0") as client_port:
+                assert client_port is not None
+                async with run_server(servicer, path=temporary_sock_path):
+                    async with run_server(task_command_router, host="0.0.0.0") as task_command_router_port:
+                        assert task_command_router_port is not None
+                        servicer.client_addr = f"http://127.0.0.1:{client_port}"
+                        servicer.container_addr = f"unix://{temporary_sock_path}"
+                        servicer.task_command_router_url = f"http://127.0.0.1:{task_command_router_port}"
+                        yield servicer
+    else:
+        # Use a regular TCP socket for the container connection
+        async with run_server(servicer, host="0.0.0.0") as client_port:
+            assert client_port is not None
+            async with run_server(servicer, host="0.0.0.0") as container_port:
+                assert container_port is not None
+                async with run_server(task_command_router, host="0.0.0.0") as task_command_router_port:
+                    assert task_command_router_port is not None
+                    servicer.client_addr = f"http://127.0.0.1:{client_port}"
+                    servicer.container_addr = f"http://127.0.0.1:{container_port}"
+                    servicer.task_command_router_url = f"http://127.0.0.1:{task_command_router_port}"
+                    yield servicer
+
+
+@pytest_asyncio.fixture(scope="function")
+async def servicer(blob_server, credentials) -> AsyncGenerator[MockClientServicer, None]:
+    async with servicer_factory(blob_server, credentials) as s:
+        yield s
+
+
+@pytest_asyncio.fixture(scope="function")
+async def client(servicer: MockClientServicer, credentials: tuple[str, str]) -> AsyncGenerator[Client, None]:
+    async with Client(servicer.client_addr, api_pb2.CLIENT_TYPE_CLIENT, credentials) as client:
+        yield client
+
+
+@pytest_asyncio.fixture(scope="function")
+async def container_client(servicer):
+    async with Client(servicer.container_addr, api_pb2.CLIENT_TYPE_CONTAINER, None) as client:
+        yield client
+
+
+@pytest_asyncio.fixture(scope="function")
+async def server_url_env(servicer, monkeypatch):
+    monkeypatch.setenv("MODAL_SERVER_URL", servicer.client_addr)
+    yield
+
+
+@pytest_asyncio.fixture(scope="function")
+async def token_env(servicer, monkeypatch, credentials):
+    token_id, token_secret = credentials
+    monkeypatch.setenv("MODAL_TOKEN_ID", token_id)
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", token_secret)
+    yield
+
+
+@pytest_asyncio.fixture(scope="function")
+async def container_env(servicer, monkeypatch):
+    monkeypatch.setenv("MODAL_SERVER_URL", servicer.container_addr)
+    monkeypatch.setenv("MODAL_TASK_ID", "ta-123")
+    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
+    yield
+
+
+@pytest_asyncio.fixture(scope="function", autouse=True)
+async def reset_default_client():
+    Client._set_env_client(None)
+
+
+@pytest.fixture(name="mock_dir", scope="session")
+def mock_dir_factory():
+    """Sets up a temp dir with content as specified in a nested dict
+
+    Example usage:
+    spec = {
+        "foo": {
+            "bar.txt": "some content"
+        },
+    }
+
+    with mock_dir(spec) as root_dir:
+        assert os.path.exists(os.path.join(root_dir, "foo", "bar.txt"))
+    """
+
+    @contextlib.contextmanager
+    def mock_dir(root_spec):
+        def rec_make(dir, dir_spec):
+            for filename, spec in dir_spec.items():
+                path = os.path.join(dir, filename)
+                if isinstance(spec, str):
+                    with open(path, "w") as f:
+                        f.write(spec)
+                else:
+                    os.mkdir(path)
+                    rec_make(path, spec)
+
+        # Windows has issues cleaning up TempDirectory: https://www.scivision.dev/python-tempfile-permission-error-windows
+        # Seems to have been fixed for some python versions in https://github.com/python/cpython/pull/10320.
+        root_dir = tempfile.mkdtemp()
+        rec_make(root_dir, root_spec)
+        cwd = os.getcwd()
+        try:
+            os.chdir(root_dir)
+            yield root_dir
+        finally:
+            os.chdir(cwd)
+            shutil.rmtree(root_dir, ignore_errors=True)
+
+    return mock_dir
+
+
+@pytest.fixture(autouse=True)
+def reset_container_app():
+    try:
+        yield
+    finally:
+        _ContainerIOManager._reset_singleton()
+        _TaskLifecycleManager._reset_singleton()
+        _App._reset_container_app()
+
+
+@pytest.fixture
+def repo_root(request):
+    return Path(request.config.rootdir)
+
+
+@pytest.fixture(scope="module")
+def test_dir(request):
+    """Absolute path to directory containing test file."""
+    return Path(__file__).parent
+
+
+@pytest.fixture(scope="function")
+def modal_config():
+    """Return a context manager with a temporary modal.toml file"""
+
+    @contextlib.contextmanager
+    def mock_modal_toml(contents: str = "", show_on_error: bool = False):
+        # Some of the cli tests run within within the main process
+        # so we need to modify the config singletons to pick up any changes
+        orig_config_path_env = os.environ.get("MODAL_CONFIG_PATH")
+        orig_config_path = config.user_config_path
+        orig_profile = config._profile
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".toml", mode="w") as t:
+                t.write(textwrap.dedent(contents.strip("\n")))
+            os.environ["MODAL_CONFIG_PATH"] = t.name
+            config.user_config_path = t.name
+            config._user_config = config._read_user_config()
+            config._profile = config._config_active_profile()
+            yield t.name
+        except Exception:
+            if show_on_error:
+                with open(t.name) as f:
+                    print(f"Test config file contents:\n\n{f.read()}", file=sys.stderr)
+            raise
+        finally:
+            if orig_config_path_env:
+                os.environ["MODAL_CONFIG_PATH"] = orig_config_path_env
+            else:
+                del os.environ["MODAL_CONFIG_PATH"]
+            config.user_config_path = orig_config_path
+            config._user_config = config._read_user_config()
+            config._profile = orig_profile
+            os.remove(t.name)
+
+    return mock_modal_toml
+
+
+@pytest.fixture
+def supports_dir(test_dir):
+    return test_dir / Path("supports")
+
+
+@pytest_asyncio.fixture
+async def set_env_client(client):
+    try:
+        Client._set_env_client(client)
+        yield
+    finally:
+        Client._set_env_client(None)
+
+
+@pytest.fixture
+def no_rich(monkeypatch):
+    normal_import = __import__
+
+    def import_fail_for_rich(name: str, *args, **kwargs) -> ModuleType:
+        if name.startswith("rich"):
+            raise ModuleNotFoundError("No module named 'rich'")
+        else:
+            return normal_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_fail_for_rich)
+    yield
+
+
+@pytest.fixture()
+def supports_on_path(supports_dir, monkeypatch):
+    monkeypatch.syspath_prepend(str(supports_dir))
+
+
+def encode_input_jwt(idx: int, input_id: str, function_call_id: str, entry_id: str, retry_count: int) -> str:
+    """
+    Creates fake input jwt token.
+    """
+    assert str(idx) and input_id and function_call_id and entry_id
+    return DecodedJwt.encode_without_signature(
+        {
+            "idx": idx,
+            "input_id": input_id,
+            "function_call_id": function_call_id,
+            "entry_id": entry_id,
+            "retry_count": retry_count,
+        }
+    )
+
+
+def decode_input_jwt(input_jwt: str) -> tuple[int, str, str, str, int]:
+    """
+    Decodes fake input jwt. Returns idx, input_id, function_call_id, entry_id, retry_count.
+    """
+    decoded = DecodedJwt.decode_without_verification(input_jwt)
+    return (
+        decoded.payload["idx"],
+        decoded.payload["input_id"],
+        decoded.payload["function_call_id"],
+        decoded.payload["entry_id"],
+        decoded.payload["retry_count"],
+    )
+
+
+def encode_function_call_jwt(function_id: str, function_call_id: str) -> str:
+    """
+    Creates fake function call jwt.
+    """
+    assert function_id and function_call_id
+    return DecodedJwt.encode_without_signature({"function_id": function_id, "function_call_id": function_call_id})
+
+
+def decode_function_call_jwt(function_call_jwt: str) -> tuple[str, str]:
+    """
+    Decodes fake function call jwt. Returns function_id, function_call_id.
+    """
+    decoded = DecodedJwt.decode_without_verification(function_call_jwt)
+    return (decoded.payload["function_id"], decoded.payload["function_call_id"])
+
+
+@pytest.fixture
+def tmp_cwd(tmp_path, monkeypatch):
+    with monkeypatch.context() as m:
+        m.chdir(tmp_path)
+        yield
+
+
+@pytest.fixture
+def mock_webbrowser(monkeypatch):
+    from unittest.mock import MagicMock
+
+    def _mock_browser(success=True):
+        mock_browser = MagicMock()
+        mock_browser.open_new_tab = MagicMock(return_value=success)
+        mock_browser.name = "chrome"
+        mock_get = MagicMock(return_value=mock_browser)
+        monkeypatch.setattr("modal._utils.browser_utils.webbrowser.get", mock_get)
+        return mock_browser
+
+    return _mock_browser
+
+
+def run_cli_command(
+    args: list[str],
+    expected_exit_code: int = 0,
+    expected_stderr: str = "",
+    expected_error: str = "",
+    input: str | None = None,
+) -> click.testing.Result:
+    from importlib.metadata import version as get_version
+
+    from packaging.version import parse as parse_version
+
+    from modal import config as config_module
+    from modal.output import enable_output
+
+    if parse_version(get_version("click")) < parse_version("8.2"):
+        # mix_stderr=False is required to capture stderr separately in older Click versions
+        runner = click.testing.CliRunner(mix_stderr=False)  # type: ignore   # this will fail type checks on newer click
+    else:
+        # Click 8.2+ defaults to separate stderr capture
+        runner = click.testing.CliRunner()
+    # DEBUGGING TIP: this runs the CLI in a separate subprocess, and output from it is not echoed by default,
+    # including from the mock fixtures. Print res.stdout and res.stderr for debugging tests.
+    previous_env_profile = os.environ.get("MODAL_PROFILE")
+    previous_profile = config_module._profile
+    try:
+        with mock.patch.object(sys, "argv", args):
+            # Enable rich output during CLI tests, just like __main__.py does
+            with enable_output():
+                res = runner.invoke(entrypoint_cli, args, input=input)
+    finally:
+        if previous_env_profile is None:
+            os.environ.pop("MODAL_PROFILE", None)
+        else:
+            os.environ["MODAL_PROFILE"] = previous_env_profile
+        config_module._profile = previous_profile
+    if res.exit_code != expected_exit_code:
+        print("stdout:", repr(res.stdout))
+        print("stderr:", repr(res.stderr))
+        traceback.print_tb(res.exc_info[2])
+        print(res.exception, file=sys.stderr)
+        assert res.exit_code == expected_exit_code
+    if expected_stderr:
+        assert re.search(expected_stderr, res.stderr), "stderr does not match expected string"
+    if expected_error:
+        assert re.search(expected_error, str(res.exception)), "exception message does not match expected string"
+    return res
+
+
+@pytest.fixture
+def mock_shell_pty(servicer, monkeypatch):
+    shell_prompt = b"TEST_PROMPT# "
+    servicer.shell_prompt = shell_prompt
+    servicer.task_command_router.shell_prompt = shell_prompt
+
+    def mock_get_pty_info(shell: bool, no_terminate_on_idle_stdin: bool = False) -> api_pb2.PTYInfo:
+        rows, cols = (64, 128)
+        return api_pb2.PTYInfo(
+            enabled=True,
+            winsz_rows=rows,
+            winsz_cols=cols,
+            env_term=os.environ.get("TERM"),
+            env_colorterm=os.environ.get("COLORTERM"),
+            env_term_program=os.environ.get("TERM_PROGRAM"),
+            pty_type=api_pb2.PTYInfo.PTY_TYPE_SHELL,
+            no_terminate_on_idle_stdin=no_terminate_on_idle_stdin,
+        )
+
+    captured_out = []
+    fake_stdin = [b"echo foo\n", b"exit\n"]
+
+    async def write_to_fd(fd: int, data: bytes):
+        nonlocal captured_out
+        captured_out.append((fd, data))
+
+    @contextlib.asynccontextmanager
+    async def fake_stream_from_stdin(handle_input, use_raw_terminal=False):
+        async def _write():
+            message_index = 0
+            while True:
+                if message_index == len(fake_stdin):
+                    break
+                data = fake_stdin[message_index]
+                await handle_input(data, message_index)
+                message_index += 1
+
+        write_task = asyncio.create_task(_write())
+        yield
+        write_task.cancel()
+
+    with (
+        mock.patch("rich.console.Console.is_terminal", True),
+        mock.patch("modal._output.pty.get_pty_info", mock_get_pty_info),
+        mock.patch("modal.sandbox._sandbox.get_pty_info", mock_get_pty_info),
+        mock.patch("modal.sandbox._common.get_pty_info", mock_get_pty_info),
+        mock.patch("modal._utils.shell_utils.stream_from_stdin", fake_stream_from_stdin),
+        mock.patch("modal.container_process.stream_from_stdin", fake_stream_from_stdin),
+        mock.patch("modal.container_process.write_to_fd", write_to_fd),
+    ):
+        yield fake_stdin, captured_out
+
+
+@pytest.fixture
+def app_stats_response():
+    since = datetime.datetime(2026, 10, 19, 12, tzinfo=datetime.timezone.utc)
+    until = since + datetime.timedelta(hours=1)
+    response = api_pb2.AppGetTimeRangeStatsResponse(
+        functions=api_pb2.AppFunctionStatsGroup(
+            total=api_pb2.AppFunctionCounts(
+                calls=api_pb2.AppCallCounts(total=80, succeeded=75, failed=5),
+                containers=api_pb2.AppContainerCounts(container_errors=7, container_active_count=6),
+            ),
+            by_name={
+                "embed": api_pb2.AppFunctionStats(
+                    object_id="fu-embed",
+                    counts=api_pb2.AppFunctionCounts(
+                        calls=api_pb2.AppCallCounts(total=60, succeeded=57, failed=3),
+                        containers=api_pb2.AppContainerCounts(container_errors=1, container_active_count=4),
+                    ),
+                ),
+                "ingest": api_pb2.AppFunctionStats(
+                    object_id="fu-ingest",
+                    counts=api_pb2.AppFunctionCounts(
+                        calls=api_pb2.AppCallCounts(total=20, succeeded=18, failed=2),
+                        containers=api_pb2.AppContainerCounts(container_errors=3, container_active_count=2),
+                    ),
+                ),
+                "reindex": api_pb2.AppFunctionStats(
+                    object_id="fu-reindex",
+                    counts=api_pb2.AppFunctionCounts(containers=api_pb2.AppContainerCounts(container_errors=3)),
+                ),
+            },
+        ),
+        servers=api_pb2.AppServerStatsGroup(
+            total=api_pb2.AppServerCounts(
+                requests=api_pb2.AppRequestCounts(total=80, ok=78, failed=2),
+                containers=api_pb2.AppContainerCounts(container_errors=1, container_active_count=3),
+            ),
+            by_name={
+                "gateway": api_pb2.AppServerStats(
+                    object_id="fu-gateway",
+                    counts=api_pb2.AppServerCounts(
+                        requests=api_pb2.AppRequestCounts(total=80, ok=78, failed=2),
+                        containers=api_pb2.AppContainerCounts(container_errors=1, container_active_count=3),
+                    ),
+                ),
+            },
+        ),
+        sandboxes=api_pb2.AppSandboxCounts(total=7, finished=5, live=2),
+        lifecycle=api_pb2.AppLifecycle(
+            app_state=api_pb2.APP_STATE_DEPLOYED,
+            created_at=(since - datetime.timedelta(days=3)).timestamp(),
+            deployed_at=(since - datetime.timedelta(days=2)).timestamp(),
+            version=42,
+            created_by="creator",
+            deployed_by="publisher",
+        ),
+        deployment_count=2,
+    )
+    response.since.FromDatetime(since)
+    response.until.FromDatetime(until)
+    return response

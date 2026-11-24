@@ -1,0 +1,708 @@
+# Python SDK Release Notes
+
+## Latest
+
+### 1.6.4 (2026-11-11)
+
+This release introduces new CLI commands for working with external images, including support for no-code deployment:
+- The new [`modal server deploy`](/docs/cli/latest/server#modal-server-deploy) CLI deploys an App with an autoscaling Server directly from an image reference (i.e., a named Modal Image or a third-party registry URI). The only constraint is that the image should start an HTTP server that binds a specified port as part of its entrypoint.
+- The new [`modal image build`](/docs/cli/latest/image#modal-image-build) CLI builds an Image from a local Dockerfile and publishes it as a [named Modal Image](/docs/guide/named-images) for reference by other Modal Apps. Note that Dockerfile builds are subject to [some limitations](/docs/guide/existing-images).
+- The new [`modal image pull`](/docs/cli/latest/image#modal-image-pull) CLI pulls an Image from a third-party registry and publishes it as a named Modal Image.
+- Image names can now be deleted with the [`modal image names delete`](/docs/cli/latest/image#modal-image-names-delete) CLI. This removes the name association but does not delete the underlying Image.
+
+It's now easier to manage API tokens:
+- The new [`Workspace.member_tokens.disable()`](/docs/sdk/py/latest/Workspace#member_tokensdisable) method and [`modal workspace member-tokens disable`](/docs/cli/latest/workspace#modal-workspace-member-tokens-disable) CLI can be used to disable tokens instead of hard-deleting them, including quickly disabling `--all` tokens in the Workspace. There is a corresponding method and CLI command for re-enabling specific tokens.
+- The new [`modal token rotate`](/docs/cli/latest/token#modal-token-rotate) CLI creates a token and deletes the one in the active profile.
+
+This release includes several other new features, enhancements, and fixes:
+- The new [`App.stats()`](/docs/sdk/py/latest/App#stats) method and [`modal app stats`](/docs/cli/latest/app#modal-app-stats) CLI report high-level Function, Server, and Sandbox stats for an App.
+- It's also possible to query Sandbox-specific stats, including costs, via the new [`App.sandboxes.stats()`](/docs/sdk/py/latest/App#sandboxesstats) method. This method supports flexible aggregation based on Sandbox tags.
+- The [`App.lookup()`](/docs/sdk/py/latest/App#lookup) method now accepts an App ID, which makes it possible to get a handle to a running ephemeral App or any stopped App.
+- The [`Function.from_id()`](/docs/sdk/py/latest/Function#from_id) method now accepts a `fu-` ID corresponding to a Modal Cls. The resulting object supports observability and autoscaling APIs; use [`Cls.from_name()`](/docs/sdk/py/latest/Cls#from_name) to invoke methods on the Cls.
+- The [`Image.build()`](/docs/sdk/py/latest/Image#build) method can now be called without providing an App, which creates an ephemeral App for running the build.
+- When working directly with a [`modal.Client`](/docs/sdk/py/latest/Client) instance, you can now call [`Client.close()`](/docs/sdk/py/latest/Client#close) (or use the [`Client.from_credentials()`](/docs/sdk/py/latest/Client#from_credentials) constructor as a context manager) to clean up resources and avoid memory leaks.
+- It's now possible to set custom autoscaling parameters in [`modal endpoint create`](/docs/cli/latest/endpoint#modal-endpoint-create).
+- The new [`modal endpoint library`](/docs/cli/latest/endpoint#modal-endpoint-library) CLI lists the models that can be served with Modal Endpoints.
+- Secret values are now reloaded when a Function restores from a [memory snapshot](/docs/guide/memory-snapshots).
+- We've improved handling in some Image APIs for nested quotes, which could previously produce broken Images.
+- Sandboxes no longer set the `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `BLIS_NUM_THREADS`, `ORT_INTRA_OP_NUM_THREADS`, and `ORT_INTER_OP_NUM_THREADS` environment variables by default. Inside the Sandbox, the visible CPU count will correspond to the CPU limit.
+- Modal now issues deprecation warnings when specifying an Image with Python 3.10. Python 3.10 is end-of-life, and the Modal SDK will discontinue support as of 1.7.0.
+
+### 1.6.3 (2026-10-27)
+
+This release includes a new [Image Builder version](/docs/guide/images#image-builder-updates), `2026.10`. After upgrading your SDK, opt into the new Image Builder in your [Workspace](/settings/image-builder-version) or [Environment](/settings/workspace-management/environments/all) settings. We recommend using the latest version for security updates and performance enhancements:
+- The new version includes updates to base Debian images, Python versions, and the Modal dependencies that are automatically included in Function containers.
+- In [`Image.from_dockerfile()`](/docs/sdk/py/latest/Image#from_dockerfile), the `FROM` instruction will be cached independently in a separate Modal Image layer and reused for subsequent builds that share the base image. This optimization only applies when the Dockerfile has a single stage and no instructions or parser directives preceding `FROM`. When caching the `FROM` instruction separately, any comments or whitespace preceding it will also be ignored.
+- In [`Image.from_registry()`](/docs/sdk/py/latest/Image#from_registry), the optional Python distribution (`add_python=`) will be added in a separate layer so that the Python version can be changed without invalidating the base layer cache.
+
+This release includes several additional updates, including Image enhancements that apply across Image Builder versions:
+- The [`Image.from_registry()`](/docs/sdk/py/latest/Image#from_registry) constructor can now be used to pull an image from AWS ECR or GCP Artifact Registry when the `secret=` keys correspond to appropriate credentials. We recommend using this instead of the separate `Image.from_aws_ecr()` and `Image.from_gcp_artifact_registry()` constructors.
+- The [`Image.from_dockerfile()`](/docs/sdk/py/latest/Image#from_dockerfile) constructor can now be provided with a `registry_secret=` to pull a private base image. Currently, this feature is limited to single-stage Dockerfile recipes.
+- Apps can now be programmatically stopped using the [`App.stop()`](/docs/sdk/py/latest/App#stop) method.
+- [Shared Endpoints](/docs/guide/shared-endpoints) can now be created from the CLI by passing `--shared` to [`modal endpoint create`](/docs/cli/latest/endpoint#modal-endpoint-create).
+- Environment-level Image Builder versions can now be configured via the [`modal environment update`](/docs/cli/latest/environment#modal-environment-update) CLI with `--set-image-builder-version`.
+- The [`Workspace.member_tokens`](/docs/sdk/py/latest/Workspace#member_tokens) SDK namespace and [`modal workspace member-tokens`](/docs/cli/latest/workspace#modal-workspace-member-tokens) CLI now let you list and delete tokens associated with Workspace members.
+- The [`Image.from_dockerfile()`](/docs/sdk/py/latest/Image#from_dockerfile) constructor now respects `force_build=True` to invalidate the build cache keyed by that Dockerfile.
+
+### 1.6.2 (2026-10-15)
+
+- The new `metrics` observability surface provides a flexible query interface for fetching detailed time-resolved data about performance and resource consumption:
+  - Use the new [`modal function metrics`](/docs/cli/latest/function#modal-function-metrics) / [`modal server metrics`](/docs/cli/latest/server#modal-server-metrics) CLIs to export metrics to JSON or CSV.
+  - Use methods in the new [`Function.metrics`](/docs/sdk/py/latest/Function#metrics) / [`Server.metrics`](/docs/sdk/py/latest/Server#metrics) namespaces to operate on metrics in code.
+- It's now possible to programmatically manage [Service Users](/docs/guide/service-users):
+  - Use the new [`modal workspace service-users`](/docs/cli/latest/workspace#modal-workspace-service-users) CLI to create, inspect, delete, and update the roles of Service Users.
+  - Use methods in the new [`Workspace.service_users`](/docs/sdk/py/latest/Workspace#service_users) namespace to perform the same operations in code.
+- We've increased the feature set around autoscaling configuration:
+  - The new [`Function.autoscaler.settings()`](/docs/sdk/py/latest/Function#autoscalersettings) / [`Server.autoscaler.settings()`](/docs/sdk/py/latest/Server#autoscaler) methods report the current configuration with provenance for any overrides that are in effect.
+  - The new [`Function.autoscaler.update()`](/docs/sdk/py/latest/Function#autoscalerupdate) / [`Server.autoscaler.update()`](/docs/sdk/py/latest/Server#autoscaler) methods replace the existing `.update_autoscaler()` methods, which are now deprecated.
+  - Use commands in the new [`modal function autoscaler`](/docs/cli/latest/function#modal-function-autoscaler) / [`modal server autoscaler`](/docs/cli/latest/server#modal-server-autoscaler) groups to query or update the autoscaler configuration from the command line.
+- The [`modal function calls`](/docs/cli/latest/function#modal-function-calls) and [`modal server requests`](/docs/cli/latest/server#modal-server-requests) CLI commands now support `--since` and `--until` filters for fetching historical data.
+- The Modal SDK now supports Python 3.15. Of note, the new [lazy import](https://peps.python.org/pep-0810/) syntax makes it easier to use third-party libraries that are not available locally or in all remote Images.
+- The [`Sandbox.from_name()`](/docs/sdk/py/latest/Sandbox#from_name) method will now return the most recently-terminated Sandbox that used the name (if it has not been claimed since) with `include_terminated=True`.
+- The [`modal run`](/docs/cli/latest/run) CLI can now read a script from stdin when passed as `-`, e.g. `modal run - <<'EOF'` followed by an inlined script. The App must have a single local entrypoint or, otherwise, a single Function.
+- Writes through the [`Sandbox.filesystem`](/docs/sdk/py/latest/Sandbox#filesystem) methods are now even more performant.
+
+### 1.6.1 (2026-10-03)
+
+- We've added CLI commands for observability over Modal Endpoints:
+  - [`modal endpoint info`](/docs/cli/latest/endpoint#modal-endpoint-info) displays basic metadata.
+  - [`modal endpoint stats`](/docs/cli/latest/endpoint#modal-endpoint-stats) reports aggregate performance metrics.
+  - [`modal endpoint logs`](/docs/cli/latest/endpoint#modal-endpoint-logs) fetches or streams logs.
+- The [`modal function stats`](/docs/cli/latest/function#modal-function-stats) and [`modal server stats`](/docs/cli/latest/server#modal-server-stats) commands (along with the [`Function.stats()`](/docs/sdk/py/latest/Function#stats) and [`Server.stats()`](/docs/sdk/py/latest/Server#stats) methods) now include a `container_total_count` value, reporting the number of containers that were live at any point in the interval.
+- The [`Server.sessions.start()`](/docs/sdk/py/latest/Server#sessionsstart) method will now wait up to 25 minutes if no container is available to place the session. Add timeouts in user code where queuing is not desired.
+
+### 1.6.0 (2026-09-28)
+
+Sandboxes now use our [next-generation backend](/blog/scaling-to-1-million-concurrent-sandboxes-in-seconds), affording substantially higher creation rates and concurrency limits for CPU Sandboxes. No code changes are required, but there are some semantic differences to be aware of:
+- The [`modal.Sandbox.create()`](/docs/sdk/py/latest/Sandbox#create) method now blocks until the Sandbox is scheduled instead of returning immediately.
+- If a Sandbox is unable to be scheduled (e.g. due to unsatisfiable resource or placement requests), creation will time out and raise a [`ResourceExhaustedError`](/docs/sdk/py/latest/exception#resourceexhaustederror).
+
+Functions and Servers can now run on [ephemeral multi-node clusters](/docs/guide/multi-node-clusters) for large-scale training or inference workloads:
+- Add the [`@modal.clustered()`](/docs/sdk/py/latest/clustered) decorator to your function or class.
+- Use the new [`modal.Cluster`](/docs/sdk/py/latest/Cluster) object within each process to determine the rank and private IPs of containers in the cluster.
+
+Servers now support sticky sessions with strong affinity guarantees, which is useful for workloads that require WebSockets to connect or reconnect to the same container:
+- Add the [`@modal.sessioned()`](/docs/sdk/py/latest/sessioned) decorator to the class defining the Server.
+- Use the new [`Server.sessions.start()`](/docs/sdk/py/latest/Server#sessionsstart) method to retrieve a token that you can pass in a `Modal-Authorization` header.
+- Use the new [`Server.sessions.terminate()`](/docs/sdk/py/latest/Server#sessionsterminate) method to terminate a session, or else it will remain active until its idle timeout.
+
+The CLI and SDK have a number of new features to support programmatic observability, oriented towards both coding agents and scalable scripted workflows:
+- We've added [`modal function`](/docs/cli/latest/function) and [`modal server`](/docs/cli/latest/server) CLI surfaces for inspecting specific Function or Server entities. Commands include `info`, `stats`, `logs`, and `calls`/`requests`.
+- We've added corresponding methods to the [`modal.Function`](/docs/sdk/py/latest/Function) and [`modal.Server`](/docs/sdk/py/latest/Server) objects in the SDK.
+- Apps can also be inspected using the new [`modal app info`](/docs/cli/latest/app#modal-app-info) CLI and [`modal.App.info()`](/docs/sdk/py/latest/App#info) method.
+- The "variants" of a Function (i.e. specific parameterizations or dynamic configurations) can be listed via the [`modal function variants`](/docs/cli/latest/function#modal-function-variants) CLI.
+
+Sandboxes can now use a full virtual machine as the runtime, providing better support for workflows like running Docker:
+- Set `runtime="vm"` in [`modal.Sandbox.create()`](/docs/sdk/py/latest/Sandbox#create) to enable.
+- To force continued use of the gVisor runtime, set `runtime="gvisor"`. This is the current default behavior, but the default may change in the future.
+- The [`modal shell`](/docs/cli/latest/shell) command also now supports a `--runtime` option.
+
+This release includes numerous other enhancements:
+- It's now possible to set a strict concurrency limit on a Server by setting `max_concurrency=` in the [`@app.server()`](/docs/sdk/py/latest/App#server) decorator. Requests will be rejected with a 503 status when a Server is at its limit.
+- A client's connection to a Sandbox is now dropped automatically after a period of inactivity and reconnected if the Sandbox is used again. This makes [`Sandbox.detach()`](/docs/sdk/py/latest/Sandbox#detach) optional.
+- You can now programmatically list Apps via the [`modal.Environment.apps.list()`](/docs/sdk/py/latest/Environment#appslist) method.
+- The [`modal token new`](/docs/cli/latest/token#modal-token-new) CLI now supports `--expires-in` to set a TTL for the token.
+- Proxy tokens can now be named via [`modal workspace proxy-tokens`](/docs/cli/latest/workspace#modal-workspace-proxy-tokens) or [`modal.Workspace.proxy_tokens`](/docs/sdk/py/latest/Workspace#proxy_tokens).
+- The [`modal app list`](/docs/cli/latest/app#modal-app-list) CLI now orders Apps by recency and supports a `--limit` option.
+- The [`FunctionCall.get_call_graph()`](/docs/sdk/py/latest/FunctionCall#get_call_graph) method now returns up to 5,000 nodes (previously 100).
+- Large file downloads via the [`modal volume`](/docs/cli/latest/volume) CLI are now more resilient to transient errors.
+
+Finally, we've made a small number of breaking changes:
+- Classes decorated with [`@app.cls()`](/docs/sdk/py/latest/App#cls) can no longer define a custom `__init__` constructor. Use [`modal.parameter()`](/docs/sdk/py/latest/parameter) for [parameters](/docs/guide/parametrized-functions) and [`@modal.enter()`](/docs/sdk/py/latest/enter) for initialization logic.
+- We've removed legacy APIs for interacting with a Sandbox's filesystem, including `Sandbox.open()`, `Sandbox.ls()`, `Sandbox.mkdir()`, `Sandbox.rm()`, `Sandbox.watch()`, the `modal.file_io.FileIO` type, and the `modal.exception.FilesystemExecutionError` exception. Use the [`Sandbox.filesystem`](/docs/sdk/py/latest/Sandbox#filesystem) APIs instead.
+- We've removed the experimental `modal bootstrap` CLI; use [`modal endpoint create`](/docs/cli/latest/endpoint#modal-endpoint-create) to quickly stand up production-ready endpoints.
+- We've removed several undocumented properties and methods that had no intended user-facing functionality.
+- We've made minor changes to JSON output in the CLI:
+  - [`modal volume ls`](/docs/cli/latest/volume#modal-volume-ls) now shows `created_modified` as an ISO 8601 timestamp and `size` as an integer number of bytes.
+  - [`modal queue list`](/docs/cli/latest/queue#modal-queue-list) now shows `partitions` and `total_size` as integers and includes a boolean `total_size_truncated` field.
+
+## 1.5
+
+### 1.5.5 (2026-08-28)
+
+- We've added a [`modal.Sandbox.logs`](/docs/sdk/py/latest/Sandbox#logs) API, allowing you to `fetch()` logs from a specific date/time range or to `tail()` the most recent logs. Note that only logs from the entrypoint process of a Sandbox are currently stored, and streaming logs via this interface is not currently supported.
+- It's now possible to configure the default role when creating a new Restricted Environment via the CLI or SDK. See the [RBAC Guide](https://modal.com/docs/guide/rbac) for more details on default environment roles.
+- The `modal` CLI now accepts a global `--profile` option for simpler ad hoc profile selection.
+- We are deprecating a number of undocumented APIs on object types in the Modal SDK. These APIs have no intended user-facing functionality and will be removed in version 1.6.0. To be safe, check for deprecation warnings on this version before upgrading.
+
+
+### 1.5.4 (2026-08-12)
+
+With this release, it's now possible to opt into a [more performant Sandbox backend](/blog/scaling-to-1-million-concurrent-sandboxes-in-seconds), which affords substantially higher creation rates and concurrency. Set `MODAL_SANDBOX_V2=1` as an environment variable and your Sandboxes will use this new system without any code changes. This will become the default behavior in version 1.6.0 of the Python SDK. Note that the new backend does not support the deprecated FileIO-based Sandbox filesystem API; please [migrate](/docs/guide/migrate-sandbox-filesystem) any code that is currently issuing deprecation warnings before enabling the feature flag.
+
+- We've added logs APIs to the `modal.App` and `modal.Image` objects:
+  - The [`App.logs`](/docs/sdk/py/latest/App#logs) API allows you to `fetch()`, `tail()`, or `stream()` all logs from an App.
+  - The [`Image.logs`](/docs/sdk/py/latest/Image#logs) API supports `fetch()` and `tail()` on Image build logs. Streaming build logs is not supported at this time.
+- We've also added a [`modal image logs`](/docs/cli/latest/image#modal-image-logs) CLI command with equivalent functionality.
+- We now support querying basic information about your Workspace's current pricing structure via the [`Workspace.billing.rates()`](/docs/sdk/py/latest/Workspace#billingrates) API and [`modal billing rates`](/docs/cli/latest/billing#modal-billing-rates) CLI.
+- The [`Function.update_autoscaler()`](/docs/sdk/py/latest/Function#update_autoscaler) and [`Server.update_autoscaler()`](/docs/sdk/py/latest/Server#update_autoscaler) methods now return the complete state of the autoscaler configuration after applying the update.
+- The `target_concurrency` parameter in [`@app.server()`](/docs/sdk/py/latest/App#server) and [`Server.update_autoscaler()`](/docs/sdk/py/latest/Server#update_autoscaler) now supports fractional values for more fine-grained control over autoscaling behavior.
+
+### 1.5.3 (2026-07-23)
+
+- We've added new APIs for programmatically retrieving logs on several object types: [`Function`](/docs/sdk/py/latest/Function#logs), [`Server`](/docs/sdk/py/latest/Server#logs), and [`FunctionCall`](/docs/sdk/py/latest/FunctionCall#logs). Each object exposes three different methods, allowing you to `stream()` logs as they are generated, `fetch()` logs from a specific date/time range, or `tail()` the most recent logs.
+- It's now possible to retrieve a summary of billing information across billing cycles:
+  - Use the [`modal.Workspace.billing.summary()`](/docs/sdk/py/latest/Workspace#billingsummary) method or the [`modal billing summary`](/docs/cli/latest/billing#modal-billing-summary) CLI to see workspace-level spend (broken down by category), credit usage, and the impact of any compute reservations.
+  - Use the [`modal.Environment.billing.summary()`](/docs/sdk/py/latest/Environment#billingsummary) method or the [`modal environment billing summary`](/docs/cli/latest/environment#modal-environment-billing-summary) CLI to see environment-level spend.
+- We've made some changes to the interfaces for managing [RBAC](/docs/guide/rbac) permissions:
+  - We now explicitly represent all workspace member and service user roles in each Environment instead of having separate concepts for Environment membership and role.
+  - We've accordingly introduced a [`modal.Environment.roles`](/docs/sdk/py/latest/Environment#roles) interface (and [`modal environment roles`](/docs/cli/latest/environment#modal-environment-roles) CLI), replacing the `modal.Environment.members` interface and `modal environment members` CLI, which are now deprecated.
+- It's now possible to specify one or more `--compute-region` options in [`modal endpoint create`](/docs/cli/latest/endpoint#modal-endpoint-create) to configure the region where Endpoint containers run.
+- We've improved performance for large writes by ≈2.5x in several Sandbox filesystem methods ([`copy_from_local()`](/docs/sdk/py/latest/Sandbox#filesystemcopy_from_local), [`write_bytes()`](/docs/sdk/py/latest/Sandbox#filesystemwrite_bytes), and [`write_text()`](/docs/sdk/py/latest/Sandbox#filesystemwrite_text)).
+
+### 1.5.2 (2026-07-10)
+
+- We've added new interfaces for programmatic management of workspace settings:
+  - Use the [`modal.Workspace.settings.list()`](/docs/sdk/py/latest/Workspace#settingslist) method or [`modal workspace settings list`](/docs/cli/latest/workspace#modal-workspace-settings-list) CLI to see current workspace-level settings.
+  - Use the [`modal.Workspace.settings.set()`](/docs/sdk/py/latest/Workspace#settingsset) method or [`modal workspace settings set`](/docs/cli/latest/workspace#modal-workspace-settings-set) CLI to configure new values.
+- We've added a [`modal.types`](/docs/sdk/py/latest/types) module for exposing dataclasses returned from public methods as public API. The types in this module are not typically constructed by user code, but it may be useful to reference them for, e.g., adding type annotations to code that wraps the relevant Modal API.
+- The [`modal.Function.with_options()`](/docs/sdk/py/latest/Function#with_options) method now accepts a `routing_region` argument to dynamically configure [regional routing](/docs/guide/region-selection#regional-routing) at the time of invocation.
+- The [`modal container stop`](/docs/cli/latest/container#modal-container-stop) CLI now accepts a `--graceful` flag. With it, the container stops fetching new inputs but finishes the inputs it is currently running before exiting, instead of having them cancelled and rescheduled. Graceful stops are only supported for containers running a Modal Function or Modal Server.
+- The [`modal container logs`](/docs/cli/latest/container#modal-container-logs) CLI now includes logs from the startup phase of the container.
+- The [`modal.Workspace.members.list()`](/docs/sdk/py/latest/Workspace#memberslist) method now uses `"member"` instead of `"user"` for the lowest-privilege Workspace role, matching the UI and documentation.
+- The [`modal.Sandbox.reload_volumes()`](/docs/sdk/py/latest/Sandbox#reload_volumes) method now blocks until the Volumes have been reloaded, bounded by a new `timeout` argument (55 seconds by default). If the reload does not complete within `timeout`, [`modal.exception.TimeoutError`](/docs/sdk/py/latest/exception#timeouterror) is raised.
+
+### 1.5.1 (2026-06-23)
+
+This release includes several major new features, including the debut of a new serverless compute primitive for low-latency HTTP applications ([`@app.server()`](/docs/sdk/py/latest/App#server)) and a new CLI for deploying production-ready LLM inference endpoints with minimal configuration ([`modal endpoint`](/docs/cli/latest/endpoint)).
+
+- We're introducing a new [`@app.server()`](/docs/sdk/py/latest/App#server) decorator (and [`modal.Server`](/docs/sdk/py/latest/Server) object), representing a serverless compute primitive that shares many features with Modal Functions while being optimized for serving HTTP-based applications with ultra-low latency. Read the [guide](/docs/guide/servers) for more information.
+- We're also introducing the [`modal endpoint`](/docs/cli/latest/endpoint) CLI, providing programmatic access to our new [Endpoints](/docs/guide/endpoints) product. Endpoints let you deploy production-ready LLM inference servers with minimal configuration.
+- We've added several new SDK features for workspace configuration and observability:
+  - We've added new billing API methods on the [`modal.Workspace`](/docs/sdk/py/latest/Workspace) and [`modal.Environment`](/docs/sdk/py/latest/Environment) objects ([`workspace.billing.report()`](/docs/sdk/py/latest/Workspace#billingreport) and [`environment.billing.report()`](/docs/sdk/py/latest/Environment#billingreport), respectively). The new APIs include a resource-level cost breakdown (CPU, memory, and specific GPU types). We've also added a [`modal environment billing`](/docs/cli/latest/environment#modal-environment-billing) CLI for generating environment-scoped billing reports. The new workspace-level API replaces the existing [`modal.billing.workspace_billing_report`](/docs/sdk/py/latest/billing#workspace_billing_report) function.
+  - We've added support for creating and managing [proxy tokens](/docs/guide/webhook-proxy-auth) via the [`modal.Workspace`](/docs/sdk/py/latest/Workspace) object ([`workspace.proxy_tokens.create()`](/docs/sdk/py/latest/Workspace#proxy_tokenscreate), [`workspace.proxy_tokens.list()`](/docs/sdk/py/latest/Workspace#proxy_tokenslist), etc.) and a new [`modal workspace proxy-tokens`](/docs/cli/latest/workspace#modal-workspace-proxy-tokens) CLI. Modal Servers and Endpoints are authenticated via proxy tokens by default.
+  - We've added a new [`modal workspace members`](/docs/cli/latest/workspace#modal-workspace-members) CLI for querying information about workspace membership.
+- The new [`modal curl`](/docs/cli/latest/curl) CLI command allows you to make requests to authenticated endpoints without explicitly passing proxy token headers. This is an experimental feature and may change in the future.
+- The [`modal app rollback`](/docs/cli/latest/app#modal-app-rollback) command now accepts a `--strategy` (`rolling` or `recreate`), like [`modal deploy`](/docs/cli/latest/deploy) and [`modal app rollover`](/docs/cli/latest/app#modal-app-rollover).
+- Sandbox connect tokens can now be scoped to a custom port ([`modal.Sandbox.create_connect_token(port=...)`](/docs/sdk/py/latest/Sandbox#create_connect_token)).
+- It is now possible to call [`image.publish()`](/docs/sdk/py/latest/Image#publish) on an Image constructed using [`modal.Image.from_id()`](/docs/sdk/py/latest/Image#from_id) without first calling [`image.build()`](/docs/sdk/py/latest/Image#build).
+- The Modal Python client now respects standard environment variables for HTTP CONNECT and SOCKS4/5 proxies (`HTTPS_PROXY` and `ALL_PROXY`). Proxy support requires installing extra dependencies, i.e. using `uv pip install 'modal[api-proxy-support]'`. To opt out of proxy support, set `MODAL_DISABLE_API_PROXY=1` or put `disable_api_proxy = true` in your `.modal.toml` profile.
+
+### 1.5.0 (2026-06-09)
+
+This is a major release that includes several new features ([named Images](/docs/guide/named-images), version-pinned Function lookups, [Sandbox domain allowlists](/docs/guide/sandbox-networking)), a new [`modal skills`](/docs/cli/latest/skills) CLI, and a small number of breaking changes.
+
+- We're introducing a "named Image" concept, akin to a Modal-native Image registry. This feature allows you to decouple Image builds from App deployment or Sandbox creation, and it simplifies the process of sharing a canonical Image across a large number of unrelated Apps.
+  - The new SDK method [`modal.Image.publish()`](/docs/sdk/py/latest/Image#publish) assigns a name to an existing Image. Names can optionally include a "tag" suffix (`"{name}:{tag}"`) to specify variants of an Image, e.g. to apply a versioning system.
+  - The new SDK method [`modal.Image.from_name()`](/docs/sdk/py/latest/Image#from_name) refers directly to that Image by its name. Unlike with Image methods that specify parts of a build recipe, the [`modal.Image.from_name()`](/docs/sdk/py/latest/Image#from_name) lookup will either succeed or fail with a [`modal.exception.NotFoundError`](/docs/sdk/py/latest/exception#notfounderror) error, but it will never trigger a build.
+  - The new [`modal image names`](/docs/cli/latest/image#modal-image-names) CLI can be used to see the current name assignments.
+- We're introducing a "version-pinning" concept for Function lookups. By passing `version=` to [`modal.Function.from_name()`](/docs/sdk/py/latest/Function#from_name) or [`modal.Cls.from_name()`](/docs/sdk/py/latest/Cls#from_name), you can retrieve an instance that will send all inputs to the same version of the Function, even after a subsequent redeployment of its App. Additionally, any transitive invocations of other Functions in the same App will also be pinned on that version. This feature makes it easy to execute workflows that involve multiple Functions when those Functions might change in incompatible ways across deployments.
+- It's now possible to restrict the *domains* that processes inside of a Sandbox can connect to. When you provide a list of domains to `outbound_domain_allowlist=[...]` in [`modal.Sandbox.create()`](/docs/sdk/py/latest/Sandbox#create), requests outside of the allowlist will be blocked by Modal infrastructure, and the denial will be recorded in the App logs.
+- We've added a new [`modal skills`](/docs/cli/latest/skills) CLI for installing a foundational Modal agent skill ([`modal skills install`](/docs/cli/latest/skills#modal-skills-install)) and keeping it up to date over time ([`modal skills update`](/docs/cli/latest/skills#modal-skills-update)). Please help us improve it by sharing any feedback you have about its impact on agentic development with Modal.
+- We've added a new [`modal.Workspace`](/docs/sdk/py/latest/Workspace) object for programmatic interaction with your Workspace configuration. The initial release offers a [`workspace.members.list()`](/docs/sdk/py/latest/Workspace#memberslist) method; expect more features soon.
+- The [`modal`](/docs/cli/latest) CLI now normalizes the keys of its `--json` output by lowercasing and substituting underscores for non-alphanumeric characters.
+- We've added a new [`sandbox.filesystem.watch()`](/docs/sdk/py/latest/Sandbox#filesystemwatch) method to the Sandbox Filesystem API, and we've deprecated the alpha [`modal.Sandbox.watch()`](/docs/sdk/py/latest/Sandbox#watch) method. The new method has a different implementation and offers significantly improved latency and reliability.
+- We've made two small breaking changes around Sandbox snapshots:
+  - [`modal.Sandbox.snapshot_filesystem()`](/docs/sdk/py/latest/Sandbox#snapshot_filesystem) and [`modal.Sandbox.snapshot_directory()`](/docs/sdk/py/latest/Sandbox#snapshot_directory) now accept an explicit `ttl=` keyword argument that configures a retention interval (in seconds) for the resulting Image. Both methods default to 30 days (`ttl=30 * 24 * 3600`). **Note:** this alters the default behavior of these methods, because snapshot Images were previously persisted indefinitely. Pass an explicit `ttl=None` to retain the previous behavior.
+  - [`modal.Sandbox.snapshot_directory()`](/docs/sdk/py/latest/Sandbox#snapshot_directory) now also accepts a `timeout=` keyword argument (defaulting to `55` seconds), which brings it to parity with [`modal.Sandbox.snapshot_filesystem()`](/docs/sdk/py/latest/Sandbox#snapshot_filesystem). If the snapshot does not return before the deadline, a [`modal.exception.TimeoutError`](/docs/sdk/py/latest/exception#timeouterror) will be raised. **Note:** this alters the default behavior, which previously waited indefinitely, but you can set an arbitrarily long timeout.
+- We've removed several deprecated static methods (`.delete()` and `.create_deployed()`) on Modal storage objects ([`modal.Volume`](/docs/sdk/py/latest/Volume), etc.). Use the [`.objects.delete()`](/docs/sdk/py/latest/Volume#objectsdelete) and [`.objects.create()`](/docs/sdk/py/latest/Volume#objectscreate) methods instead.
+
+## 1.4
+
+### 1.4.3 (2026-05-18)
+
+- This release introduces a new ["regional routing"](https://modal.com/docs/guide/region-selection#regional-routing) concept for Function inputs, which is now in Public Beta. By setting `routing_region="..."` in the `@app.function()` or `@app.cls()` decorators, you can configure the Function to route its inputs through servers in `us-west`, `eu-west`, or `ap-south` instead of `us-east`. This can reduce network latency and help you meet data residency obligations. While in Beta, this feature has a few constraints:
+  - `routing_region=` can only be set during the initial deployment of a Function and cannot be changed in a subsequent redeployment.
+  - Functions using regional routing outside of `us-east` can only be invoked with the `.remote()` and `.map()` methods.
+- We've added a new `modal.Environment` object for programmatically managing Environments, and we've expanded the `modal environment` CLI to support [RBAC](https://modal.com/docs/guide/rbac) configuration.
+- It is now possible to dynamically configure `modal.Function` behavior using `Function.with_options()`, `Function.with_concurrency()`, and `Function.with_batching()`.
+- The new `modal.Volume.with_mount_options()` method allows you to configure a Volume mount as read-only (`read_only=True`) and / or limit the mount to a subdirectory of the Volume (`sub_path="/some/path"`).
+- It's now possible to pass a custom App name for ephemeral Apps using the `--name` option in `modal run`/`modal serve` or by setting `name=` in `App.run()`.
+- We've added two new methods to the `modal.Sandbox` [Filesystem API](https://modal.com/docs/guide/sandbox-files):
+  - `sandbox.filesystem.list_files(path)` lists entries (with metadata) in a given directory on the Sandbox filesystem. This replaces the alpha `modal.Sandbox.ls` method.
+  - `sandbox.filesystem.stat(path)` returns metadata for a specific file/symlink/directory on the Sandbox's filesystem.
+- It's now possible to place restrictions on *inbound* Sandbox connections by setting `inbound_cidr_allowlist=[...]` in `modal.Sandbox.create()`. We are also adding a new `outbound_cidr_allowlist=[...]` parameter and deprecating the existing `cidr_allowlist=[...]` to avoid confusion.
+- We've improved the reliability of the `modal.Sandbox.snapshot_filesystem()` operation, especially for large snapshots, and we now support setting a `timeout=` longer than 55s when necessary.
+- Images returned by `modal.Sandbox.snapshot_directory()` can now be passed to `modal.Sandbox.create()` to use as a root filesystem for the new Sandbox.
+- We've added a `modal.Image.pipe()` method to let you define reusable Image recipes that compose well with the fluent Image builder interface.
+- It's now possible to assign Sandbox tags at creation with `modal.Sandbox.create(..., tags=tags)`.
+- It's now possible to use `--chmod` and `--chown` flags on `COPY` commands within `modal.Image.from_dockerfile()`.
+- We've improved the reliability and latency for `modal shell` and `modal container exec` CLI commands.
+
+### 1.4.2 (2026-04-16)
+
+- We've added a new `modal app rollover` CLI command for triggering a redeployment of an App without making any code or configuration changes. A rollover replaces existing containers with fresh ones. As with `modal deploy`, there are two strategies for switching between deployments:
+  - `--strategy=rolling` (the default) will smoothly migrate traffic from old containers to new containers
+  - `--strategy=recreate` will terminate all running containers so that any subsequent inputs will go to new containers
+- We've added a new `modal bootstrap` CLI command, which fetches deployable starter code for common AI applications (e.g., text generation, text-to-image, speech-to-text). This is an experiment: try it out and give us feedback!
+- We've added two methods to the new Sandbox filesystem API:
+  - `sandbox.filesystem.make_directory()` creates a new directory on the Sandbox filesystem
+  - `sandbox.filesystem.remove()` deletes a file or directory from the Sandbox filesystem
+- The new Sandbox filesystem methods replace the `modal.Sandbox.mkdir` and `modal.Sandbox.rm` methods, which are now deprecated.
+- Sandboxes also now support `sb.unmount_image(path)` to remove a previously mounted Image from a path and reveal the underlying Sandbox filesystem there again.
+- The `modal app stop` and `modal container stop` CLI commands now prompt for confirmation (pass `--yes` to skip).
+- Several other `modal app` CLI commands will now map a name-based argument to a recently-stopped App that used that name. This is useful for, e.g., fetching logs from an App after it has been stopped.
+- We've added a `build_args` parameter to `modal.Image.dockerfile_commands()`.
+
+### 1.4.1 (2026-03-30)
+
+- We're introducing a concept of "readiness probes" for `modal.Sandbox`. This feature lets you configure a readiness check on a TCP port (`modal.Probe.with_tcp()`) or by executing a process (`modal.Probe.with_exec()`). Calling `sb.wait_until_ready()` will block until the Probe succeeds:
+  ```python notest
+  app = modal.App.lookup('sandbox-app', create_if_missing=True)
+  probe = modal.Probe.with_tcp(8080)
+  sb = modal.Sandbox.create(
+      "python3", "-m", "http.server", "8080",
+      readiness_probe=probe,
+      app=app,
+  )
+  sb.wait_until_ready()
+  ```
+- We fixed a longstanding bug that could cause WebSocket performance to degrade after handling hundreds of connections from the same container.
+- We improved the performance of `modal container logs` when fetching logs for an old container.
+- We fixed a bug introduced in 1.4.0 that made the `modal` CLI crash on `typer<0.19.0`.
+
+### 1.4.0 (2026-03-25)
+
+We've made significant CLI enhancements so that Modal logs can be more accessible to coding agents:
+
+- The `modal app logs` and `modal container logs` commands now have the ability to fetch historical logs using counting (e.g. `--tail 1000`) or time-based (e.g., `--since 4h`, `--until 2026-03-15`, etc.) configuration. Note that historical log access is subject to plan-level retention limits.
+- The `modal container logs` command also accepts `--all` to fetch the complete set of logs for that Container or Sandbox.
+- Both CLI commands now accept a `--search` filter, and they can also filter by `--source` (`stdout`/`stderr`/`system`).
+- The `modal app logs` command additionally accepts `--function`, `--function-call`, and `--container` filters.
+- The `modal app logs` command can prefix each line with the ID of the Function, FunctionCall, or Container where it originated (e.g. `--show-function-id`).
+- Note that the default behavior of these commands has changed. Previously, they would follow (i.e., stream) logs by default, but you now must pass `--follow` to get this behavior. The new default will always show the most recent 100 log entries.
+
+We're releasing a new [Sandbox filesystem API](https://modal.com/docs/guide/sandbox-files) (currently in Beta) with significantly improved reliability and ergonomics:
+
+- Use `sb.filesystem.copy_from_local` / `sb.filesystem.copy_to_local` to transfer file contents between your local filesystem and the Sandbox filesystem.
+- Use `sb.filesystem.write_text` / `sb.filesystem.read_text` or `sb.filesystem.write_bytes` / `sb.filesystem.read_bytes` to transfer file contents between local memory and the Sandbox filesystem.
+- These new APIs replace the `modal.Sandbox.open` method and the `modal.file_io.FileIO` type that it returns; the old APIs are now deprecated.
+
+We're introducing the concept of "deployment strategies" to give you more flexibility over what happens when redeploying your App:
+
+- By passing `modal deploy --strategy recreate` (or `app.deploy(strategy="recreate")` in the SDK), you can immediately terminate any containers that are running when the deployment completes. This is most useful for development workflows, as it guarantees that any subsequent input will be handled by containers running the new version of the App. This trades off some downtime for certainty about when the new version will be in use.
+- The disruptive "recreate" strategy is also useful when your App runs at its `max_containers` limit, as otherwise we are unable to bring up replacement capacity.
+- The `modal serve` command now uses a "recreate" strategy during code updates.
+- The default "rolling" strategy is unchanged. This strategy prioritizes uptime, but means that old containers may still continue handling inputs for some time.
+
+We've also included a number of smaller new features and improvements:
+
+- Sandboxes now accept an `include_oidc_identity_token` parameter in `modal.Sandbox.create`. When set to `True`, a `MODAL_IDENTITY_TOKEN` environment variable will be injected into the Sandbox, enabling OIDC-based authentication (e.g., for AWS federation). See the [OIDC integration guide](https://modal.com/docs/guide/oidc-integration) for more details.
+- The new `modal.Image.from_scratch()` constructor creates an empty Image, equivalent to `FROM scratch` in Docker. This is primarily useful as a lightweight filesystem to mount into a Sandbox via `modal.Sandbox.mount_image`.
+- The `modal container list` command now accepts an `--app-id` filter to return containers for a specific App.
+- We've addressed an issue where `modal.Sandbox.exec` could hang if the Sandbox had terminated immediately after creation.
+- An exception is now raised if the *same* Volume or CloudBucketMount is mounted at multiple paths in a container.
+- The client will now error faster (≈60s) if it cannot establish an initial connection the Modal servers.
+
+Finally, we are introducing a small number of breaking changes and enforcing some deprecations of pre-1.0 APIs:
+
+- Exceptions returned by `modal.Function.map()` are no longer wrapped in a `UserCodeException` type, and we're deprecating the transitional `wrap_returned_exceptions=` parameter.
+- The `modal.enable_output()` context manager no longer yields a value; this had briefly leaked an internal type.
+- We've removed unused `namespace` parameters from a number of APIs.
+- It's now required to pass `-m` on the CLI when using a module path spelling of the Function reference (e.g. `modal deploy -m project.app`)
+- We've removed backwards compatibility for the old autoscaler configuration (`keep_warm`, `concurrency_limit`, etc.).
+- It's no longer possible to look up a specific method on a Cls using `modal.Function.from_name`; use `modal.Cls.from_name` instead.
+
+## 1.3
+
+### 1.3.5 (2026-03-03)
+
+- We've added a `modal changelog` CLI for retrieving changelog entries with a flexible query interface (e.g. `modal changelog --since=1.2`, `modal changelog --since=2025-12-01`, `modal changelog --newer`). We expect that this will be a useful way to surface information about new features to coding agents.
+- We've added a new `modal.Secret.update` method, which allows you to programmatically modify the environment variables within a Secret. This method has the semantics of Python's `dict.update`: Secret contents can be overwritten or extended when using it. Note that Secret updates will take effect only for containers that start up after the modification.
+- The dataclass returned by `modal.Function.get_current_stats()` now includes a `num_running_inputs` field that reports the number of inputs the Function is currently handling.
+
+
+### 1.3.4 (2026-02-23)
+
+- We're introducing "Directory Snapshots": a new beta feature for persisting specific directories past the lifetime of an individual Sandbox. Using the new methods `modal.Sandbox.snapshot_directory()` and `modal.Sandbox.mount_image()`, you can capture the state of a directory and then later include it in a different Sandbox:
+  ```python notest
+  sb = modal.Sandbox.create(app=app)
+  snapshot = sb.snapshot_directory("/project")
+
+  sb2 = modal.Sandbox.create(app=app)
+  sb2.mount_image("/project", snapshot)
+  ```
+  This feature can be useful for separating the lifecycle of application code in the Sandbox's main Image from project code that changes in each Sandbox session. Files in the mounted snapshot also benefit from several optimizations that allow them to be read faster. See the [Sandbox Snapshot guide](https://modal.com/docs/guide/sandbox-snapshots) for more information.
+- We've added a new `modal.Sandbox.detach()` method that we recommend calling after you are done interacting with a Sandbox. This method disconnects your local client from the Sandbox and cleans up resources associated with the connection. After calling `detach`, operations on the Sandbox object may raise and are otherwise not guaranteed to work.
+- The `modal.Sandbox.terminate()` method now accepts a `wait` parameter. With `wait=True`, `terminate` will block until the Sandbox is finished and return the exit code. The default `wait=False` maintains the previous behavior.
+- Throughput for writing to the `stdin` of a `modal.Sandbox.exec` process has been increased by 8x.
+- We've added a new `modal.Volume.from_id()` method for referencing a Volume by its object id.
+
+### 1.3.3 (2026-02-12)
+
+- We've added a new `modal billing report` CLI and promoted the `modal.billing.workspace_billing_report` API to General Availability for all Team and Enterprise plan workspaces.
+- We've added `modal.Queue.from_id()` and `modal.Dict.from_id()` methods to support referencing a Queue or Dict by its object id.
+- Modal's async usage warnings are now enabled by default. These warnings will fire when using a [blocking interface on a Modal object](https://modal.com/docs/guide/async) in an async context. We've aimed to provide detailed and actionable suggestions for how to modify the code, which makes the warnings verbose. While we recommend addressing any warnings that pop up, as they can point to significant performance issues or bugs, we also provide a configuration option to disable them (`MODAL_ASYNC_WARNINGS=0` or `async_warnings = false` in the `.modal.toml`). Please report any apparent false positives or incorrect suggested fixes.
+- We've fixed a bug where the ASGI scope's `state` contents could leak between requests when using `@modal.asgi_app`.
+
+### 1.3.2 (2026-01-30)
+
+- Modal objects now have a `.get_dashboard_url()` method. This method will return a URL for viewing that object on the Modal dashboard:
+  ```python
+  fc = f.spawn()
+  print(fc.get_dashboard_url())  # Easy access to logs, etc.
+  ```
+- There is also a new `modal dashboard` CLI and new `modal app dashboard` / `modal volume dashboard` CLI subcommands:
+  ```bash
+  modal dashboard  # Opens up the Apps homepage for the current environment
+  modal dashboard <object-id>  # Opens up a view of this object
+  modal app dashboard <app-name>  # Opens up the dashboard for this deployed App
+  modal volume dashboard <volume-name>  # Opens up the file browser for this persistent Volume
+  ```
+- You can now pass a Sandbox ID (`sb-xxxxx`) directly to the `modal container logs` CLI.
+- The `modal token info` CLI will now include the token name, if provided at token creation.
+- We've fixed an issue where `modal.Cls.with_options()` (or the `with_concurrency()` / `with_batching()` methods) could sometimes use stale argument values when called repeatedly.
+
+
+### 1.3.1 (2026-01-22)
+
+- We've improved our experimental support for Python 3.14t (free-threaded Python) inside Modal containers.
+  - The container environment will now use the Python implementation of the Protobuf runtime rather than the incompatible `upb` implementation.
+  - As 3.14t images are not being published to the official source for our prebuilt `modal.Image.debian_slim()` images, we recommend using `modal.Image.from_registry` to build a 3.14t Image:
+    ```python
+    modal.Image.from_registry("debian:bookworm-slim", add_python="3.14t")
+    ```
+  - Note that 3.14t support is available only on the 2025.06 [Image Builder Version](https://modal.com/settings/image-config).
+  - Support is still experimental, so please share any issues that you encounter running 3.14t in Modal containers.
+- It's now possible to provide a `custom_domain` for a `modal.Sandbox`:
+  ```python
+  sb = modal.Sandbox.create(..., custom_domain="sandboxes.mydomain.com")
+  ```
+  Note that Sandbox custom domains work differently from Function custom domains and must currently be set up manually by Modal; please get in touch if this feature interests you.
+- We added a new `modal token info` CLI command to retrieve information about the credentials that are currently in use.
+- We added a `--timestamps` flag to a number of CLI entrypoints (`modal run`, `modal serve`, `modal deploy`, and `modal container logs`) to show timestamps in the logging output.
+- The automatic CLI creation for `modal run` entrypoints now supports `Literal` type annotations, provided that the literal type contains either all `str` or all `int` values.
+- We've fixed a bug that could cause App builds to fail with an uninformative `CancelledError` when the App was misconfigured.
+- We've improved client resource management when running `modal.Sandbox.exec`, which avoids a rare thread race condition.
+
+### 1.3.0 (2025-12-19)
+
+Modal now supports Python 3.14. Python 3.14t (the free-threading build) support is currently a work in progress, because we are waiting for dependencies to be updated with free-threaded support. Additionally, Modal no longer supports Python 3.9, which has reached [end-of-life](https://devguide.python.org/versions).
+
+We are adding experimental support for detecting cases where Modal's blocking APIs are used in async contexts (which can be a source of bugs or performance issues). You can opt into runtime warnings by setting `MODAL_ASYNC_WARNINGS=1` as an environment variable or `async_warnings = true` as a config field. We will enable these warnings by default in the future; please report any apparent false positives or other issues while support is experimental.
+
+This release also includes a small number of deprecations and behavioral changes:
+
+- The Modal SDK will no longer propagate `grpclib.GRPCError` types out to the user; our own `modal.Error` subtypes will be used instead. To avoid disrupting user code that has relied on `GRPCError` exceptions for control flow, we are temporarily making some exception types inherit from `GRPCError` so that they will also be caught by `except grpclib.GRPCError` statements. Accessing the `.status` attribute of the exception will issue a deprecation warning, but warnings cannot be issued if the exception object is only caught and there is no other interaction with it. We advise proactively migrating any exception handling to use Modal types, as we will remove the dependency on `grpclib` types entirely in the future. See the [`modal.exception`](https://modal.com/docs/sdk/py/latest/exception) docs for the mapping from gRPC status codes to Modal exception types.
+- The `max_inputs` parameter in the `@app.function()` and `@app.cls` decorators has been renamed to `single_use_containers` and now takes a boolean value rather than an integer. Note that only `max_inputs=1` has been supported, so this has no functional implications. This change is being made to reduce confusion with `@modal.concurrent(max_inputs=...)` and so that Modal's autoscaler can provide better performance for Functions with single-use containers.
+- The async (`.aio`) interface has been deprecated from `modal.FunctionCall.from_id`, `modal.Image.from_id`, and `modal.SandboxSnapshot.from_id`, because these methods do not perform I/O.
+- The `replace_bytes` and `delete_bytes` methods have been removed from the `modal.file_io` filesystem interface.
+- Images built with `modal.Image.micromamba()` using the 2023.12 [Image Builder Version](https://modal.com/docs/guide/images#image-builder-updates) will now use a Python version that matches their local environment by default, rather than defaulting to Python 3.9.
+
+## 1.2
+
+### 1.2.6 (2025-12-16)
+
+- Fixed bug where iterating on a `modal.Sandbox.exec` output stream could raise unauthenticated errors.
+
+### 1.2.5 (2025-12-12)
+
+- It is now possible to set a custom `name=` for a Function without using `serialized=True`. This can be useful when decorating a function multiple times, e.g. applying multiple Modal configurations to the same implementation.
+- It is now possible to start `modal shell` with a Modal Image ID (`modal shell im-abc123`). Additionally, `modal shell` will now warn if you pass invalid combinations of arguments (like `--cpu` together with the ID of an already running Sandbox, etc.).
+- Fixed a bug in `modal shell` that caused e.g. `vi` to fail with unicode decode errors.
+- Fixed a thread-safety issue in `modal.Sandbox` resource cleanup.
+- Improved performance when adding large local directories to an Image.
+- Improved async Sandbox performance by not blocking the event loop while reading from `stdout` or `stderr`.
+
+### 1.2.4 (2025-11-21)
+
+- Fixed a bug in `modal.Sandbox.exec` when using `stderr=StreamType.STDOUT` (introduced in v1.2.3).
+- Added a new `h2_enabled` option in `modal.forward`, which enables HTTP/2 advertisement in TLS establishment.
+
+### 1.2.3 (2025-11-20)
+
+- CPU Functions can now be configured to run on non-preemptible capacity by setting `nonpreemptible=True` in the `@app.function()` or `@app.cls()` decorator. This feature is not currently available when requesting a GPU. Note that non-preemptibility incurs a 3x multiplier on CPU and memory pricing. See the [Guide](https://modal.com/docs/guide/preemption) for more information on preemptions.
+- The Modal client can now respond more gracefully to server throttling (e.g., rate limiting) by backing off and automatically retrying. This behavior can be controlled with a new `MODAL_MAX_THROTTLE_WAIT` config variable. Setting the config to `0` will preserve the previous behavior and treat rate limits as an exception; setting it to a nonzero number (the unit is seconds) will allow a limited duration of retries.
+- The `modal.Sandbox.exec` implementation has been rewritten to be more reliable and efficient.
+- Added a new `--add-local` flag to `modal shell`, allowing local files and directories to be included in the shell's container.
+- Fixed a bug introduced in v1.2.2 where some Modal objects (e.g., `modal.FunctionCall`) were not usable after being captured in a Memory Snapshot. The bug would result in a `has no loader function` error when the object was used.
+
+### 1.2.2 (2025-11-10)
+
+- `modal.Image.run_commands` now supports `modal.Volume` mounts. This can be helpful for accelerating builds by keeping a package manager cache on the Volume:
+
+  ```python
+  cache_vol = modal.Volume.from_name("cache-mount")
+  cmd_using_cache = "..."
+  image = modal.Image.debian_slim().run_commands(cmd_using_cache, volumes={"/cache": cache_vol})
+  ```
+
+- All Modal objects now accept an optional `modal.Client` object in their constructor methods. Passing an explicit client can be helpful in cases where Modal credentials are retrieved from within the Python process that is making requests.
+- The `name=` passed to `modal.Sandbox.create` and `modal.Sandbox.from_name` is now required to follow other Modal object naming rules (must contain only alphanumeric characters, dashes, periods, or underscores and cannot exceed 64 characters). Passing an invalid name will now error.
+- `modal.CloudBucketMount` now supports `force_path_style=True` to disable virtual-host-style addressing. See [mountpoint-s3 endpoints docs](https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md#endpoints-and-aws-privatelink) for details.
+- The output from `modal config show` is now valid JSON and can be parsed by CLI tools such as `jq`.
+- Fixed a bug where App tags were not attached to Image builds that occur when first deploying the App.
+
+### 1.2.1 (2025-10-22)
+
+- It's now possible to override the default `-dev` suffix applied to the autogenerated URLs for ephemeral Apps (i.e., when using `modal serve`) via a new `dev_suffix` field in the `.modal.toml` config file, or equivalently with the `MODAL_DEV_SUFFIX` environment variable. This can help avoid collisions when multiple users of a workspace are working on the same codebase simultaneously.
+- Fixed a bug where reading long stdout/stderr from `modal.Sandbox.exec()` could break in `text=True` mode.
+- Fixed a bug where the status code was not checked when downloading a file from a Volume.
+- `modal run --detach ...` will now exit more gracefully if you lose internet connection while your App is running.
+
+### 1.2.0 (2025-10-09)
+
+In this release, we're introducing the concept of "App tags", which are simple key-value metadata that can be included to provide additional organizational context. Tags can be defined as part of the `modal.App` constructor:
+
+```python
+app = modal.App("llm-inference-server", tags={"team": "genai-platform"})
+```
+
+Tags can also be added to an active App via the new `modal.App.set_tags()` method, and current tags can be retrieved with the new `modal.App.get_tags()`.
+
+This release also introduces a new API for generating a tabular billing report: `modal.billing.workspace_billing_report()`. The billing API will report the cost incurred by each App, aggregated over time intervals (currently supporting a daily or hourly resolution). The report can optionally include App tags, allowing you to perform cost allocation using your own organizational schema.
+
+Note that the initial release of the billing API is a private beta. Please get in touch to discuss access.
+
+This release also includes some internal changes to Function input/output serialization. These changes will provide better support for calling into Modal Functions from our `modal-js` and `modal-go` SDKs. Versions 0.4 or later of `modal-js` and `modal-go` will only be able to invoke Functions in Apps deployed with version 1.2 or later of the Python SDK.
+
+Other new features and improvements:
+
+- The new `modal.Sandbox.create_connect_token()` method facilitates authentication for making HTTP / Websocket requests to a server running in a Sandbox:
+
+  ```python notest
+  sb = modal.Sandbox.create(...)
+
+  # Create a connect token, optionally including arbitrary user metadata
+  creds = sb.create_connect_token(user_metadata={"user_id": "user123"})
+
+  # Make an http request, passing the token in the authorization header
+  requests.get(creds.url, headers={"Authorization": f"Bearer {creds.token}"})
+  ```
+
+  See the [Sandbox Networking guide](https://modal.com/docs/guide/sandbox-networking) for more information.
+
+- The new `modal.Image.build()` method allows you to eagerly trigger an Image build. This is particularly helpful when working with Sandboxes, as otherwise the Image build would happen lazily inside `modal.Sandbox.create()`:
+
+  ```python notest
+  app = modal.App.lookup("sandbox-app")
+  image = modal.Image.from_registry("ubuntu")
+
+  # This step will block until the build completes
+  image.build(app)
+
+  # Now the Sandbox will be created and scheduled immediately
+  sb = modal.Sandbox.create(app=app, image=image)
+  ```
+
+- We've added an `env` parameter to a number of methods that configure Function, Sandbox, or Image execution. This parameter accepts a dictionary and adds the contents as environment variables in the relevant Modal container. This allows for simpler inclusion of non-sensitive information compared to using a `modal.Secret`.
+- It's now possible to pass a `modal.CloudBucketMount` instance to the `volumes=` parameter of `modal.Cls.with_options` (previously, only dynamic addition of `modal.Volume` mounts was supported).
+- The new `modal.Sandbox.get_tags()` method will fetch the tags currently in use by the Sandbox (i.e., after calling `modal.Sandbox.set_tags()`). Note that Sandbox tags are distinct from the new concept of App tags.
+- `modal.Dict.pop()` now accepts an optional `default` parameter, akin to Python's `dict.pop()`.
+- It's now possible to `modal shell` into a running Sandbox by passing its Sandbox ID (`modal shell sb-123`).
+- Sandboxes can now be configured to expose a PTY device via `Sandbox.create(..., pty=True)` and `Sandbox.exec(..., pty=True)`. This provides better support for Claude Code.
+- The new `modal.experimental.image_delete()` function can be used to delete the final layer of an Image given its ID, which can be particularly useful for cleaning up Sandbox Filesystem Snapshots.
+- Using `modal run --interactive` (or `-i`) will now suppress Modal's status spinner to avoid interfering with breakpoints in local entrypoint functions. We've also improved support for printing large objects when attached to a debugger.
+- We've improved support for Protobuf 5+ when using the Python implementation of the Protobuf runtime.
+
+This release also introduces a small number of new deprecations:
+
+- We deprecated the `client` parameter from `Sandbox.set_tags()`. To use an explicit Client when interacting with the Sandbox, pass it into `modal.Sandbox.create()` instead.
+- We deprecated the `pty_info` parameter from `Sandbox.create()` and `Sandbox.exec()`. This was a private parameter accepting an internal Protobuf type. See the new boolean `pty` parameter instead.
+- We replaced the `--no-confirm` option with `--yes` in the `modal environment delete` CLI to align with other CLI commands that normally require confirmation.
+
+Finally, some functionality that began issuing deprecation warnings prior to v0.73 has now been completely removed:
+
+- It is now required to "instantiate" a `modal.Cls` before invoking one of its methods.
+- The eager `.lookup()` method has been removed from most Modal object classes (but not from `modal.App.lookup`, which remains supported). The lazy `.from_name()` method is recommended for accessing deployed objects going forward.
+- The public constructors on the `modal.mount.Mount` object have been removed; this is now an entirely internal class.
+- The `context_mount=` parameter has accordingly been removed from Docker-oriented `modal.Image` methods.
+- The unused `allow_cross_region_volumes` parameter has been removed from the function decorators.
+- The `modal.experimental.update_autoscaler()` function has been removed; this functionality now has a stable API as `modal.Function.update_autoscaler()`.
+
+## 1.1
+
+### 1.1.4 (2025-09-03)
+
+- Added a `startup_timeout` parameter to the `@app.function()` and `@app.cls()` decorators. When used, this configures the timeout applied to each container's startup period separately from the input `timeout`. For backwards compatibility, `timeout` still applies to the startup phase when `startup_timeout` is unset.
+- Added an optional `idle_timeout` parameter to `modal.Sandbox.create()`. When provided, Sandboxes will terminate after `idle_timeout` seconds of idleness.
+- The dataclass returned by `modal.experimental.get_cluster_info()` now includes a `cluster_id` field to identify the clustered set of containers.
+- When `block_network=True` is set in `modal.Sandbox.create()`, we now raise an error if any of `encrypted_ports`, `h2_ports`, or `unencrypted_ports` are also set.
+- Functions decorated with `@modal.asgi_app()` now return an HTTP 408 (request timeout) error code instead of a 502 (gateway timeout) in rare cases when an input fails to arrive at the container, e.g. due to cancellation.
+- `modal.Sandbox.create()` now warns when an invalid `name=` is passed, applying the same rules as other Modal object names: names must be alphanumeric and not longer than 64 characters. This will become an error in the future.
+
+### 1.1.3 (2025-08-19)
+
+- Fixed a bug introduced in `v1.1.2` that causes invocation of `modal.FunctionCall.get`, `modal.FunctionCall.get_call_graph`, `modal.FunctionCall.cancel`, and `modal.FunctionCall.gather` to fail when the `FunctionCall` object is retrieved via `modal.FunctionCall.from_id`.
+- Added retries to improve the robustness of `modal volume get`
+
+### 1.1.2 (2025-08-14)
+
+We're introducing a new API pattern for imperative management of Modal resource types (`modal.Volume`, `modal.Secret`, `modal.Dict`, and `modal.Queue`). The API is accessible through the `.objects` namespace on each class. The object management namespace has methods for the following operations:
+
+- `.objects.create(name)` creates an object on our backend. E.g., with [`modal.Volume.objects.create`](https://modal.com/docs/sdk/py/latest/Volume#create):
+  ```python notest
+  modal.Volume.objects.create("huggingface-cache", environment_name="dev")
+  ```
+- `.objects.delete(name)` deletes the object with that name. E.g., with [`modal.Secret.objects.delete`](https://modal.com/docs/sdk/py/latest/Secret#delete):
+  ```python notest
+  modal.Secret.objects.delete("aws-token")
+  ```
+- `.objects.list()` returns a list of object instances. E.g., with [`modal.Queue.objects.list`](https://modal.com/docs/sdk/py/latest/Queue#list):
+  ```python notest
+  for queue in modal.Queue.objects.list():
+      queue_info = queue.info()
+      print(queue_info.name, queue_info.created_at, queue.len())
+  ```
+
+With the introduction of these APIs, we're replacing a few older methods with similar functionality:
+
+- Static `.delete()` methods on the resource types themselves are being deprecated, because they are too easily confused with operations on the _contents_ of a resource (i.e., calling `modal.Dict.delete(key_name)` is an easy mistake that can have significant adverse consequences).
+- The undocumented `.create_deployed()` methods of `modal.Volume` and `modal.Secret` are being deprecated in favor of this consistent API for imperative management.
+
+Other changes:
+
+- `modal.Cls.with_options` now supports `region` and `cloud` keyword arguments to support runtime constraints on scheduling.
+- Fixed a bug that could cause Image builds to fail with `'FilePatternMatcher' object has no attribute 'patterns'` when using a `modal.FilePatternMatcher.from_file` ignore pattern.
+- Fixed a bug where `rdma=True` was ignored when using `@modal.experimental.clustered()` with a `modal.Cls`.
+
+### 1.1.1 (2025-08-01)
+
+We're introducing the concept of "named Sandboxes" for usecases where Sandboxes need to have unique ownership over a resource. A named Sandbox can be created by passing `name=` to `modal.Sandbox.create()`, and it can be retrieved with the new `modal.Sandbox.from_name()` constructor. Only one running Sandbox can use a given name (scoped within the App that is managing the Sandbox) at any time, so trying to create a Sandbox with a name that is already taken will fail. Sandboxes release their name when they terminate. See the [guide](https://modal.com/docs/guide/sandbox#named-sandboxes) for more information about using this new feature.
+
+Other changes:
+
+- We've made an internal change to the `modal.Image.uv_pip_install` method to make it more portable across different base Images. As a consequence, Images built with this method on 1.1.0 will need to rebuild the next time they are used.
+- We've added a `.name` property and `.info()` method to `modal.Dict`, `modal.Queue`, `modal.Volume`, and `modal.Secret` objects.
+- Sandboxes now support `experimental_options` configuration for enabling preview functionality.
+- We've Improved Modal's rich output when used in a Jupyter notebook.
+
+### 1.1.0 (2025-07-17)
+
+This release introduces support for the `2025.06` [Image Builder Version](https://modal.com/docs/guide/images#image-builder-updates), which is in a "preview" state. The new image builder includes several major changes to how the Modal client dependencies are included in Modal Images. These improvements should greatly reduce the risk of conflicts with user code dependencies. They also allow Modal Sandboxes to easily be used with existing Images or Dockerfiles that are not themselves compatible with the Modal client library. You can see more details and update your Workspace on its [Image Config](https://modal.com/settings/image-config) page. Please share any issues that you encounter as we work to make the version stable.
+
+We're also introducing first-class support for building Modal Images with the [uv package manager](https://docs.astral.sh/uv/) through the new [`modal.Image.uv_pip_install`](https://modal.com/docs/sdk/py/latest/Image#uv_pip_install) and [`modal.Image.uv_sync`](https://modal.com/docs/sdk/py/latest/Image#uv_sync) methods:
+
+```python
+import modal
+
+# uv_pip_install accepts a list of packages, like pip_install, but up to 50% faster
+image = modal.Image.debian_slim().uv_pip_install("torch==2.7.1", "numpy==2.3.1")
+
+# uv_sync accepts a local `uv_project_dir` (defaulting to the local working directory)
+# and uses the pyproject.toml and uv.lock files to specify the environment
+image = modal.Image.debian_slim().uv_sync()
+```
+
+Please note that, as these methods are new, there is some chance that future releases will need to fix bugs or address edge cases in ways that break the cache for existing Images. When using `modal.Image.uv_pip_install`, we recommend pinning dependency versions so that any necessary rebuilds produce a consistent environment.
+
+This release also includes a number of other new features and bug fixes:
+
+- Optimized handling of the `ignore` parameter in `Image.add_local_dir` and similar methods for cases where entire directories are ignored.
+- Added a `poetry_version` parameter to `modal.Image.poetry_install_from_file`, which supports installing a specific version of `poetry`. It's also possible to set `poetry_version=None` to skip the install step, i.e. when poetry is already available in the Image.
+- Added a [`modal.Sandbox.reload_volumes`](https://modal.com/docs/sdk/py/latest/Sandbox#reload_volumes) method, which triggers a reload of all Volumes currently mounted inside a running Sandbox.
+- Added a `build_args` parameter to `modal.Image.from_dockerfile` for passing arguments through to `ARG` instructions in the Dockerfile.
+- It's now possible to use `@modal.experimental.clustered` and `i6pn` networking with `modal.Cls`.
+- Fixed a bug where `Cls.with_options` would fail when provided with a `modal.Secret` object that was already hydrated.
+- Fixed a bug where the timeout specified in `modal.Sandbox.exec()` was not respected by `ContainerProcess.wait()` or `ContainerProcess.poll()`.
+- Fixed retry handling when using `modal run --detach` directly against a remote Function.
+
+Finally, this release introduces a small number of deprecations and potentially-breaking changes:
+
+- We now raise `modal.exception.NotFoundError` in all cases where Modal object lookups fail; previously some methods could leak an internal `GRPCError` with a `NOT_FOUND` status.
+- We're enforcing pre-1.0 deprecations on `modal.build`, `modal.Image.copy_local_file`, and `modal.Image.copy_local_dir`.
+- We're deprecating the `environment_name` parameter in `modal.Sandbox.create()`. A Sandbox's environment association will now be determined by its parent App. This should have no user-facing effects.
+- We've deprecated the `namespace` parameter in the `.from_name` methods of `Function`, `Cls`, `Dict`, `Queue`, `Volume`, `NetworkFileSystem`, and `Secret`, along with `modal.runner.deploy_app`. These object types do not have a concept of distinct namespaces.
+
+## 1.0
+
+### 1.0.5 (2025-06-27)
+
+- Added a [`modal.Volume.read_only`](/docs/sdk/py/latest/Volume#read_only) method, which will configure a Volume instance to disallow writes:
+
+  ```python notest
+  vol = modal.Volume.from_name("models")
+  read_only_vol = vol.read_only()
+
+  @app.function(volumes={"/models": read_only_vol})
+  def f():
+      with open("/models/weights.pt", "w") as fid:  # Raises an OSError
+          ...
+
+  @app.local_entrypoint()
+  def main():
+      with read_only_vol.batch_upload() as batch:  # Raises a modal.exceptions.InvalidError
+          ...
+
+      with vol.batch_upload() as batch:  # This instance is still writeable
+          ...
+  ```
+
+- Introduced a gradual fix for a bug where `Function.map` and `Function.starmap` leak an internal exception wrapping type (`modal.exceptions.UserCodeException`) when `return_exceptions=True` is set. To avoid breaking any user code that depends on the specific types in the return list, these functions will continue returning the wrapper type by default, but they now issue a deprecation warning. To opt into the future behavior and silence the warning, you can set `wrap_returned_exceptions=False` in the call to `.map` or `.starmap`.
+- When an `@app.cls()`-decorated class inherits from a class (or classes) with `modal.parameter()` annotations, the parent parameters will now be inherited and included in the parameter set for the modal Cls.
+- Redeployments that migrate parameterized functions from an explicit constructor to `modal.parameter()` annotations will now handle requests from outdated clients more gracefully, avoiding a problem where new containers would crashloop on a deserialization error.
+- The Modal client will now retry its initial connection to the Modal server, improving stability on flaky networks.
+
+### 1.0.4 (2025-06-13)
+
+- When `modal.Cls.with_options` is called multiple times on the same instance, the overrides will now be merged. For example, the following configuration will use an H100 GPU and request 16 CPU cores:
+  ```python
+  Model.with_options(gpu="A100", cpu=16).with_options(gpu="H100")
+  ```
+- Added a `--secret` option to `modal shell` for including environment variables defined by named Secret(s) in the shell session:
+  ```
+  modal shell --secret huggingface --secret wandb
+  ```
+- Added a `verbose: bool` option to `modal.Sandbox.create()`. When this is set to `True`, execs and file system operations will appear in the Sandbox logs.
+- Updated `modal.Sandbox.watch()` so that exceptions are now raised in (and can be caught by) the calling task.
+
+### 1.0.3 (2025-06-05)
+
+- Added support for specifying a timezone on `Cron` schedules, which allows you to run a Function at a specific local time regardless of daylight savings:
+
+  ```python
+  import modal
+  app = modal.App()
+
+  @app.function(schedule=modal.Cron("* 6 * * *"), timezone="America/New_York")  # Use tz database naming conventions
+  def f():
+      print("This function will run every day at 6am New York time.")
+  ```
+
+- Added an `h2_ports` parameter to `Sandbox.create`, which exposes encrypted ports using HTTP/2. The following example will create an H2 port on 5002 and a port using HTTPS over HTTP/1.1 on 5003:
+  ```python
+  sb = modal.Sandbox.create(app=app, h2_ports = [5002], encrypted_ports = [5003])
+  ```
+- Added `--from-dotenv` and `--from-json` options to `modal secret create`, which will read from local files to populate Secret contents.
+- `Sandbox.terminate` no longer waits for container shutdown to complete before returning. It still ensures that a terminated container will shutdown imminently. To restore the previous behavior (i.e., to wait until the Sandbox is actually terminated), call `sb.wait(raise_on_termination=False)` after calling `sb.terminate()`.
+- Improved performance and stability for `modal volume get`.
+- Fixed a rare race condition that could sometimes make `Function.map` and similar calls deadlock.
+- Fixed an issue where `Function.map` and similar methods would stall for 55 seconds when passed an empty iterator as input instead of completing immediately.
+- We now raise an error during App setup when using interactive mode without the `modal.enable_output` context manager. Previously, this would run the App but raise when `modal.interact()` was called.
+
+### 1.0.2 (2025-05-26)
+
+- Fixed an incompatibility with breaking changes in `aiohttp` v3.12.0, which caused issues with Volume and large input uploads. The issues typically manifest as `Local data and remote data checksum mismatch` or `'_io.BufferedReader' object has no attribute 'getbuffer'` errors.
+
+### 1.0.1 (2025-05-19)
+
+- Added a `--timestamps` flag to `modal app logs` that prepends a timestamp to each log line.
+- Fixed a bug where objects returned by `Sandbox.list` had `returncode == 0` for _running_ Sandboxes. Now the return code for running Sandboxes will be `None`.
+- Fixed a bug affecting systems where the `sys.platform.node` name includes unicode characters.
+
+### 1.0.0 (2025-05-16)
+
+With this release, we're beginning to enforce the deprecations discussed in the [1.0 migration guide](https://modal.com/docs/guide/modal-1-0-migration). Going forward, we'll include breaking changes for outstanding deprecations in `1.Y.0` releases, so we recommend pinning Modal on a minor version (`modal~=1.0.0`) if you have not addressed the existing warnings. While we'll continue to make improvements to the Modal API, new deprecations will be introduced at a substantially reduced rate, and support windows for older client versions will lengthen.
+
+⚠️ In this release, we've made some breaking changes to Modal's "automounting" behavior.️ If you've not already adapted your source code in response to warnings about automounting, Apps built with 1.0+ will have different files included and may not run as expected:
+
+- Previously, Modal containers would automatically include the source for local Python packages that were imported by your Modal App. Going forward, it will be necessary to explicitly include such packages in the Image (i.e., with `modal.Image.add_local_python_source`).
+- Support for the `automount` configuration (`MODAL_AUTOMOUNT`) has been removed; this environment variable will no longer have any effect.
+- Modal will continue to automatically include the Python module or package where the Function is defined. If the Function is defined within a package, the entire directory tree containing the package will be mounted. This limited automounting can also be disabled in cases where your Image definition already includes the package defining the Function: set `include_source=False` in the `modal.App` constructor or `@app.function` decorator.
+
+Additionally, we have enforced a number of previously-introduced deprecations:
+
+- Removed `modal.Mount` as a public object, along with various `mount=` parameters where Mounts could be passed into the Modal API. Usage can be replaced with `modal.Image` methods, e.g.:
+  ```python
+  @app.function(image=image, mounts=[modal.Mount.from_local_dir("data", "/root/data")])  # This is now an error!
+  @app.function(image=image.add_local_dir("data", "/root/data"))  # Correct spelling
+  ```
+- Removed the `show_progress` parameter from `modal.App.run`. This parameter has been replaced by the `modal.enable_output` context manager:
+  ```python
+  with modal.enable_output(), app.run():
+    ...  # Will produce verbose Modal output
+  ```
+- Passing flagged options to the `Image.pip_install` package list will now raise an error. Use the `extra_options` parameter to specify options that aren't exposed through the `Image.pip_install` signature:
+  ```python
+  image.pip_install("flash-attn", "--no-build-isolation")  # This is now an error!
+  image.pip_install("flash-attn", extra_options="--no-build-isolation")  # Correct spelling
+  ```
+- Removed backwards compatibility for using `label=` or `tag=` keywords in object lookup methods. We standardized these methods to use `name=` as the parameter name, but we recommend using positional arguments:
+  ```python
+  f = modal.Function.from_name("my-app", tag="f")  # No longer supported! Will raise an error!
+  f = modal.Function.from_name("my-app", "f")  # Preferred spelling
+  ```
+- It's no longer possible to invoke a generator Function with `Function.spawn`; previously this warned, now it raises an `InvalidError`. Additionally, the `FunctionCall.get_gen` method has been removed, and it's no longer possible to set `is_generator` when using `FunctionCall.from_id`.
+- Removed the `.resolve()` method on Modal objects. This method had not been publicly documented, but where used it can be replaced straightforwardly with `.hydrate()`. Note that explicit hydration should rarely be necessary: in most cases you can rely on lazy hydration semantics (i.e., objects will be hydrated when the first method that requires server metadata is called).
+- Functions decorated with `@modal.asgi_app` or `@modal.wsgi_app` are now required to be nullary. Previously, we warned in the case where a function was defined with parameters that all had default arguments.
+- Referencing the deprecated `modal.Stub` object will now raise an `AttributeError`, whereas previously it was an alias for `modal.App`. This is a simple name change.

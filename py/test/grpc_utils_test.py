@@ -1,0 +1,736 @@
+# Copyright Modal Labs 2022
+import asyncio
+import pytest
+import time
+import urllib.parse
+from unittest import mock
+
+import grpclib.protocol
+from google.protobuf.any_pb2 import Any
+from grpclib import GRPCError, Status
+
+import modal
+from modal import __version__
+from modal._utils.async_utils import synchronize_api
+from modal._utils.grpc_utils import (
+    ConnectionManager,
+    CustomProtoStatusDetailsCodec,
+    ModalChannel,
+    Retry,
+    RetryTimeoutError,
+    create_channel,
+    create_channel_config,
+    create_channel_with_fallbacks,
+    get_server_retry_policy,
+)
+from modal.exception import ClientClosed, ConnectionError, InvalidError, ServiceError, TimeoutError
+from modal_proto import api_grpc, api_pb2, task_command_router_pb2
+
+from .supports.skip import skip_windows_unix_socket
+
+
+@pytest.mark.asyncio
+async def test_http_channel(servicer, credentials):
+    token_id, token_secret = credentials
+    metadata = {
+        "x-Alingo-Modal-Core-type": str(api_pb2.CLIENT_TYPE_CLIENT),
+        "x-modal-python-version": "3.12.1",
+        "x-Alingo-Modal-Core-version": __version__,
+        "x-modal-token-id": token_id,
+        "x-modal-token-secret": token_secret,
+    }
+    assert servicer.client_addr.startswith("http://")
+    channel = create_channel(servicer.client_addr)
+    client_stub = api_grpc.ModalClientStub(channel)
+
+    req = api_pb2.BlobCreateRequest()
+    resp = await client_stub.BlobCreate(req, metadata=metadata)
+    assert len(resp.blob_ids) > 0
+
+    # The endpoint hostname is injected as a header on every request.
+    host = urllib.parse.urlparse(servicer.client_addr).hostname
+    assert servicer.blob_create_metadata.get("x-modal-host") == host
+
+    channel.close()
+
+
+def test_retry_timeout_error_message():
+    service_exc = RetryTimeoutError(ServiceError("server unavailable"))
+    assert "last error: ServiceError: server unavailable" in str(service_exc)
+    assert "contact Modal support" in str(service_exc)
+    assert isinstance(service_exc.final_exception, ServiceError)
+
+    other_exc = RetryTimeoutError(ConnectionError("connection closed"))
+    assert "last error: ConnectionError: connection closed" in str(other_exc)
+
+    timeout_exc = RetryTimeoutError(asyncio.TimeoutError("deadline exceeded"))
+    assert "last error: TimeoutError: deadline exceeded" in str(timeout_exc)
+    assert isinstance(timeout_exc.final_exception, asyncio.TimeoutError)
+
+
+@skip_windows_unix_socket
+@pytest.mark.asyncio
+async def test_unix_channel(servicer):
+    metadata = {
+        "x-Alingo-Modal-Core-type": str(api_pb2.CLIENT_TYPE_CONTAINER),
+        "x-modal-python-version": "3.12.1",
+        "x-Alingo-Modal-Core-version": __version__,
+    }
+    assert servicer.container_addr.startswith("unix://")
+    channel = create_channel(servicer.container_addr)
+    client_stub = api_grpc.ModalClientStub(channel)
+
+    req = api_pb2.BlobCreateRequest()
+    resp = await client_stub.BlobCreate(req, metadata=metadata)
+    assert len(resp.blob_ids) > 0
+
+    channel.close()
+
+
+@pytest.mark.asyncio
+async def test_http_broken_channel():
+    # A single connection attempt to a broken URL raises immediately (retries and failover live in
+    # create_channel_with_fallbacks).
+    ch = create_channel("https://xyz.invalid")
+    with pytest.raises(OSError):
+        await ch.__connect__()
+
+
+@pytest.mark.asyncio
+async def test_retry_transient_errors(servicer, client):
+    client_stub = client._stub
+
+    @synchronize_api
+    async def wrapped_blob_create(req, **kwargs):
+        return await client_stub.BlobCreate(req, **kwargs)
+
+    # Use the BlobCreate request for retries
+    req = api_pb2.BlobCreateRequest()
+
+    def wrap_grpc_error(status):
+        return [GRPCError(s, "foobar") for s in status]
+
+    # Fail 3 times -> should still succeed
+    servicer.fail_blob_create = wrap_grpc_error([Status.UNAVAILABLE] * 3)
+    await wrapped_blob_create.aio(req)
+    assert servicer.blob_create_metadata.get("x-idempotency-key")
+    assert servicer.blob_create_metadata.get("x-retry-attempt") == "3"
+
+    # Fail 4 times -> should fail
+    servicer.fail_blob_create = wrap_grpc_error([Status.UNAVAILABLE] * 4)
+    with pytest.raises(GRPCError):
+        await wrapped_blob_create.aio(req)
+    assert servicer.blob_create_metadata.get("x-idempotency-key")
+    assert servicer.blob_create_metadata.get("x-retry-attempt") == "3"
+
+    # Fail 5 times, but set max_retries to infinity
+    servicer.fail_blob_create = wrap_grpc_error([Status.UNAVAILABLE] * 5)
+    assert await wrapped_blob_create.aio(req, retry=Retry(max_retries=None, base_delay=0))
+    assert servicer.blob_create_metadata.get("x-idempotency-key")
+    assert servicer.blob_create_metadata.get("x-retry-attempt") == "5"
+
+    # Not a transient error.
+    servicer.fail_blob_create = wrap_grpc_error([Status.PERMISSION_DENIED])
+    with pytest.raises(GRPCError):
+        assert await wrapped_blob_create.aio(req, retry=Retry(max_retries=None, base_delay=0))
+    assert servicer.blob_create_metadata.get("x-idempotency-key")
+    assert servicer.blob_create_metadata.get("x-retry-attempt") == "0"
+
+    # Make sure to respect total_timeout. Once the budget can't fit another attempt, any retryable error is
+    # reported as a timeout, chained to the underlying failure.
+    t0 = time.time()
+    servicer.fail_blob_create = wrap_grpc_error([Status.UNAVAILABLE] * 99)
+    with pytest.raises(RetryTimeoutError) as exc_info:
+        assert await wrapped_blob_create.aio(req, retry=Retry(max_retries=None, total_timeout=3))
+    total_time = time.time() - t0
+    assert total_time <= 3.1
+    assert isinstance(exc_info.value, TimeoutError)
+    assert isinstance(exc_info.value.__cause__, GRPCError)
+    assert isinstance(exc_info.value.final_exception, ServiceError)
+    assert exc_info.value.final_exception._grpc_status == Status.UNAVAILABLE
+    assert "contact Modal support" in str(exc_info.value)
+
+    # A retryable error with budget left keeps its own type when retries run out.
+    servicer.fail_blob_create = wrap_grpc_error([Status.UNAVAILABLE] * 2)
+    with pytest.raises(GRPCError):
+        await wrapped_blob_create.aio(req, retry=Retry(max_retries=1, base_delay=0, total_timeout=30))
+
+    # Check input_plane_region included
+    servicer.fail_blob_create = []  # Reset to no failures
+    await wrapped_blob_create.aio(req, metadata=[("x-modal-input-plane-region", "us-east")])
+    assert servicer.blob_create_metadata.get("x-modal-input-plane-region") == "us-east"
+
+    # Check input_plane_region not included
+    servicer.fail_blob_create = wrap_grpc_error([Status.UNAVAILABLE] * 3)
+    await wrapped_blob_create.aio(req)
+    assert servicer.blob_create_metadata.get("x-idempotency-key")
+    assert servicer.blob_create_metadata.get("x-retry-attempt") == "3"
+    assert servicer.blob_create_metadata.get("x-modal-input-plane-region") is None
+
+    # Check all metadata is included
+    servicer.fail_blob_create = wrap_grpc_error([Status.UNAVAILABLE] * 3)
+    await wrapped_blob_create.aio(req, metadata=[("x-modal-input-plane-region", "us-east")])
+    assert servicer.blob_create_metadata.get("x-idempotency-key")
+    assert servicer.blob_create_metadata.get("x-retry-attempt") == "3"
+    assert servicer.blob_create_metadata.get("x-modal-input-plane-region") == "us-east"
+
+
+@pytest.mark.asyncio
+async def test_retry_total_timeout_drop_raises_timeout_error(servicer, client):
+    async def wedged(servicer, stream):
+        await stream.recv_message()
+        await asyncio.sleep(30)
+
+    req = api_pb2.BlobCreateRequest()
+    with servicer.intercept() as ctx:
+        ctx.set_responder("BlobCreate", wedged)
+
+        # An attempt dropped on the client side because total_timeout elapsed is final and identifiable.
+        with pytest.raises(RetryTimeoutError, match="contact Modal support"):
+            await client.stub.BlobCreate(req, retry=Retry(total_timeout=0.5, attempt_timeout_floor=0.0))
+        assert len(ctx.get_requests("BlobCreate")) == 1
+
+        # A per-attempt drop with budget left is still a plain transient failure that gets retried.
+        with pytest.raises((ConnectionError, ServiceError)):
+            await client.stub.BlobCreate(req, retry=Retry(attempt_timeout=0.05, max_retries=1, base_delay=0))
+        assert len(ctx.get_requests("BlobCreate")) == 3
+
+
+@pytest.mark.asyncio
+async def test_retry_max_retries_reached_before_total_timeout_keeps_original_error(servicer, client):
+    async def unavailable(servicer, stream):
+        await stream.recv_message()
+        raise GRPCError(Status.UNAVAILABLE, "nope")
+
+    req = api_pb2.BlobCreateRequest()
+    with servicer.intercept() as ctx:
+        ctx.set_responder("BlobCreate", unavailable)
+
+        # The retry count, not the clock, ends the operation: the failure is reported as-is even though the
+        # remaining budget couldn't have fit another attempt anyway.
+        with pytest.raises(ServiceError, match="nope") as exc_info:
+            await client.stub.BlobCreate(
+                req, retry=Retry(max_retries=0, total_timeout=30.0, attempt_timeout=1.0, attempt_timeout_floor=60.0)
+            )
+        assert not isinstance(exc_info.value, RetryTimeoutError)
+        assert len(ctx.get_requests("BlobCreate")) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_last_attempt_failing_after_total_timeout_raises_timeout_error(servicer, client):
+    async def slow_unavailable(servicer, stream):
+        await stream.recv_message()
+        await asyncio.sleep(0.3)
+        raise GRPCError(Status.UNAVAILABLE, "nope")
+
+    req = api_pb2.BlobCreateRequest()
+    with servicer.intercept() as ctx:
+        ctx.set_responder("BlobCreate", slow_unavailable)
+
+        # No retries are permitted, but the deadline has passed by the time the attempt fails.
+        with pytest.raises(RetryTimeoutError) as exc_info:
+            await client.stub.BlobCreate(req, retry=Retry(max_retries=0, total_timeout=0.1))
+        assert isinstance(exc_info.value.final_exception, ServiceError)
+        assert len(ctx.get_requests("BlobCreate")) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_timeout_error(servicer, client):
+    client_stub = client._stub
+
+    @synchronize_api
+    async def wrapped_blob_create(req, **kwargs):
+        return await client_stub.BlobCreate(req, **kwargs)
+
+    # Use the BlobCreate request for retries
+    req = api_pb2.BlobCreateRequest()
+    with pytest.raises(InvalidError, match="Retry must be None when timeout is set"):
+        await wrapped_blob_create.aio(req, timeout=4.0)
+
+
+def test_CustomProtoStatusDetailsCodec_round_trip():
+    blob_msg = api_pb2.BlobCreateResponse(blob_id="abc")
+    sandbox_msg = task_command_router_pb2.TaskExecPollResponse(code=31)
+    msgs = [blob_msg, sandbox_msg]
+
+    codec = CustomProtoStatusDetailsCodec()
+    encoded_msg = codec.encode(Status.CANCELLED, "this-is-a-message", msgs)
+    assert isinstance(encoded_msg, bytes)
+
+    decoded_status = api_pb2.RPCStatus.FromString(encoded_msg)
+    assert decoded_status.message == "this-is-a-message"
+    assert decoded_status.code == Status.CANCELLED.value
+    for detail in decoded_status.details:
+        assert detail.type_url.startswith("type.modal.com/")
+
+    decoded_msg = codec.decode(Status.CANCELLED, None, encoded_msg)
+    assert len(decoded_msg) == 2
+    assert decoded_msg == msgs
+
+
+def test_CustomProtoStatusDetailsCodec_type_url_scoping():
+    from google.protobuf.duration_pb2 import Duration
+
+    modal_msg = api_pb2.RPCRetryPolicy(retry_after_secs=1.0)
+    non_modal_msg = Duration(seconds=5)
+
+    codec = CustomProtoStatusDetailsCodec()
+    encoded = codec.encode(Status.INTERNAL, "test", [modal_msg, non_modal_msg])
+    decoded_status = api_pb2.RPCStatus.FromString(encoded)
+
+    assert decoded_status.details[0].type_url == "type.modal.com/modal.client.RPCRetryPolicy"
+    assert decoded_status.details[1].type_url == "type.googleapis.com/google.protobuf.Duration"
+
+
+def test_CustomProtoStatusDetailsCodec_unknown():
+    encoded_details = [
+        Any(type_url="abc", value=b"bad"),
+    ]
+    encoded_msg = api_pb2.RPCStatus(details=encoded_details).SerializeToString()
+    codec = CustomProtoStatusDetailsCodec()
+
+    decoded_msg = codec.decode(Status.INTERNAL, None, encoded_msg)
+    assert not decoded_msg
+
+
+def test_CustomProtoStatusDetailsCodec_google_common_proto_compat():
+    """Check that rpc's encoded with the default GRPC codec works with the
+    CustomProtoStatusDetailsCodec decoder."""
+
+    # ProtoStatusDetailsCodec requires `googleapis-common-protos` to be installed,
+    # which installs `google.rpc`.
+    pytest.importorskip("google.rpc")
+
+    from grpclib.encoding.proto import ProtoStatusDetailsCodec
+
+    blob_msg = api_pb2.BlobCreateResponse(blob_id="abc")
+    sandbox_msg = task_command_router_pb2.TaskExecPollResponse(code=31)
+    msgs = [blob_msg, sandbox_msg]
+
+    grpclib_codec = ProtoStatusDetailsCodec()
+    message = grpclib_codec.encode(Status.INTERNAL, "my-message", details=msgs)
+    codec = CustomProtoStatusDetailsCodec()
+
+    decoded_msg = codec.decode(Status.INTERNAL, None, message)
+    assert len(decoded_msg) == 2
+    assert decoded_msg == msgs
+
+
+@pytest.mark.asyncio
+@pytest.mark.flaky(max_runs=3)
+async def test_codec_with_channel(servicer, client):
+    """Check codec works with channel."""
+
+    details = [api_pb2.BlobCreateResponse(blob_id="abc")]
+
+    async def raise_error(servicer, stream):
+        raise GRPCError(Status.INTERNAL, "Blob create failed", details=details)
+
+    req = api_pb2.BlobCreateRequest()
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("BlobCreate", raise_error)
+        with pytest.raises(GRPCError) as excinfo:
+            await client._stub.BlobCreate.direct(req, timeout=2.0)
+    assert excinfo.value.details == details
+
+
+@pytest.mark.asyncio
+async def test_flash_container_register_deregister(servicer, client):
+    client_stub = client._stub
+
+    @synchronize_api
+    async def wrapped_flash_container_register(req, **kwargs):
+        return await client_stub.FlashContainerRegister(req, **kwargs)
+
+    @synchronize_api
+    async def wrapped_flash_container_deregister(req, **kwargs):
+        return await client_stub.FlashContainerDeregister(req, **kwargs)
+
+    # Test invalid request
+    register_req = api_pb2.FlashContainerRegisterRequest(service_name="test", host="localhost", port=8000)
+    with pytest.raises(InvalidError, match="Retry must be None when timeout is set"):
+        await wrapped_flash_container_register.aio(register_req, timeout=4.0)
+
+    # Test working request
+    await wrapped_flash_container_register.aio(register_req)
+    assert servicer.flash_container_registrations == {"test": "http://localhost:8000"}
+
+    # Test working request
+    deregister_req = api_pb2.FlashContainerDeregisterRequest(service_name="test")
+    await wrapped_flash_container_deregister.aio(deregister_req, timeout=4.0, retry=None)
+    assert servicer.flash_container_registrations == {}
+
+
+@pytest.mark.parametrize(
+    "exception, expected_instruction",
+    [
+        (ValueError(), None),
+        (GRPCError(Status.UNAVAILABLE, "my-message"), None),
+        (GRPCError(Status.UNAVAILABLE, "my-message", details=[api_pb2.FlashContainerListResponse()]), None),
+        (
+            GRPCError(
+                Status.UNAVAILABLE,
+                "my-message",
+                details=[
+                    api_pb2.RPCRetryPolicy(
+                        retry_after_secs=2,
+                    )
+                ],
+            ),
+            api_pb2.RPCRetryPolicy(retry_after_secs=2),
+        ),
+    ],
+)
+def test_get_server_retry_policy(exception, expected_instruction):
+    assert get_server_retry_policy(exception) == expected_instruction
+
+
+def test_channel_config():
+    config = create_channel_config()
+
+    assert config._keepalive_time == 30.0
+    assert config._keepalive_timeout == 10.0
+    assert config._keepalive_permit_without_calls is True
+    assert config.http2_connection_window_size == 64 * 1024 * 1024
+    assert config.http2_stream_window_size == 64 * 1024 * 1024
+
+
+def _keepalive_probes_sent(config, num_probe_intervals: int, monkeypatch, sending_requests: bool = False) -> int:
+    """Count the probes grpclib sends on a connection that either only awaits a response or keeps sending requests.
+
+    Replays its probe schedule against `_is_need_send_ping`, one tick per probe
+    interval.
+    """
+    now = config._keepalive_time
+    monkeypatch.setattr(grpclib.protocol.time, "monotonic", lambda: now)
+
+    connection = grpclib.protocol.Connection(mock.MagicMock(), mock.MagicMock(), config=config)
+    probes = 0
+    for _ in range(num_probe_intervals):
+        if sending_requests:
+            connection.headers_send_process()
+        if connection._is_need_send_ping():
+            connection.last_ping_sent = now
+            connection.ping_count_in_sequence += 1
+            probes += 1
+        now += config._keepalive_time
+    return probes
+
+
+def test_channel_config_keepalive_probing_stops_without_data(monkeypatch):
+    assert _keepalive_probes_sent(create_channel_config(), 20, monkeypatch) == 2
+
+
+def test_channel_config_keepalive_probes_while_sending_requests(monkeypatch):
+    assert _keepalive_probes_sent(create_channel_config(), 20, monkeypatch, sending_requests=True) == 20
+
+
+def test_channel_config_sustained_keepalive_probes_for_connection_lifetime(monkeypatch):
+    config = create_channel_config(sustained_keepalive=True)
+
+    assert _keepalive_probes_sent(config, 20, monkeypatch) == 20
+    assert config._http2_min_sent_ping_interval_without_data < config._keepalive_time
+
+
+@synchronize_api
+async def test_retry_transient_errors_grpc_retry(servicer, client, caplog, monkeypatch):
+    monkeypatch.setattr(modal._utils.grpc_utils, "SERVER_RETRY_WARNING_TIME_INTERVAL", 0.3)
+    req = api_pb2.BlobCreateRequest()
+    servicer.fail_blob_create = [GRPCError(Status.RESOURCE_EXHAUSTED, "foobar")] + [
+        GRPCError(Status.RESOURCE_EXHAUSTED, "foobar-message", details=[api_pb2.RPCRetryPolicy(retry_after_secs=0.1)])
+    ] * 10
+
+    with pytest.raises(GRPCError):
+        await client._stub.BlobCreate(req)
+
+    assert servicer.blob_create_metadata.get("x-idempotency-key")
+    assert servicer.blob_create_metadata.get("x-throttle-retry-attempt") == "10"
+
+    # With an interval of 0.3 sec and retrying for a 1.0 sec, warning message is shown at time 0.0, 0.3, 0.6, 0.9
+    message_count = caplog.text.count("Retrying...")
+    # Test can be flaky so we assert that there are 3 or 4 messages
+    assert message_count in (3, 4)
+
+
+@synchronize_api
+async def test_retry_transient_errors_grpc_retry_total_timeout(servicer, client, monkeypatch):
+    """No retries when MODAL_MAX_THROTTLE_WAIT is lower than retry_after_secs."""
+
+    monkeypatch.setenv("MODAL_MAX_THROTTLE_WAIT", "1")
+    req = api_pb2.BlobCreateRequest()
+    servicer.fail_blob_create = [
+        GRPCError(Status.RESOURCE_EXHAUSTED, "foobar"),
+        GRPCError(
+            Status.RESOURCE_EXHAUSTED,
+            "foobar-message",
+            details=[api_pb2.RPCRetryPolicy(retry_after_secs=2)],
+        ),
+    ]
+
+    with pytest.raises(GRPCError):
+        await client._stub.BlobCreate(req)
+
+    assert servicer.blob_create_metadata.get("x-throttle-retry-attempt") == "0"
+
+
+@synchronize_api
+async def test_retry_transient_errors_grpc_no_retries(servicer, client, monkeypatch):
+    """No retries when MODAL_MAX_THROTTLE_WAIT is 0."""
+
+    monkeypatch.setenv("MODAL_MAX_THROTTLE_WAIT", "0")
+    req = api_pb2.BlobCreateRequest()
+    servicer.fail_blob_create = [
+        GRPCError(Status.RESOURCE_EXHAUSTED, "foobar"),
+        GRPCError(
+            Status.RESOURCE_EXHAUSTED,
+            "foobar-message",
+            details=[api_pb2.RPCRetryPolicy(retry_after_secs=0.1)],
+        ),
+    ]
+
+    with pytest.raises(GRPCError):
+        await client._stub.BlobCreate(req)
+
+    assert servicer.blob_create_metadata.get("x-throttle-retry-attempt") == "0"
+
+
+@skip_windows_unix_socket
+@pytest.mark.asyncio
+async def test_ModalChannel(servicer):
+    error_msg = "Sandbox detached"
+    metadata = {
+        "x-Alingo-Modal-Core-type": str(api_pb2.CLIENT_TYPE_CONTAINER),
+        "x-modal-python-version": "3.12.1",
+        "x-Alingo-Modal-Core-version": __version__,
+    }
+    assert servicer.container_addr.startswith("unix://")
+    o = urllib.parse.urlparse(servicer.container_addr)
+    channel = ModalChannel(path=o.path, closed_error_message=error_msg)
+
+    client_stub = api_grpc.ModalClientStub(channel)
+    req = api_pb2.BlobCreateRequest()
+    resp = await client_stub.BlobCreate(req, metadata=metadata)
+    assert len(resp.blob_ids) > 0
+
+    channel.close()
+
+    with pytest.raises(ClientClosed, match=error_msg):
+        await client_stub.BlobCreate(req, metadata=metadata)
+
+
+@pytest.mark.asyncio
+async def test_modal_channel_connected_checks_transport():
+    channel = ModalChannel()
+    assert not channel._connected
+
+    channel._protocol = mock.Mock()  # type: ignore
+    channel._protocol.handler.connection_lost = False  # type: ignore
+    channel._protocol.connection.is_closing.return_value = False  # type: ignore
+    assert channel._connected
+
+    channel._protocol.connection.is_closing.return_value = True
+    assert not channel._connected
+
+
+@pytest.mark.asyncio
+async def test_create_channel_with_fallbacks_single_url(servicer):
+    # With a single URL, the channel is created and connected normally.
+    channel = await create_channel_with_fallbacks(servicer.client_addr)
+    try:
+        assert channel is not None
+    finally:
+        channel.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connection_type", ["tcp", "tls", "proxy", "unix"])
+async def test_modal_channel_logs_connection_attempts(connection_type, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="modal-utils")
+    use_tls = connection_type in ("tls", "proxy")
+    target = "/tmp/router.sock" if connection_type == "unix" else "worker.example:443"
+    channel = (
+        ModalChannel(path=target) if connection_type == "unix" else ModalChannel("worker.example", 443, ssl=use_tls)
+    )
+    protocol = mock.Mock()
+    protocol.handler.connection_lost = False
+    protocol.connection.is_closing.return_value = False
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    error = ConnectionResetError()
+
+    async def create_connection(*args, **kwargs):
+        started.set()
+        await finish.wait()
+        if protocol.handler.connection_lost:
+            raise error
+        return protocol
+
+    from modal._utils import proxy_support
+
+    proxy_url = "http://username:password@proxy.example:8080" if connection_type == "proxy" else None
+    monkeypatch.setattr(proxy_support, "get_proxy_url", lambda *args, **kwargs: proxy_url)
+    monkeypatch.setattr(proxy_support, "create_proxied_connection", create_connection)
+    monkeypatch.setattr(grpclib.client.Channel, "_create_connection", create_connection)
+    monkeypatch.setattr(
+        modal._utils.grpc_utils, "time", mock.Mock(monotonic=mock.Mock(side_effect=[10, 12.5, 20, 30.25]))
+    )
+
+    connect = asyncio.create_task(channel.__connect__())
+    try:
+        await started.wait()
+        start_message = f"Starting connection attempt to {target} (TLS={use_tls})"
+        assert caplog.messages == [start_message]
+
+        finish.set()
+        assert await connect is protocol
+        # A reused connection doesn't log a new attempt.
+        assert await channel.__connect__() is protocol
+        assert caplog.messages == [start_message, f"Connection to {target} established after 2.500s"]
+
+        protocol.handler.connection_lost = True
+        with pytest.raises(ConnectionResetError) as exc:
+            await channel.__connect__()
+        assert exc.value is error
+        assert caplog.messages[-2:] == [
+            start_message,
+            f"Connection attempt to {target} failed after 10.250s: ConnectionResetError()",
+        ]
+        assert all(record.levelname == "DEBUG" for record in caplog.records)
+        assert "password" not in caplog.text
+    finally:
+        finish.set()
+        await connect
+        channel.close()
+
+
+@pytest.mark.asyncio
+async def test_modal_channel_logs_cancelled_connection(monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="modal-utils")
+    channel = ModalChannel("worker.example", 443)
+    started = asyncio.Event()
+
+    async def create_connection(*args, **kwargs):
+        started.set()
+        await asyncio.Future()
+
+    from modal._utils import proxy_support
+
+    monkeypatch.setattr(proxy_support, "get_proxy_url", lambda *args, **kwargs: None)
+    monkeypatch.setattr(grpclib.client.Channel, "_create_connection", create_connection)
+    connect = asyncio.create_task(channel.__connect__())
+    await started.wait()
+    connect.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await connect
+    assert caplog.messages[0] == "Starting connection attempt to worker.example:443 (TLS=False)"
+    assert caplog.messages[1].startswith("Connection attempt to worker.example:443 cancelled after ")
+    assert caplog.messages[1].endswith(": CancelledError()")
+    channel.close()
+
+
+@pytest.mark.asyncio
+async def test_create_channel_with_fallbacks_falls_back(servicer, monkeypatch):
+    # Keep each candidate's connect budget short so the unreachable URL loses the race quickly.
+    monkeypatch.setattr(modal._utils.async_utils, "RETRY_N_ATTEMPTS_OVERRIDE", 1)
+    # The primary URL is unresolvable; the working servicer address should win the race.
+    # stagger_delay=0 starts both attempts immediately to keep the test fast.
+    channel = await create_channel_with_fallbacks(f"https://xyz.invalid,{servicer.client_addr}", stagger_delay=0)
+    try:
+        assert channel is not None
+    finally:
+        channel.close()
+
+
+@pytest.mark.asyncio
+async def test_create_channel_with_fallbacks_fast_failover(servicer, monkeypatch):
+    # A failing primary should fall over immediately, without waiting out the full stagger delay.
+    monkeypatch.setattr(modal._utils.async_utils, "RETRY_N_ATTEMPTS_OVERRIDE", 1)
+
+    # Make the primary's connect fail instantly and deterministically. Relying on a real
+    # connection-refused (a closed port) or DNS failure (a bogus hostname) makes the timing
+    # OS/resolver/load-dependent, which is what made this test flaky. The fallback keeps its real
+    # channel, so the race still exercises a genuine successful connection.
+    primary_url = "https://primary.invalid"
+    real_create_channel = modal._utils.grpc_utils.create_channel
+
+    def fake_create_channel(url, *args, **kwargs):
+        channel = real_create_channel(url, *args, **kwargs)
+        if url == primary_url:
+
+            async def fail_connect():
+                raise OSError("connection refused")
+
+            monkeypatch.setattr(channel, "__connect__", fail_connect)
+        return channel
+
+    monkeypatch.setattr(modal._utils.grpc_utils, "create_channel", fake_create_channel)
+
+    t0 = time.monotonic()
+    channel = await create_channel_with_fallbacks(f"{primary_url},{servicer.client_addr}", stagger_delay=1.0)
+    elapsed = time.monotonic() - t0
+    try:
+        assert channel is not None
+        assert elapsed < 0.5
+    finally:
+        channel.close()
+
+
+@pytest.mark.asyncio
+async def test_create_channel_with_fallbacks_all_unreachable(monkeypatch):
+    from modal.exception import ConnectionError as ModalConnectionError
+
+    monkeypatch.setattr(modal._utils.async_utils, "RETRY_N_ATTEMPTS_OVERRIDE", 1)
+    with pytest.raises(ModalConnectionError):
+        await create_channel_with_fallbacks("https://xyz.invalid,https://abc.invalid", stagger_delay=0)
+
+
+@pytest.mark.asyncio
+async def test_connection_manager_concurrent_callers_share_one_channel(servicer):
+    manager = ConnectionManager(client=mock.Mock(), metadata={})
+    connects = 0
+
+    original = modal._utils.grpc_utils.create_channel_with_fallbacks
+
+    async def counting_create(*args, **kwargs):
+        nonlocal connects
+        connects += 1
+        return await original(*args, **kwargs)
+
+    with mock.patch.object(modal._utils.grpc_utils, "create_channel_with_fallbacks", counting_create):
+        channels = await asyncio.gather(*[manager.get_or_create_channel(servicer.client_addr) for _ in range(8)])
+
+    try:
+        assert connects == 1
+        assert len({id(channel) for channel in channels}) == 1
+    finally:
+        manager.close()
+
+    # Every channel handed out is reachable by close(), so none are left connected.
+    assert all(channel._protocol is None for channel in channels)
+
+
+@pytest.mark.asyncio
+async def test_connection_manager_failed_connect_is_not_reused(servicer):
+    manager = ConnectionManager(client=mock.Mock(), metadata={})
+    calls = 0
+
+    original = modal._utils.grpc_utils.create_channel_with_fallbacks
+
+    async def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError("Could not connect to the Modal server.")
+        return await original(*args, **kwargs)
+
+    with mock.patch.object(modal._utils.grpc_utils, "create_channel_with_fallbacks", fail_once):
+        with pytest.raises(ConnectionError):
+            await manager.get_or_create_channel(servicer.client_addr)
+        channel = await manager.get_or_create_channel(servicer.client_addr)
+
+    try:
+        assert calls == 2
+        assert channel is not None
+    finally:
+        manager.close()

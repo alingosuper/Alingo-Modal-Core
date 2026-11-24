@@ -1,0 +1,252 @@
+# Copyright Modal Labs 2023
+import functools
+import pytest
+import time
+from unittest.mock import Mock
+
+from grpclib import Status
+
+from modal import fastapi_endpoint, method
+from modal._output.status import FunctionCreationStatus
+from modal._serialization import serialize_data_format
+from modal._utils import async_utils
+from modal._utils.function_utils import (
+    FunctionSourceInfo,
+    _stream_function_call_data,
+    callable_has_non_self_non_default_params,
+    callable_has_non_self_params,
+    get_schedule_str,
+    normalize_fractional_target_concurrency,
+    validate_target_concurrency,
+)
+from modal.exception import InvalidError
+from modal_proto import api_pb2
+
+GLOBAL_VARIABLE = "whatever"
+
+
+def hasarg(a): ...
+
+
+def noarg(): ...
+
+
+def defaultarg(a="hello"): ...
+
+
+def wildcard_args(*wildcard_list, **wildcard_dict): ...
+
+
+def test_is_nullary():
+    assert not FunctionSourceInfo(hasarg).is_nullary()
+    assert FunctionSourceInfo(noarg).is_nullary()
+    assert FunctionSourceInfo(defaultarg).is_nullary()
+    assert FunctionSourceInfo(wildcard_args).is_nullary()
+
+
+class Cls:
+    def f1(self):
+        pass
+
+    def f2(self, x):
+        pass
+
+    def f3(self, *args):
+        pass
+
+    def f4(self, x=1):
+        pass
+
+
+def f5():
+    pass
+
+
+def f6(x):
+    pass
+
+
+def f7(x=1):
+    pass
+
+
+def test_callable_has_non_self_params():
+    assert not callable_has_non_self_params(Cls.f1)
+    assert not callable_has_non_self_params(Cls().f1)
+    assert callable_has_non_self_params(Cls.f2)
+    assert callable_has_non_self_params(Cls().f2)
+    assert callable_has_non_self_params(Cls.f3)
+    assert callable_has_non_self_params(Cls().f3)
+    assert callable_has_non_self_params(Cls.f4)
+    assert callable_has_non_self_params(Cls().f4)
+    assert not callable_has_non_self_params(f5)
+    assert callable_has_non_self_params(f6)
+    assert callable_has_non_self_params(f7)
+
+
+def test_callable_has_non_self_non_default_params():
+    assert not callable_has_non_self_non_default_params(Cls.f1)
+    assert not callable_has_non_self_non_default_params(Cls().f1)
+    assert callable_has_non_self_non_default_params(Cls.f2)
+    assert callable_has_non_self_non_default_params(Cls().f2)
+    assert callable_has_non_self_non_default_params(Cls.f3)
+    assert callable_has_non_self_non_default_params(Cls().f3)
+    assert not callable_has_non_self_non_default_params(Cls.f4)
+    assert not callable_has_non_self_non_default_params(Cls().f4)
+    assert not callable_has_non_self_non_default_params(f5)
+    assert callable_has_non_self_non_default_params(f6)
+    assert not callable_has_non_self_non_default_params(f7)
+
+
+class Foo:
+    def __init__(self):
+        pass
+
+    @method()
+    def bar(self):
+        return "hello"
+
+    @fastapi_endpoint()
+    def web(self):
+        pass
+
+
+# run test on same event loop as servicer
+@async_utils.synchronize_api
+async def test_stream_function_call_data(servicer, client):
+    req = api_pb2.FunctionCallPutDataRequest(
+        function_call_id="fc-bar",
+        data_chunks=[
+            api_pb2.DataChunk(
+                data_format=api_pb2.DATA_FORMAT_PICKLE,
+                data=serialize_data_format("hello", api_pb2.DATA_FORMAT_PICKLE),
+                index=1,
+            ),
+            api_pb2.DataChunk(
+                data_format=api_pb2.DATA_FORMAT_PICKLE,
+                data=serialize_data_format("world", api_pb2.DATA_FORMAT_PICKLE),
+                index=2,
+            ),
+        ],
+    )
+    await client._stub.FunctionCallPutDataOut(req)
+
+    t0 = time.time()
+    gen = _stream_function_call_data(client, None, "fc-bar", variant="data_out")
+    servicer.fail_get_data_out = [Status.INTERNAL] * 3
+    assert await gen.__anext__() == "hello"
+    elapsed = time.time() - t0
+    assert 0.111 <= elapsed < 1.0
+
+    assert await gen.__anext__() == "world"
+
+
+def decorator(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        return f
+
+    return wrapper
+
+
+def has_global_ref():
+    assert GLOBAL_VARIABLE
+
+
+@pytest.mark.parametrize("func", [has_global_ref, decorator(has_global_ref)])
+def test_global_variable_extraction(func):
+    info = FunctionSourceInfo(func)
+    assert info.get_globals().get("GLOBAL_VARIABLE") == GLOBAL_VARIABLE
+
+
+def test_url_displayed_function_create_status_web_url(monkeypatch):
+    status_row_mock = Mock()
+    output_mgr_mock = Mock()
+    output_mgr_mock.add_status_row.return_value = status_row_mock
+    monkeypatch.setattr("modal.output.OutputManager.get", lambda: output_mgr_mock)
+
+    web_url = "https://user--endpoint-f.me"
+    tag = "fu-abc"
+
+    response = api_pb2.FunctionCreateResponse(
+        function_id="fu-abc",
+        function=api_pb2.Function(
+            module_name="my_module",
+            function_name="f",
+        ),
+        handle_metadata=api_pb2.FunctionHandleMetadata(web_url=web_url),
+    )
+
+    with FunctionCreationStatus("Function", tag) as function_creation_status:
+        function_creation_status.set_response(response)
+
+    start_message = status_row_mock.message.call_args.args[0]
+    assert f"Creating Function {tag}..." == start_message
+
+    finish_message = status_row_mock.details.call_args.args[0]
+    assert web_url in finish_message
+
+
+def test_validate_target_concurrency_accepts_valid_values():
+    validate_target_concurrency(0, "target_concurrency", allow_fractional=False)
+    validate_target_concurrency(10, "target_concurrency", allow_fractional=False)
+    validate_target_concurrency(0.0, "target_concurrency", allow_fractional=True)
+    validate_target_concurrency(2.5, "target_concurrency", allow_fractional=True)
+    validate_target_concurrency(1.234, "target_concurrency", allow_fractional=True)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (0, 0.0),
+        (0.0, 0.0),
+        (0.01, 1.0),
+        (0.5, 1.0),
+        (0.99, 1.0),
+        (1, 1.0),
+        (1.0, 1.0),
+        (1.234, 1.23),
+        (1.235, 1.24),
+        (2.5, 2.5),
+        (20, 20.0),
+    ],
+)
+def test_normalize_fractional_target_concurrency(value, expected):
+    assert normalize_fractional_target_concurrency(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "allow_fractional", "match"),
+    [
+        ("10", False, "must be a number"),
+        (True, False, "must be a number"),
+        (float("nan"), False, "must be finite"),
+        (float("inf"), False, "must be finite"),
+        (-1, False, "must be non-negative"),
+        (1.5, False, "must be an integer"),
+        (1.0, False, "must be an integer"),
+    ],
+)
+def test_validate_target_concurrency_rejects_invalid_values(value, allow_fractional, match):
+    with pytest.raises(InvalidError, match=match):
+        validate_target_concurrency(value, "target_concurrency", allow_fractional=allow_fractional)
+
+
+@pytest.mark.parametrize(
+    ("schedule", "expected"),
+    [
+        (api_pb2.Schedule(), None),
+        (
+            api_pb2.Schedule(
+                period=api_pb2.Schedule.Period(years=1, months=2, weeks=3, days=4, hours=5, minutes=6, seconds=7)
+            ),
+            "Period(years=1, months=2, weeks=3, days=4, hours=5, minutes=6, seconds=7.0)",
+        ),
+        (
+            api_pb2.Schedule(cron=api_pb2.Schedule.Cron(cron_string="* * * * *", timezone="America/Los_Angeles")),
+            "Cron('* * * * *', America/Los_Angeles)",
+        ),
+    ],
+)
+def test_get_schedule_str(schedule: api_pb2.Schedule, expected: str | None):
+    assert get_schedule_str(schedule) == expected

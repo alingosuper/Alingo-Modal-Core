@@ -1,0 +1,792 @@
+package modal
+
+// Client construction, auth, timeout, and retry logic for Modal.
+
+import (
+	"context"
+	"crypto/rsa"
+	"crypto/tls"
+	"fmt"
+	"log/slog"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/modal-labs/Alingo-Modal-Core/go/proto/modal_proto"
+)
+
+// clientWithConn wraps a ModalClientClient and its underlying gRPC connection
+// to enable proper cleanup of connection-owned goroutines.
+type clientWithConn struct {
+	pb.ModalClientClient
+	conn *grpc.ClientConn
+}
+
+// Close closes the underlying gRPC connection, terminating all associated goroutines.
+func (c *clientWithConn) Close() error {
+	if c.conn != nil {
+		return c.conn.Close()
+	}
+	return nil
+}
+
+// Client exposes services for interacting with Modal resources.
+// You should not instantiate it directly, and instead use [NewClient]/[NewClientWithOptions].
+type Client struct {
+	Apps              AppService
+	CloudBucketMounts CloudBucketMountService
+	Cls               ClsService
+	Environments      *EnvironmentService
+	Functions         FunctionService
+	FunctionCalls     FunctionCallService
+	Images            ImageService
+	Proxies           ProxyService
+	Queues            QueueService
+	Sandboxes         SandboxService
+	SandboxSnapshots  SandboxSnapshotService
+	Secrets           SecretService
+	Volumes           VolumeService
+
+	config                       config
+	profile                      Profile
+	sdkVersion                   string
+	logger                       *slog.Logger
+	cpClient                     *clientWithConn            // control plane client
+	ipClients                    map[string]*clientWithConn // input plane clients
+	authTokenManager             *authTokenManager
+	additionalUnaryInterceptors  []grpc.UnaryClientInterceptor
+	additionalStreamInterceptors []grpc.StreamClientInterceptor
+	mu                           sync.RWMutex
+	environmentManager           *environmentManager
+	oauthJWTKey                  *rsa.PrivateKey
+	serverWarningLogger          *serverWarningLogger
+}
+
+// NewClient generates a new client with the default profile configuration read from environment variables and ~/.modal.toml.
+func NewClient() (*Client, error) {
+	return NewClientWithOptions(nil)
+}
+
+// OAuthCredentialsParams defines credentials for authenticating through a Modal OAuth integration.
+type OAuthCredentialsParams struct {
+	// RefreshToken is returned by Modal's token endpoint.
+	RefreshToken string
+	// ClientID is a Modal-issued OAuth client ID, with an "oc-" prefix.
+	ClientID string
+	// JWTKey is an unencrypted RSA private key encoded as PEM, with literal or escaped newlines.
+	JWTKey string
+}
+
+// ClientParams defines credentials and options for initializing the Modal client.
+type ClientParams struct {
+	TokenID     string
+	TokenSecret string
+	// OAuthCredentials overrides profile credentials when non-nil. It must contain
+	// a refresh token, client ID, and JWT key.
+	OAuthCredentials *OAuthCredentialsParams
+	Environment      string
+	Config           *config
+	Logger           *slog.Logger
+	MaxThrottleWait  *time.Duration
+	// ControlPlaneClient is a custom gRPC client for testing.
+	// If provided, the client will use this instead of creating its own connection.
+	// Typically used with mock clients in tests.
+	ControlPlaneClient pb.ModalClientClient
+	// ControlPlaneConn is the underlying gRPC connection for ControlPlaneClient.
+	// If provided, Client.Close() will close this connection for proper cleanup.
+	// Leave nil for mock clients that don't have real connections.
+	ControlPlaneConn *grpc.ClientConn
+	// GRPCUnaryInterceptors allows custom gRPC unary interceptors for telemetry, tracing, and observability.
+	// These are appended after Modal's built-in interceptors (header injection, auth, retry, timeout).
+	// Note that the Modal gRPC API is not considered a public API, and can change without warning.
+	GRPCUnaryInterceptors []grpc.UnaryClientInterceptor
+	// GRPCStreamInterceptors allows custom gRPC stream interceptors for telemetry, tracing, and observability.
+	// These are appended after Modal's built-in stream interceptors (header injection).
+	// Note that the Modal gRPC API is not considered a public API, and can change without warning.
+	GRPCStreamInterceptors []grpc.StreamClientInterceptor
+}
+
+// NewClientWithOptions generates a new client and allows overriding options in the default profile configuration.
+func NewClientWithOptions(params *ClientParams) (*Client, error) {
+	ctx := context.Background()
+	if params == nil {
+		params = &ClientParams{}
+	}
+
+	var cfg config
+	if params.Config != nil {
+		cfg = *params.Config
+	} else {
+		var err error
+		cfg, err = readConfigFile()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read config file: %w", err)
+		}
+	}
+
+	profile := getProfile(os.Getenv("MODAL_PROFILE"), cfg)
+
+	hasTokenParams := params.TokenID != "" || params.TokenSecret != ""
+	hasOAuthParams := params.OAuthCredentials != nil
+	if hasTokenParams {
+		if params.TokenID != "" {
+			profile.TokenID = params.TokenID
+		}
+		if params.TokenSecret != "" {
+			profile.TokenSecret = params.TokenSecret
+		}
+		profile.OAuthRefreshToken = ""
+		profile.OAuthClientID = ""
+		profile.OAuthJWTKey = ""
+	} else if hasOAuthParams {
+		profile.TokenID = ""
+		profile.TokenSecret = ""
+		profile.OAuthRefreshToken = params.OAuthCredentials.RefreshToken
+		profile.OAuthClientID = params.OAuthCredentials.ClientID
+		profile.OAuthJWTKey = params.OAuthCredentials.JWTKey
+	}
+	if err := validateProfileCredentials(profile, hasOAuthParams); err != nil {
+		return nil, err
+	}
+	if params.Environment != "" {
+		profile.Environment = params.Environment
+	}
+	if params.MaxThrottleWait != nil {
+		profile.MaxThrottleWait = params.MaxThrottleWait
+	}
+
+	var logger *slog.Logger
+	var err error
+
+	if params.Logger != nil {
+		logger = params.Logger
+	} else {
+		logger, err = newLogger(profile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize logger: %w", err)
+		}
+	}
+
+	var oauthJWTKey *rsa.PrivateKey
+	if profile.OAuthJWTKey != "" {
+		oauthJWTKey, err = parseOAuthJWTKey(profile.OAuthJWTKey)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	c := &Client{
+		config:                       cfg,
+		profile:                      profile,
+		sdkVersion:                   sdkVersion,
+		logger:                       logger,
+		serverWarningLogger:          newServerWarningLogger(logger),
+		ipClients:                    map[string]*clientWithConn{},
+		additionalUnaryInterceptors:  params.GRPCUnaryInterceptors,
+		additionalStreamInterceptors: params.GRPCStreamInterceptors,
+		oauthJWTKey:                  oauthJWTKey,
+	}
+
+	logger.DebugContext(ctx, "Initializing Modal client", "version", sdkVersion, "server_url", profile.ServerURL)
+
+	if params.ControlPlaneClient != nil {
+		c.cpClient = &clientWithConn{
+			ModalClientClient: params.ControlPlaneClient,
+			conn:              params.ControlPlaneConn,
+		}
+	} else {
+		conn, client, err := dialWithFallbacks(ctx, profile, c)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create control plane client: %w", err)
+		}
+		c.cpClient = &clientWithConn{ModalClientClient: client, conn: conn}
+	}
+
+	c.authTokenManager = newAuthTokenManager(authTokenGetFetcher(c.cpClient), c.logger)
+	c.environmentManager = newEnvironmentManager(c.cpClient, c.logger)
+
+	logger.DebugContext(ctx, "Modal client initialized successfully")
+
+	c.Apps = &appServiceImpl{client: c}
+	c.CloudBucketMounts = &cloudBucketMountServiceImpl{client: c}
+	c.Cls = &clsServiceImpl{client: c}
+	c.Environments = &EnvironmentService{client: c, Objects: &environmentObjectsServiceImpl{client: c}}
+	c.Functions = &functionServiceImpl{client: c}
+	c.FunctionCalls = &functionCallServiceImpl{client: c}
+	c.Images = &imageServiceImpl{client: c}
+	c.Proxies = &proxyServiceImpl{client: c}
+	c.Queues = &queueServiceImpl{client: c}
+	c.Sandboxes = &sandboxServiceImpl{client: c}
+	c.SandboxSnapshots = &sandboxSnapshotServiceImpl{client: c}
+	c.Secrets = &secretServiceImpl{client: c}
+	c.Volumes = &volumeServiceImpl{client: c}
+
+	return c, nil
+}
+
+func validateProfileCredentials(profile Profile, hasExplicitOAuthCredentials bool) error {
+	hasTokenCredentials := profile.TokenID != "" || profile.TokenSecret != ""
+	hasOAuthCredentials := hasExplicitOAuthCredentials || profile.OAuthRefreshToken != "" || profile.OAuthClientID != "" || profile.OAuthJWTKey != ""
+	if hasTokenCredentials && hasOAuthCredentials {
+		return InvalidError{Exception: "Modal token credentials and OAuth credentials cannot both be configured"}
+	}
+	if hasOAuthCredentials && (profile.OAuthRefreshToken == "" || profile.OAuthClientID == "" || profile.OAuthJWTKey == "") {
+		return InvalidError{Exception: "OAuth refresh token, client ID, and JWT key must be configured"}
+	}
+	return nil
+}
+
+// ipClient returns the input plane client for the given server URL.
+// It creates a new client if one doesn't exist for that specific server URL, otherwise it returns the existing client.
+func (c *Client) ipClient(ctx context.Context, serverURL string) (pb.ModalClientClient, error) {
+	c.mu.RLock()
+	if client, ok := c.ipClients[serverURL]; ok {
+		c.mu.RUnlock()
+		return client, nil
+	}
+	c.mu.RUnlock()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if client, ok := c.ipClients[serverURL]; ok {
+		return client, nil
+	}
+
+	c.logger.DebugContext(ctx, "Creating input plane client", "server_url", serverURL)
+	prof := c.profile
+	prof.ServerURL = serverURL
+	conn, client, err := newClient(ctx, prof, c, c.additionalUnaryInterceptors, c.additionalStreamInterceptors)
+	if err != nil {
+		return nil, err
+	}
+	c.ipClients[serverURL] = &clientWithConn{ModalClientClient: client, conn: conn}
+	return c.ipClients[serverURL], nil
+}
+
+// getImageBuilderVersion returns the image builder version by querying the server where the local profile takes
+// precedence.
+func (c *Client) getImageBuilderVersion(ctx context.Context, environmentName string) (string, error) {
+	if c.profile.ImageBuilderVersion != "" {
+		return c.profile.ImageBuilderVersion, nil
+	}
+	return c.environmentManager.GetImageBuilderVersion(ctx, firstNonEmpty(environmentName, c.profile.Environment))
+}
+
+// Close closes all gRPC connections.
+func (c *Client) Close() {
+	ctx := context.Background()
+	c.logger.DebugContext(ctx, "Closing Modal client")
+
+	if c.cpClient != nil {
+		if err := c.cpClient.Close(); err != nil {
+			c.logger.WarnContext(ctx, "Failed to close control plane connection", "error", err)
+		}
+	}
+
+	c.mu.Lock()
+	for serverURL, client := range c.ipClients {
+		if err := client.Close(); err != nil {
+			c.logger.WarnContext(ctx, "Failed to close input plane connection", "server_url", serverURL, "error", err)
+		}
+	}
+	c.ipClients = map[string]*clientWithConn{}
+	c.mu.Unlock()
+
+	c.logger.DebugContext(ctx, "Modal client closed")
+}
+
+// Version returns the SDK version.
+func (c *Client) Version() string {
+	return c.sdkVersion
+}
+
+// timeoutCallOption carries a per-RPC absolute timeout.
+type timeoutCallOption struct {
+	grpc.EmptyCallOption
+	timeout time.Duration
+}
+
+// retryCallOption carries per-RPC retry overrides.
+type retryCallOption struct {
+	grpc.EmptyCallOption
+	retries         *int
+	baseDelay       *time.Duration
+	maxDelay        *time.Duration
+	delayFactor     *float64
+	additionalCodes []codes.Code
+}
+
+const (
+	apiEndpoint                = "api.modal.com:443"
+	maxMessageSize             = 100 * 1024 * 1024 // 100 MB
+	windowSize                 = 64 * 1024 * 1024  // 64 MiB
+	defaultRetryAttempts       = 3
+	defaultRetryBaseDelay      = 100 * time.Millisecond
+	defaultRetryMaxDelay       = 1 * time.Second
+	defaultRetryBackoffMul     = 2.0
+	serverRetryWarningInterval = 30 * time.Second
+	fallbackStaggerDelay       = 3 * time.Second  // head start each server URL gets over the next
+	fallbackConnectTimeout     = 60 * time.Second // total time to connect to any server URL
+)
+
+var retryableGrpcStatusCodes = map[codes.Code]struct{}{
+	codes.DeadlineExceeded: {},
+	codes.Unavailable:      {},
+	codes.Canceled:         {},
+	codes.Internal:         {},
+	codes.Unknown:          {},
+}
+
+func isRetryableGrpc(err error) bool {
+	if st, ok := status.FromError(err); ok {
+		if _, ok := retryableGrpcStatusCodes[st.Code()]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// newClient dials the given server URL with auth/timeout/retry interceptors installed.
+// It returns (conn, stub). Close the conn when done.
+func newClient(ctx context.Context, profile Profile, c *Client, customUnaryInterceptors []grpc.UnaryClientInterceptor, customStreamInterceptors []grpc.StreamClientInterceptor) (*grpc.ClientConn, pb.ModalClientClient, error) {
+	var target string
+	var creds credentials.TransportCredentials
+	var scheme string
+	if after, ok := strings.CutPrefix(profile.ServerURL, "https://"); ok {
+		target = after
+		creds = credentials.NewTLS(&tls.Config{})
+		scheme = "https"
+	} else if after, ok := strings.CutPrefix(profile.ServerURL, "http://"); ok {
+		target = after
+		creds = insecure.NewCredentials()
+		scheme = "http"
+	} else {
+		return nil, nil, status.Errorf(codes.InvalidArgument, "invalid server URL: %s", profile.ServerURL)
+	}
+
+	c.logger.DebugContext(ctx, "Connecting to Modal server", "target", target, "scheme", scheme)
+
+	parsedURL, err := url.Parse(profile.ServerURL)
+	if err != nil {
+		return nil, nil, status.Errorf(codes.InvalidArgument, "invalid server URL: %s", profile.ServerURL)
+	}
+	host := parsedURL.Hostname()
+
+	unaryInterceptors := []grpc.UnaryClientInterceptor{
+		headerInjectorUnaryInterceptor(c, host),
+		authTokenInterceptor(c),
+		retryInterceptor(c),
+		serverWarningUnaryInterceptor(c.serverWarningLogger),
+		timeoutInterceptor(),
+	}
+	unaryInterceptors = append(unaryInterceptors, customUnaryInterceptors...)
+
+	streamInterceptors := []grpc.StreamClientInterceptor{
+		headerInjectorStreamInterceptor(c, host),
+		serverWarningStreamInterceptor(c.serverWarningLogger),
+	}
+	streamInterceptors = append(streamInterceptors, customStreamInterceptors...)
+
+	conn, err := grpc.NewClient(
+		target,
+		grpc.WithTransportCredentials(creds),
+		grpc.WithInitialWindowSize(windowSize),
+		grpc.WithInitialConnWindowSize(windowSize),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(maxMessageSize),
+			grpc.MaxCallSendMsgSize(maxMessageSize),
+		),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		grpc.WithChainUnaryInterceptor(unaryInterceptors...),
+		grpc.WithChainStreamInterceptor(streamInterceptors...),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, pb.NewModalClientClient(conn), nil
+}
+
+// dialWithFallbacks dials profile.ServerURL, which may be a comma-separated list of URLs. The
+// attempts race and the first connection to become ready wins, which lets the client fail over to a
+// secondary endpoint when the primary is unreachable. The URL at index i starts after i*fallbackStaggerDelay, or as
+// soon as the previous one fails, so earlier URLs are preferred when reachable.
+func dialWithFallbacks(ctx context.Context, profile Profile, c *Client) (*grpc.ClientConn, pb.ModalClientClient, error) {
+	urls := strings.Split(profile.ServerURL, ",")
+	if len(urls) == 1 {
+		return newClient(ctx, profile, c, c.additionalUnaryInterceptors, c.additionalStreamInterceptors)
+	}
+	ctx, cancel := context.WithTimeout(ctx, fallbackConnectTimeout)
+	defer cancel()
+	failed := make([]chan struct{}, len(urls))
+	for i := range failed {
+		failed[i] = make(chan struct{})
+	}
+	conns := make(chan *grpc.ClientConn, len(urls))
+	for i, u := range urls {
+		go func() {
+			markFailed := sync.OnceFunc(func() { close(failed[i]) })
+			if i > 0 {
+				select {
+				case <-failed[i-1]:
+				case <-time.After(time.Duration(i) * fallbackStaggerDelay):
+				case <-ctx.Done():
+				}
+			}
+			p := profile
+			p.ServerURL = strings.TrimSpace(u)
+			conn, _, err := newClient(ctx, p, c, c.additionalUnaryInterceptors, c.additionalStreamInterceptors)
+			if err != nil {
+				markFailed()
+				conns <- nil
+				return
+			}
+			conn.Connect()
+			for s := conn.GetState(); s != connectivity.Ready; s = conn.GetState() {
+				if s == connectivity.TransientFailure {
+					markFailed()
+				}
+				if !conn.WaitForStateChange(ctx, s) {
+					markFailed()
+					_ = conn.Close()
+					conns <- nil
+					return
+				}
+			}
+			conns <- conn
+		}()
+	}
+	var winner *grpc.ClientConn
+	for range urls {
+		if conn := <-conns; winner == nil {
+			if winner = conn; winner != nil {
+				cancel()
+			}
+		} else if conn != nil {
+			_ = conn.Close()
+		}
+	}
+	if winner == nil {
+		return nil, nil, fmt.Errorf("could not connect to the Modal server at %s", profile.ServerURL)
+	}
+	return winner, pb.NewModalClientClient(winner), nil
+}
+
+// injectRequiredHeaders adds required headers to the context. `host` is the hostname of the server
+// being called, which the server can't read off the :authority pseudo-header, so we send it
+// explicitly.
+func injectRequiredHeaders(ctx context.Context, c *Client, host string) (context.Context, error) {
+	clientType := strconv.Itoa(int(pb.ClientType_CLIENT_TYPE_LIBMODAL_GO))
+	headerPairs := []string{
+		"x-Alingo-Modal-Core-type", clientType,
+		"x-Alingo-Modal-Core-version", "1.0.0", // CLIENT VERSION: Behaves like this Python SDK version
+		"x-modal-libmodal-version", "modal-go/" + c.sdkVersion,
+		"x-modal-host", host,
+	}
+	if c.profile.OAuthRefreshToken != "" {
+		headerPairs = append(headerPairs,
+			"x-modal-refresh-token", c.profile.OAuthRefreshToken,
+			"x-modal-oauth-client-id", c.profile.OAuthClientID,
+		)
+		if c.oauthJWTKey == nil {
+			return nil, fmt.Errorf("OAuth JWT key must be configured")
+		}
+		assertion, err := mintOAuthClientAssertion(c.profile.OAuthClientID, c.oauthJWTKey)
+		if err != nil {
+			return nil, err
+		}
+		headerPairs = append(headerPairs, "x-modal-oauth-client-assertion", assertion)
+	} else if c.profile.TokenID != "" && c.profile.TokenSecret != "" {
+		headerPairs = append(headerPairs,
+			"x-modal-token-id", c.profile.TokenID,
+			"x-modal-token-secret", c.profile.TokenSecret,
+		)
+	} else {
+		return nil, fmt.Errorf("missing credentials, please set them in .modal.toml, environment variables, or via NewClientWithOptions()")
+	}
+
+	return metadata.AppendToOutgoingContext(
+		ctx,
+		headerPairs...,
+	), nil
+}
+
+// headerInjectorUnaryInterceptor adds required headers to outgoing unary RPCs.
+func headerInjectorUnaryInterceptor(c *Client, host string) grpc.UnaryClientInterceptor {
+	return func(
+		ctx context.Context,
+		method string,
+		req, reply any,
+		cc *grpc.ClientConn,
+		invoker grpc.UnaryInvoker,
+		opts ...grpc.CallOption,
+	) error {
+		var err error
+		ctx, err = injectRequiredHeaders(ctx, c, host)
+		if err != nil {
+			return err
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+}
+
+// headerInjectorStreamInterceptor adds required headers to outgoing streaming RPCs.
+func headerInjectorStreamInterceptor(c *Client, host string) grpc.StreamClientInterceptor {
+	return func(
+		ctx context.Context,
+		desc *grpc.StreamDesc,
+		cc *grpc.ClientConn,
+		method string,
+		streamer grpc.Streamer,
+		opts ...grpc.CallOption,
+	) (grpc.ClientStream, error) {
+		var err error
+		ctx, err = injectRequiredHeaders(ctx, c, host)
+		if err != nil {
+			return nil, err
+		}
+		return streamer(ctx, desc, cc, method, opts...)
+	}
+}
+
+// authTokenInterceptor handles proactive auth token management.
+// Injects auth tokens into outgoing requests.
+func authTokenInterceptor(c *Client) grpc.UnaryClientInterceptor {
+	return func(
+		ctx context.Context,
+		method string,
+		req, reply any,
+		cc *grpc.ClientConn,
+		inv grpc.UnaryInvoker,
+		opts ...grpc.CallOption,
+	) error {
+		// Skip auth token for AuthTokenGet requests to prevent it from getting stuck
+		if method != "/modal.client.ModalClient/AuthTokenGet" {
+			token, err := c.authTokenManager.GetToken(ctx)
+			if err != nil || token == "" {
+				return fmt.Errorf("failed to get auth token: %w", err)
+			}
+			ctx = metadata.AppendToOutgoingContext(ctx, "x-modal-auth-token", token)
+		}
+		return inv(ctx, method, req, reply, cc, opts...)
+	}
+}
+
+func timeoutInterceptor() grpc.UnaryClientInterceptor {
+	return func(
+		ctx context.Context,
+		method string,
+		req, reply any,
+		cc *grpc.ClientConn,
+		inv grpc.UnaryInvoker,
+		opts ...grpc.CallOption,
+	) error {
+		// pick the first TimeoutCallOption, if any
+		for _, o := range opts {
+			if to, ok := o.(timeoutCallOption); ok && to.timeout > 0 {
+				// honour an existing, *earlier* deadline if present
+				if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= to.timeout {
+					break
+				}
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, to.timeout)
+				defer cancel()
+				break
+			}
+		}
+		return inv(ctx, method, req, reply, cc, opts...)
+	}
+}
+
+// getServerRetryPolicy extracts RPCRetryPolicy from gRPC error details, returning nil if absent.
+func getServerRetryPolicy(err error) *pb.RPCRetryPolicy {
+	st, ok := status.FromError(err)
+	if !ok {
+		return nil
+	}
+	for _, detail := range st.Details() {
+		if policy, ok := detail.(*pb.RPCRetryPolicy); ok {
+			return policy
+		}
+	}
+	return nil
+}
+
+func retryInterceptor(c *Client) grpc.UnaryClientInterceptor {
+	return func(
+		ctx context.Context,
+		method string,
+		req, reply any,
+		cc *grpc.ClientConn,
+		inv grpc.UnaryInvoker,
+		opts ...grpc.CallOption,
+	) error {
+		c.logger.DebugContext(ctx, "Sending gRPC request", "method", method)
+		// start with package defaults
+		retries := defaultRetryAttempts
+		baseDelay := defaultRetryBaseDelay
+		maxDelay := defaultRetryMaxDelay
+		factor := defaultRetryBackoffMul
+		retryable := retryableGrpcStatusCodes
+
+		// override from call-options (first one wins)
+		for _, o := range opts {
+			if rc, ok := o.(retryCallOption); ok {
+				if rc.retries != nil {
+					retries = *rc.retries
+				}
+				if rc.baseDelay != nil {
+					baseDelay = *rc.baseDelay
+				}
+				if rc.maxDelay != nil {
+					maxDelay = *rc.maxDelay
+				}
+				if rc.delayFactor != nil {
+					factor = *rc.delayFactor
+				}
+				if len(rc.additionalCodes) > 0 {
+					retryable = map[codes.Code]struct{}{}
+					for k := range retryableGrpcStatusCodes {
+						retryable[k] = struct{}{}
+					}
+					for _, c := range rc.additionalCodes {
+						retryable[c] = struct{}{}
+					}
+				}
+				break
+			}
+		}
+
+		idempotency := uuid.NewString()
+		start := time.Now()
+		delay := baseDelay
+		throttleRetries := 0
+		maxThrottleWait := c.profile.MaxThrottleWait
+		// MODAL_MAX_THROTTLE_WAIT=0 disables server-driven retries entirely
+		throttleEnabled := maxThrottleWait == nil || *maxThrottleWait != 0
+
+		var lastServerRetryWarnTime time.Time
+
+		attempt := 0
+		for attempt <= retries {
+			mdPairs := []string{
+				"x-idempotency-key", idempotency,
+				"x-retry-attempt", strconv.Itoa(attempt),
+				"x-throttle-retry-attempt", strconv.Itoa(throttleRetries),
+			}
+			if attempt > 0 {
+				mdPairs = append(mdPairs, "x-retry-delay", strconv.FormatFloat(time.Since(start).Seconds(), 'f', 3, 64))
+			}
+			if throttleRetries > 0 {
+				mdPairs = append(mdPairs, "x-throttle-retry-delay", strconv.FormatFloat(time.Since(start).Seconds(), 'f', 3, 64))
+			}
+			aCtx := metadata.AppendToOutgoingContext(ctx, mdPairs...)
+
+			err := inv(aCtx, method, req, reply, cc, opts...)
+			if err == nil {
+				return nil
+			}
+
+			// Check for server-directed retry via RPCRetryPolicy in error details.
+			// These are handled independently of the client retry counter (attempt).
+			if serverPolicy := getServerRetryPolicy(err); serverPolicy != nil && throttleEnabled {
+				serverDelay := max(time.Duration(float64(serverPolicy.GetRetryAfterSecs())*float64(time.Second)), defaultRetryBaseDelay)
+
+				// If sleeping serverDelay would push total elapsed time past the cap, stop now.
+				if maxThrottleWait != nil {
+					if time.Since(start)+serverDelay >= *maxThrottleWait {
+						return err
+					}
+				}
+
+				if deadline, ok := ctx.Deadline(); ok && time.Now().Add(serverDelay).After(deadline) {
+					return err
+				}
+
+				var errArgs []any
+				if st, ok := status.FromError(err); ok {
+					errArgs = []any{"status", st.Code(), "message", st.Message()}
+				} else {
+					errArgs = []any{"error", err}
+				}
+				errArgs = append(errArgs, "elapsed", time.Since(start), "throttle_retries", throttleRetries, "idempotency_key", idempotency[:8], "method", method)
+				c.logger.DebugContext(ctx, "Server requested retry delay",
+					append(errArgs, "serverDelay", serverDelay)...)
+
+				now := time.Now()
+				if lastServerRetryWarnTime.IsZero() || now.Sub(lastServerRetryWarnTime) >= serverRetryWarningInterval {
+					lastServerRetryWarnTime = now
+					c.logger.WarnContext(ctx, "Server requested retry delay. Retrying...", errArgs...)
+				}
+
+				throttleRetries++
+				if sleepCtx(ctx, serverDelay) != nil {
+					return err
+				}
+				continue // don't increment attempt; server-driven retries are unlimited
+			}
+
+			if st, ok := status.FromError(err); ok { // gRPC error
+				if _, ok := retryable[st.Code()]; !ok || attempt == retries {
+					if attempt == retries && attempt > 0 {
+						c.logger.DebugContext(ctx, "Final retry attempt failed",
+							"error", err,
+							"retries", attempt,
+							"delay", delay,
+							"method", method,
+							"idempotency_key", idempotency[:8])
+					}
+					return err
+				}
+			} else { // Unexpected, non-gRPC error
+				return err
+			}
+
+			if attempt > 0 {
+				c.logger.DebugContext(ctx, "Retryable failure",
+					"error", err,
+					"retries", attempt,
+					"delay", delay,
+					"method", method,
+					"idempotency_key", idempotency[:8])
+			}
+
+			if sleepCtx(ctx, delay) != nil {
+				return err // ctx cancelled or deadline exceeded
+			}
+
+			// exponential back-off
+			delay = min(delay*time.Duration(factor), maxDelay)
+			attempt++
+		}
+		return nil // unreachable
+	}
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}

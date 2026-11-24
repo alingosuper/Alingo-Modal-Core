@@ -1,0 +1,1340 @@
+# Copyright Modal Labs 2023
+import asyncio
+import base64
+import hashlib
+import io
+import multiprocessing
+import os
+import platform
+import pytest
+import random
+import re
+import sys
+import time
+from difflib import ndiff
+from pathlib import Path
+from unittest import mock
+
+import modal
+from modal._load_context import LoadContext
+from modal._resolver import Resolver
+from modal._utils.async_utils import TaskContext, synchronizer
+from modal._utils.blob_utils import BLOCK_SIZE
+from modal.exception import (
+    AlreadyExistsError,
+    ExecutionError,
+    InvalidError,
+    NotFoundError,
+    ServiceError,
+    VolumeUploadTimeoutError,
+)
+from modal.volume import _open_files_error_annotation, _Volume
+from modal_proto import api_pb2
+
+VERSIONS = [
+    None,
+    api_pb2.VOLUME_FS_VERSION_V2,
+]
+
+
+def dummy():
+    pass
+
+
+def assert_eq_large(left, right):
+    assert len(left) == len(right)
+    if left != right:
+        raise AssertionError(ndiff(left.splitlines(), right.splitlines()))
+
+
+def test_volume_create_options_match_objects_create_signature():
+    """The VolumeCreateOptions TypedDict must stay in sync with _VolumeManager.create's options.
+
+    `Volume.from_name(create_options=...)` takes the TypedDict, while `Volume.objects.create(...)`
+    accepts the same options as explicit keyword arguments; every TypedDict field must correspond
+    to a matching parameter of `objects.create`.
+    """
+    import inspect
+    import typing
+
+    from modal.types import VolumeCreateOptions
+    from modal.volume import _VolumeManager
+
+    def unwrap(annotation):
+        # Strip an Optional/None union (from the `= None` defaults on create) to the underlying type.
+        args = typing.get_args(annotation)
+        if args:
+            non_none = [a for a in args if a is not type(None)]
+            if len(non_none) == 1 and len(non_none) != len(args):
+                return non_none[0]
+        return annotation
+
+    option_hints = typing.get_type_hints(VolumeCreateOptions)
+    create_hints = typing.get_type_hints(_VolumeManager.create)
+
+    for field, annotation in option_hints.items():
+        assert field in create_hints, f"'{field}' is in VolumeCreateOptions but not a parameter of objects.create"
+        assert unwrap(annotation) == unwrap(create_hints[field]), (
+            f"type of '{field}' differs between VolumeCreateOptions and objects.create"
+        )
+
+    # The parameter is exposed as an explicit keyword-only argument, not swept into **kwargs.
+    params = inspect.signature(_VolumeManager.create).parameters
+    for field in option_hints:
+        assert params[field].kind == inspect.Parameter.KEYWORD_ONLY
+
+
+def test_volume_info(servicer, client):
+    name = "super-important-data"
+    vol = modal.Volume.from_name(name, create_if_missing=True)
+    assert vol.name == name
+
+    vol.hydrate(client)
+    info = vol.info()
+    assert info.name == name
+    assert info.created_by == servicer.default_username
+
+
+def test_volume_from_id(servicer, client):
+    # Create a volume and get its ID
+    with modal.Volume.ephemeral(client=client) as vol:
+        volume_id = vol.object_id
+
+        # Use from_id to get a reference to the same volume (lazy hydration)
+        vol2 = modal.Volume.from_id(volume_id, client=client)
+
+        # After hydration, object_id should be available
+        vol2.hydrate()
+        assert vol2.object_id == volume_id
+
+
+def test_volume_from_id_named(servicer, client):
+    # Test from_id with a named volume
+    name = "test-volume-from-id"
+    vol = modal.Volume.from_name(name, create_if_missing=True, client=client)
+    vol.hydrate()
+    volume_id = vol.object_id
+
+    # Use from_id to get a reference to the same volume (lazy hydration)
+    vol2 = modal.Volume.from_id(volume_id, client=client)
+
+    # Check metadata is populated correctly (triggers lazy hydration)
+    info = vol2.info()
+    assert info.name == name
+    assert info.created_by == servicer.default_username
+
+    # After hydration, object_id should be available
+    assert vol2.object_id == volume_id
+
+
+def test_volume_from_id_not_found(servicer, client):
+    # Test that from_id raises NotFoundError for non-existent volume
+    with pytest.raises(NotFoundError):
+        modal.Volume.from_id("vo-nonexistent", client=client).hydrate()
+
+
+@pytest.mark.parametrize("read_only", [True, False])
+@pytest.mark.parametrize("version", VERSIONS)
+def test_volume_mount(client, servicer, version, read_only):
+    app = modal.App(include_source=False)
+
+    vol = modal.Volume.from_name("xyz", create_if_missing=True, version=version)
+    if read_only:
+        vol = vol.with_mount_options(read_only=True)
+
+    _ = app.function(volumes={"/root/foo": vol})(dummy)
+
+    with servicer.intercept() as ctx:
+        with app.run(client=client):
+            req = ctx.pop_request("FunctionCreate")
+            assert req.function.volume_mounts[0].read_only == read_only
+            # Verify sub_path is NOT sent when not specified (wire format preservation)
+            assert req.function.volume_mounts[0].sub_path == ""
+
+
+def test_volume_subdirectory_mount(client, servicer):
+    app = modal.App(include_source=False)
+
+    vol = modal.Volume.from_name("xyz", create_if_missing=True).with_mount_options(sub_path="/nested")
+
+    _ = app.function(volumes={"/root/foo": vol})(dummy)
+
+    with servicer.intercept() as ctx:
+        with app.run(client=client):
+            req = ctx.pop_request("FunctionCreate")
+            assert req.function.volume_mounts[0].sub_path == "/nested"
+
+
+def test_volume_mount_options_read_only_subdirectory(client, servicer):
+    app = modal.App(include_source=False)
+    vol = modal.Volume.from_name("xyz", create_if_missing=True).with_mount_options(read_only=True, sub_path="/nested")
+
+    _ = app.function(volumes={"/root/foo": vol})(dummy)
+
+    with servicer.intercept() as ctx:
+        with app.run(client=client):
+            req = ctx.pop_request("FunctionCreate")
+            assert req.function.volume_mounts[0].read_only
+            assert req.function.volume_mounts[0].sub_path == "/nested"
+
+
+def test_volume_mount_options_are_stored_on_volume_copy():
+    vol = modal.Volume.from_name("xyz", create_if_missing=True)
+    vol_mount = vol.with_mount_options(read_only=True, sub_path="/nested")
+
+    assert isinstance(vol_mount, modal.Volume)
+    assert vol_mount is not vol
+    assert hasattr(vol_mount, "batch_upload")
+    assert hasattr(vol_mount, "remove_file")
+    assert hasattr(vol_mount, "copy_files")
+
+
+def test_volume_mount_options_set_state_on_volume_copy():
+    vol = _Volume.from_name("xyz", create_if_missing=True)
+    vol_mount = vol.with_mount_options(read_only=True, sub_path="/nested")
+
+    assert vol._mount_options is None
+    assert vol_mount._mount_options is not None
+    assert vol_mount._mount_options.read_only
+    assert vol_mount._mount_options.sub_path == "/nested"
+
+
+def test_volume_mount_options_merge_on_repeated_calls():
+    vol = _Volume.from_name("xyz", create_if_missing=True).with_mount_options(read_only=True, sub_path="/nested")
+
+    vol_with_new_subpath = vol.with_mount_options(sub_path="/other")
+    assert vol_with_new_subpath._mount_options.read_only
+    assert vol_with_new_subpath._mount_options.sub_path == "/other"
+
+    vol_with_new_read_only = vol.with_mount_options(read_only=False)
+    assert not vol_with_new_read_only._mount_options.read_only
+    assert vol_with_new_read_only._mount_options.sub_path == "/nested"
+
+    vol_with_none_subpath = vol.with_mount_options(sub_path=None)
+    assert vol_with_none_subpath._mount_options.read_only
+    assert vol_with_none_subpath._mount_options.sub_path == "/nested"
+
+    vol_with_cleared_subpath = vol.with_mount_options(sub_path="/")
+    assert vol_with_cleared_subpath._mount_options.read_only
+    assert vol_with_cleared_subpath._mount_options.sub_path is None
+
+
+def test_volume_read_only_sets_state_on_volume_copy():
+    vol = _Volume.from_name("xyz", create_if_missing=True)
+    read_only_vol = vol.read_only()
+
+    assert read_only_vol._read_only
+    assert read_only_vol._mount_options is not None
+    assert read_only_vol._mount_options.read_only
+
+
+def test_volume_read_only_rejects_mount_options_immediately():
+    vol = modal.Volume.from_name("xyz", create_if_missing=True)
+    vol_with_mount_options = vol.with_mount_options(sub_path="/nested")
+
+    with pytest.raises(InvalidError, match="Cannot call read_only.*with_mount_options"):
+        vol_with_mount_options.read_only()
+
+
+def test_volume_with_mount_options_copies_metadata(client, servicer):
+    """Test that with_mount_options copies _metadata and _name for live methods."""
+    vol = modal.Volume.from_name("xyz", create_if_missing=True)
+    vol.hydrate(client)
+
+    # with_mount_options without read_only should still allow calling live methods
+    vol_with_subpath = vol.with_mount_options(sub_path="/nested")
+    vol_with_subpath.hydrate(client)
+
+    # Verify that _name is copied correctly
+    assert vol_with_subpath.name == vol.name == "xyz"
+
+    # These should not raise AttributeError - they access _metadata internally
+    vol_with_subpath.listdir("/")
+
+    # remove_file also accesses _metadata; FileNotFoundError means it worked (no AttributeError)
+    with pytest.raises(FileNotFoundError):
+        vol_with_subpath.remove_file("nonexistent", recursive=True)
+
+
+def test_volume_with_mount_options_rejects_legacy_read_only_immediately():
+    vol = modal.Volume.from_name("xyz", create_if_missing=True)
+    read_only_vol = vol.read_only()
+
+    with pytest.raises(InvalidError, match="Cannot call with_mount_options.*read_only"):
+        read_only_vol.with_mount_options(sub_path="/nested")
+
+
+def test_volume_bad_paths():
+    app = modal.App()
+    vol = modal.Volume.from_name("xyz")
+
+    with pytest.raises(InvalidError):
+        app.function(volumes={"/root/../../foo": vol})(dummy)
+
+    with pytest.raises(InvalidError):
+        app.function(volumes={"/": vol})(dummy)
+
+    with pytest.raises(InvalidError):
+        app.function(volumes={"/tmp/": vol})(dummy)
+
+
+def test_volume_mount_read_only_error(client):
+    read_only_vol = modal.Volume.from_name("xyz", create_if_missing=True).read_only()
+    read_only_vol_hydrated = read_only_vol.hydrate(client)
+
+    with pytest.raises(InvalidError):
+        with read_only_vol_hydrated.batch_upload():
+            pass
+
+    with pytest.raises(InvalidError):
+        read_only_vol_hydrated.remove_file("file1.txt")
+
+    with pytest.raises(InvalidError):
+        read_only_vol_hydrated.copy_files(["file1.txt"], "bar2")
+
+
+def test_volume_duplicate_mount():
+    app = modal.App()
+    vol = modal.Volume.from_name("xyz")
+
+    with pytest.raises(InvalidError):
+        app.function(volumes={"/foo": vol, "/bar": vol})(dummy)
+
+
+@pytest.mark.parametrize("skip_reload", [False, True])
+def test_volume_commit(client, servicer, skip_reload):
+    with servicer.intercept() as ctx:
+        ctx.add_response("VolumeCommit", api_pb2.VolumeCommitResponse(skip_reload=skip_reload))
+        ctx.add_response("VolumeCommit", api_pb2.VolumeCommitResponse(skip_reload=skip_reload))
+
+        with modal.Volume.ephemeral(client=client) as vol:
+            # Note that in practice this will not work unless run in a task.
+            vol.commit()
+
+            # Make sure we can commit through the provider too
+            vol.commit()
+
+            assert ctx.pop_request("VolumeCommit").volume_id == vol.object_id
+            assert ctx.pop_request("VolumeCommit").volume_id == vol.object_id
+
+            # commit should implicitly reload on successful commit if skip_reload=False
+            assert servicer.volume_reloads[vol.object_id] == 0 if skip_reload else 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+@pytest.mark.parametrize("file_contents_size", [100, 8 * 1024 * 1024, 16 * 1024 * 1024, 32 * 1024 * 1024 + 4711])
+async def test_volume_get(client, tmp_path, version, file_contents_size):
+    await modal.Volume.objects.create.aio("my-vol", client=client, version=version)
+    vol = await modal.Volume.from_name("my-vol").hydrate.aio(client=client)
+
+    file_contents = random.randbytes(file_contents_size)
+    file_path = "foo.bin"
+    local_file_path = tmp_path / file_path
+    local_file_path.write_bytes(file_contents)
+
+    async with vol.batch_upload() as batch:
+        batch.put_file(local_file_path, file_path)
+
+    data = b""
+    async for chunk in vol.read_file.aio(file_path):  # TODO(elias): deprecate .aio syntax optional
+        data += chunk
+
+    # Faster assert to avoid huge error when there are large content differences:
+    assert len(data) == file_contents_size
+    assert data == file_contents
+
+    output = io.BytesIO()
+    await vol.read_file_into_fileobj.aio(file_path, output)
+
+    # Faster assert to avoid huge error when there are large content differences:
+    assert len(output.getvalue()) == file_contents_size
+    assert output.getvalue() == file_contents
+
+    with pytest.raises(FileNotFoundError):
+        async for _ in vol.read_file.aio("/abc/def/i-dont-exist-at-all"):  # TODO(elias): deprecate .aio syntax optional
+            ...
+
+
+class _ShortWriteBytesIO(io.BytesIO):
+    """A file object that only ever accepts part of each write."""
+
+    def write(self, b) -> int:
+        return super().write(bytes(b)[: max(1, len(b) // 3)])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_read_file_into_fileobj_short_writes(client, tmp_path, version):
+    await modal.Volume.objects.create.aio("my-vol", client=client, version=version)
+    vol = await modal.Volume.from_name("my-vol").hydrate.aio(client=client)
+
+    file_contents = random.randbytes(1000)
+    local_file_path = tmp_path / "foo.bin"
+    local_file_path.write_bytes(file_contents)
+    async with vol.batch_upload() as batch:
+        batch.put_file(local_file_path, "foo.bin")
+
+    output = _ShortWriteBytesIO()
+    await vol.read_file_into_fileobj.aio("foo.bin", output)
+    assert output.getvalue() == file_contents
+
+
+@pytest.mark.asyncio
+async def test_volume2_get_block_aligned_trailing_zero_regression(client, tmp_path):
+    await modal.Volume.objects.create.aio("my-vol", client=client, version=api_pb2.VOLUME_FS_VERSION_V2)
+    vol = await modal.Volume.from_name("my-vol").hydrate.aio(client=client)
+
+    file_contents_size = 2 * BLOCK_SIZE
+    file_contents = b"A" * (file_contents_size - 2) + b"B\0"
+    file_path = "foo.bin"
+    local_file_path = tmp_path / file_path
+    local_file_path.write_bytes(file_contents)
+
+    async with vol.batch_upload() as batch:
+        batch.put_file(local_file_path, file_path)
+
+    data = b""
+    async for chunk in vol.read_file.aio(file_path):
+        data += chunk
+
+    assert len(data) == file_contents_size
+    assert data == file_contents
+
+
+def test_expected_block_lengths():
+    from modal.volume import _expected_block_lengths
+
+    assert _expected_block_lengths(0, 0, 0) == []
+    assert _expected_block_lengths(0, 10, 1) == [10]
+    assert _expected_block_lengths(0, BLOCK_SIZE + 10, 2) == [BLOCK_SIZE, 10]
+    # A range starting mid-block: the first body only covers the rest of that block.
+    assert _expected_block_lengths(BLOCK_SIZE - 5, 2 * BLOCK_SIZE, 3) == [5, BLOCK_SIZE, BLOCK_SIZE - 5]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trailing_zeros", [1, BLOCK_SIZE // 2, BLOCK_SIZE - 1])
+async def test_volume2_get_pads_zero_trimmed_blocks(client, tmp_path, trailing_zeros):
+    await modal.Volume.objects.create.aio("my-vol", client=client, version=api_pb2.VOLUME_FS_VERSION_V2)
+    vol = await modal.Volume.from_name("my-vol").hydrate.aio(client=client)
+
+    # Every block ends in zeros, so the server omits them from each body.
+    file_contents = (random.randbytes(BLOCK_SIZE - trailing_zeros).replace(b"\0", b"x") + b"\0" * trailing_zeros) * 2
+    file_path = "foo.bin"
+    local_file_path = tmp_path / file_path
+    local_file_path.write_bytes(file_contents)
+
+    async with vol.batch_upload() as batch:
+        batch.put_file(local_file_path, file_path)
+
+    data = b""
+    async for chunk in vol.read_file.aio(file_path):
+        data += chunk
+    assert data == file_contents
+
+    output = io.BytesIO()
+    assert await vol.read_file_into_fileobj.aio(file_path, output) == len(file_contents)
+    assert output.getvalue() == file_contents
+
+
+def test_volume_reload(client, servicer):
+    with modal.Volume.ephemeral(client=client) as vol:
+        # Note that in practice this will not work unless run in a task.
+        vol.reload()
+
+        assert servicer.volume_reloads[vol.object_id] == 1
+
+
+@pytest.mark.asyncio
+async def test_volume_batch_upload_reports_earliest_checked_at(servicer, client):
+    async with modal.Volume.ephemeral(client=client) as vol:
+        with servicer.intercept() as ctx:
+            before = time.time()
+            async with vol.batch_upload() as batch:
+                batch.put_file(io.BytesIO(b"hello"), "/hello")
+            after = time.time()
+
+    [req] = ctx.get_requests("VolumePutFiles")
+    assert before <= req.earliest_checked_at.ToNanoseconds() / 1e9 <= after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_batch_upload(servicer, client, tmp_path, version):
+    local_file_path = tmp_path / "some_file"
+    local_file_path.write_text("hello world")
+
+    local_dir = tmp_path / "some_dir"
+    local_dir.mkdir()
+    (local_dir / "smol").write_text("###")
+
+    subdir = local_dir / "subdir"
+    subdir.mkdir()
+    (subdir / "other").write_text("####")
+
+    async with modal.Volume.ephemeral(client=client, version=version) as vol:
+        with open(local_file_path, "rb") as fp:
+            async with vol.batch_upload() as batch:
+                batch.put_file(local_file_path, "/some_file")
+                batch.put_directory(local_dir, "/some_dir")
+                batch.put_file(io.BytesIO(b"data from a file-like object"), "/filelike", mode=0o600)
+                batch.put_directory(local_dir, "/non-recursive", recursive=False)
+                batch.put_file(fp, "/filelike2")
+        object_id = vol.object_id
+
+    assert servicer.volumes[object_id].files.keys() == {
+        "/some_file",
+        "/some_dir/smol",
+        "/some_dir/subdir/other",
+        "/filelike",
+        "/non-recursive/smol",
+        "/filelike2",
+    }
+    assert servicer.volumes[object_id].files["/some_file"].data == b"hello world"
+    assert servicer.volumes[object_id].files["/some_dir/smol"].data == b"###"
+    assert servicer.volumes[object_id].files["/some_dir/subdir/other"].data == b"####"
+    assert servicer.volumes[object_id].files["/filelike"].data == b"data from a file-like object"
+    assert servicer.volumes[object_id].files["/filelike"].mode == 0o600
+    assert servicer.volumes[object_id].files["/non-recursive/smol"].data == b"###"
+    assert servicer.volumes[object_id].files["/filelike2"].data == b"hello world"
+    assert servicer.volumes[object_id].files["/filelike2"].mode == 0o644
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_batch_upload_bytesio(servicer, client, tmp_path, version):
+    async with modal.Volume.ephemeral(client=client, version=version) as vol:
+        async with vol.batch_upload() as batch:
+            batch.put_file(io.BytesIO(b"data from a file-like object"), "/filelike", mode=0o600)
+        object_id = vol.object_id
+
+    assert servicer.volumes[object_id].files.keys() == {
+        "/filelike",
+    }
+    assert servicer.volumes[object_id].files["/filelike"].data == b"data from a file-like object"
+    assert servicer.volumes[object_id].files["/filelike"].mode == 0o600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_batch_upload_opened_file(servicer, client, tmp_path, version):
+    local_file_path = tmp_path / "some_file"
+    local_file_path.write_text("hello world")
+
+    async with modal.Volume.ephemeral(client=client, version=version) as vol:
+        with open(local_file_path, "rb") as fp:
+            async with vol.batch_upload() as batch:
+                batch.put_file(fp, "/filelike2", mode=0o600)
+        object_id = vol.object_id
+
+    assert servicer.volumes[object_id].files.keys() == {
+        "/filelike2",
+    }
+    assert servicer.volumes[object_id].files["/filelike2"].data == b"hello world"
+    assert servicer.volumes[object_id].files["/filelike2"].mode == 0o600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_batch_upload_force(servicer, client, tmp_path, version):
+    local_file_path = tmp_path / "some_file"
+    local_file_path.write_text("hello world")
+
+    local_file_path2 = tmp_path / "some_file2"
+    local_file_path2.write_text("overwritten")
+
+    async with modal.Volume.ephemeral(client=client, version=version) as vol:
+        with servicer.intercept() as ctx:
+            # Seed the volume
+            async with vol.batch_upload() as batch:
+                batch.put_file(local_file_path, "/some_file")
+
+            if version == api_pb2.VOLUME_FS_VERSION_V2:
+                # The batch should involve two calls; once with a missing_blocks response
+                assert ctx.pop_request("VolumePutFiles2").disallow_overwrite_existing_files
+                assert ctx.pop_request("VolumePutFiles2").disallow_overwrite_existing_files
+            else:
+                assert ctx.pop_request("VolumePutFiles").disallow_overwrite_existing_files
+
+            # Attempting to overwrite the file with force=False should result in an error
+            with pytest.raises(FileExistsError):
+                async with vol.batch_upload(force=False) as batch:
+                    batch.put_file(local_file_path, "/some_file")
+
+            if version == api_pb2.VOLUME_FS_VERSION_V2:
+                # The batch should fail on the first call since force=False
+                assert ctx.pop_request("VolumePutFiles2").disallow_overwrite_existing_files
+            else:
+                assert ctx.pop_request("VolumePutFiles").disallow_overwrite_existing_files
+
+            assert servicer.volumes[vol.object_id].files["/some_file"].data == b"hello world"
+
+            # Overwriting should work with force=True
+            async with vol.batch_upload(force=True) as batch:
+                batch.put_file(local_file_path2, "/some_file")
+
+            if version == api_pb2.VOLUME_FS_VERSION_V2:
+                # The batch should involve two calls; once with a missing_blocks response
+                assert not ctx.pop_request("VolumePutFiles2").disallow_overwrite_existing_files
+                assert not ctx.pop_request("VolumePutFiles2").disallow_overwrite_existing_files
+            else:
+                assert not ctx.pop_request("VolumePutFiles").disallow_overwrite_existing_files
+
+            assert servicer.volumes[vol.object_id].files["/some_file"].data == b"overwritten"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_upload_removed_file(servicer, client, tmp_path, version):
+    local_file_path = tmp_path / "some_file"
+    local_file_path.write_text("hello world")
+
+    async with modal.Volume.ephemeral(client=client, version=version) as vol:
+        with pytest.raises(FileNotFoundError):
+            async with vol.batch_upload() as batch:
+                batch.put_file(local_file_path, "/dest")
+                local_file_path.unlink()
+
+
+@pytest.mark.asyncio
+async def test_volume_upload_large_file(client, tmp_path, servicer, blob_server):
+    with mock.patch("modal._utils.blob_utils.LARGE_FILE_LIMIT", 10):
+        local_file_path = tmp_path / "bigfile"
+        local_file_path.write_text("hello world, this is a lot of text")
+
+        async with modal.Volume.ephemeral(client=client) as vol:
+            async with vol.batch_upload() as batch:
+                batch.put_file(local_file_path, "/a")
+            object_id = vol.object_id
+
+        assert servicer.volumes[object_id].files.keys() == {"/a"}
+        assert servicer.volumes[object_id].files["/a"].data == b""
+        assert servicer.volumes[object_id].files["/a"].data_blob_id == "bl-1"
+
+        _, blobs, _, _ = blob_server
+        assert blobs["bl-1"] == b"hello world, this is a lot of text"
+
+
+@pytest.mark.asyncio
+async def test_volume2_upload_large_file(client, tmp_path, servicer, blob_server):
+    # Volumes version 2 don't use `modal._utils.blob_utils.LARGE_FILE_LIMIT`
+    # Instead, we need to go over 8MiB to trigger different behavior (ie spilling into multiple blocks), but in this
+    # unit test context there isn't much of a semantic difference.
+
+    # Create a byte buffer that is larger than 8MiB
+    data = b"hello world, this is a lot of text" * 250_000
+    assert len(data) > BLOCK_SIZE
+
+    local_file_path = tmp_path / "bigfile"
+    local_file_path.write_bytes(data)
+
+    async with modal.Volume.ephemeral(client=client, version=api_pb2.VOLUME_FS_VERSION_V2) as vol:
+        async with vol.batch_upload() as batch:
+            batch.put_file(local_file_path, "/a")
+        object_id = vol.object_id
+
+    assert servicer.volumes[object_id].files.keys() == {"/a"}
+    # Volumes version 2 don't use blob entities
+    assert_eq_large(servicer.volumes[object_id].files["/a"].data, data)
+
+
+@pytest.mark.asyncio
+async def test_volume2_upload_large_blank_file(client, tmp_path, servicer, blob_server):
+    # Volumes version 2 don't use `modal._utils.blob_utils.LARGE_FILE_LIMIT`
+    # Instead, we need to go over 8MiB to trigger different behavior (ie spilling into multiple blocks), but in this
+    # unit test context there isn't much of a semantic difference.
+
+    # Create a byte buffer that is larger than 8MiB. Each block starts with b"a" followed by zeroes until the next
+    # block boundary, except the last block that just contains b"cdef"
+    data = (b"a" + (b"\0" * (8 * 1024 * 1024 - 1))) * 2 + b"cdef"
+    assert len(data) > BLOCK_SIZE
+
+    local_file_path = tmp_path / "bigfile"
+    local_file_path.write_bytes(data)
+
+    async with modal.Volume.ephemeral(client=client, version=api_pb2.VOLUME_FS_VERSION_V2) as vol:
+        async with vol.batch_upload() as batch:
+            batch.put_file(local_file_path, "/a")
+        object_id = vol.object_id
+
+    assert servicer.volumes[object_id].files.keys() == {"/a"}
+    # Volumes version 2 don't use blob entities
+    assert_eq_large(servicer.volumes[object_id].files["/a"].data, data)
+
+
+@pytest.mark.asyncio
+async def test_volume_upload_large_stream(client, servicer, blob_server):
+    with mock.patch("modal._utils.blob_utils.LARGE_FILE_LIMIT", 10):
+        stream = io.BytesIO(b"hello world, this is a lot of text")
+
+        async with modal.Volume.ephemeral(client=client) as vol:
+            async with vol.batch_upload() as batch:
+                batch.put_file(stream, "/a")
+            object_id = vol.object_id
+
+        assert servicer.volumes[object_id].files.keys() == {"/a"}
+        assert servicer.volumes[object_id].files["/a"].data == b""
+        assert servicer.volumes[object_id].files["/a"].data_blob_id == "bl-1"
+
+        _, blobs, _, _ = blob_server
+        assert blobs["bl-1"] == b"hello world, this is a lot of text"
+
+
+@pytest.mark.asyncio
+async def test_volume2_upload_large_stream(client, servicer, blob_server):
+    # Volumes version 2 don't use `modal._utils.blob_utils.LARGE_FILE_LIMIT`
+    # Instead, we need to go over 8MiB to trigger different behavior (ie spilling into multiple blocks), but in this
+    # unit test context there isn't much of a semantic difference.
+
+    # Create a byte buffer that is larger than 8MiB
+    data = b"hello world, this is a lot of text" * 250_000
+    assert len(data) > BLOCK_SIZE
+
+    stream = io.BytesIO(data)
+
+    async with modal.Volume.ephemeral(client=client, version=api_pb2.VOLUME_FS_VERSION_V2) as vol:
+        async with vol.batch_upload() as batch:
+            batch.put_file(stream, "/a")
+        object_id = vol.object_id
+
+    assert servicer.volumes[object_id].files.keys() == {"/a"}
+    assert servicer.volumes[object_id].files["/a"].data == data
+
+
+@pytest.mark.asyncio
+async def test_volume_upload_file_timeout(client, tmp_path, servicer, blob_server, *args):
+    call_count = 0
+
+    async def mount_put_file(self, stream):
+        await stream.recv_message()
+        nonlocal call_count
+        call_count += 1
+        await stream.send_message(api_pb2.MountPutFileResponse(exists=False))
+
+    with servicer.intercept() as ctx:
+        ctx.set_responder("MountPutFile", mount_put_file)
+        with mock.patch("modal._utils.blob_utils.LARGE_FILE_LIMIT", 10):
+            with mock.patch("modal.volume.VOLUME_PUT_FILE_CLIENT_TIMEOUT", 0.5):
+                local_file_path = tmp_path / "bigfile"
+                local_file_path.write_text("hello world, this is a lot of text")
+
+                async with modal.Volume.ephemeral(client=client) as vol:
+                    with pytest.raises(VolumeUploadTimeoutError):
+                        async with vol.batch_upload() as batch:
+                            batch.put_file(local_file_path, "/dest")
+
+                assert call_count > 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_copy_1(client, tmp_path, servicer, version):
+    ## test 1: copy src path to dst path ##
+    src_path = "original.txt"
+    dst_path = "copied.txt"
+    local_file_path = tmp_path / src_path
+    local_file_path.write_text("test copy")
+
+    async with modal.Volume.ephemeral(client=client, version=version) as vol:
+        # add local file to volume
+        async with vol.batch_upload() as batch:
+            batch.put_file(local_file_path, src_path)
+        object_id = vol.object_id
+
+        # copy file from src_path to dst_path
+        await vol.copy_files.aio([src_path], dst_path, False)
+
+    assert servicer.volumes[object_id].files.keys() == {src_path, dst_path}
+
+    assert servicer.volumes[object_id].files[src_path].data == b"test copy"
+    assert servicer.volumes[object_id].files[dst_path].data == b"test copy"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_copy_2(client, tmp_path, servicer, version):
+    ## test 2: copy multiple files into a directory ##
+    file_paths = ["file1.txt", "file2.txt"]
+
+    async with modal.Volume.ephemeral(client=client, version=version) as vol:
+        for file_path in file_paths:
+            local_file_path = tmp_path / file_path
+            local_file_path.write_text("test copy")
+            async with vol.batch_upload() as batch:
+                batch.put_file(local_file_path, file_path)
+            object_id = vol.object_id
+
+        await vol.copy_files.aio(file_paths, "test_dir", False)
+
+    returned_volume_files = [Path(file) for file in servicer.volumes[object_id].files.keys()]
+    expected_volume_files = [
+        Path(file) for file in ["file1.txt", "file2.txt", "test_dir/file1.txt", "test_dir/file2.txt"]
+    ]
+
+    assert returned_volume_files == expected_volume_files
+
+    returned_file_data = {
+        Path(entry): servicer.volumes[object_id].files[entry] for entry in servicer.volumes[object_id].files
+    }
+    assert returned_file_data[Path("test_dir/file1.txt")].data == b"test copy"
+    assert returned_file_data[Path("test_dir/file2.txt")].data == b"test copy"
+
+
+@pytest.mark.parametrize("version", VERSIONS)
+def test_from_name(servicer, client, version):
+    # Lookup should fail since it doesn't exist
+    with pytest.raises(NotFoundError):
+        modal.Volume.from_name("xyz", version=version).hydrate(client)
+
+    # Create it
+    modal.Volume.from_name("xyz", create_if_missing=True, version=version).hydrate(client)
+
+    # Lookup should succeed now
+    modal.Volume.from_name("xyz", version=version).hydrate(client)
+
+    modal.Volume.objects.delete("xyz", client=client)
+    # Lookup should fail again
+    with pytest.raises(NotFoundError):
+        modal.Volume.from_name("xyz", version=version).hydrate(client)
+    modal.Volume.objects.delete("xyz", client=client, allow_missing=True)
+
+
+def test_ephemeral(servicer, client):
+    assert servicer.n_vol_heartbeats == 0
+    with modal.Volume.ephemeral(client=client, _heartbeat_sleep=1) as vol:
+        assert vol.listdir("/") == []
+        # TODO(erikbern): perform some operations
+        time.sleep(1.5)  # Make time for 2 heartbeats
+    # Windows timer granularity (~15.6ms) can cause an extra heartbeat to
+    # slip in before the context manager tears down.
+    assert servicer.n_vol_heartbeats in (2, 3)
+
+
+def test_lazy_hydration_from_named(client):
+    vol = modal.Volume.from_name("my-vol", create_if_missing=True, client=client)
+    assert vol.listdir("/") == []
+
+
+def test_volume_from_name_double_resolve(client, servicer):
+    name = "my-vol"
+    modal.Volume.objects.create(name, client=client)
+    vol = modal.Volume.from_name(name)
+
+    @synchronizer.wrap
+    async def wrapped_test(vol, client):
+        resolver = Resolver()
+        async with TaskContext() as tc:
+            load_context = LoadContext(client=client, task_context=tc)
+            await resolver.load(vol, load_context)
+        return vol.object_id
+
+    with servicer.intercept() as ctx:
+        wrapped_test(vol, client)  # type: ignore
+        req = ctx.pop_request("VolumeGetOrCreate")
+        assert req.deployment_name == name
+        assert req.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_UNSPECIFIED
+        ctx.calls.clear()
+        wrapped_test(vol, client)  # type: ignore
+        assert len(ctx.calls) == 0
+
+
+@pytest.mark.skipif(platform.system() != "Linux", reason="needs /proc")
+@pytest.mark.asyncio
+async def test_open_files_error_annotation(tmp_path):
+    assert _open_files_error_annotation(tmp_path) is None
+
+    # Current process keeps file open
+    with (tmp_path / "foo.txt").open("w") as _f:
+        assert _open_files_error_annotation(tmp_path) == "path foo.txt is open"
+
+    # cwd of current process is inside volume
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    assert _open_files_error_annotation(tmp_path) == "cwd is inside volume"
+    os.chdir(cwd)
+
+    # Subprocess keeps open file
+    open_path = tmp_path / "bar.txt"
+    open_path.write_text("")
+    proc = await asyncio.create_subprocess_exec("tail", "-f", open_path.as_posix())
+    await asyncio.sleep(0.01)  # Give process some time to start
+    assert _open_files_error_annotation(tmp_path) == f"path bar.txt is open from 'tail -f {open_path.as_posix()}'"
+    proc.kill()
+    await proc.wait()
+    assert _open_files_error_annotation(tmp_path) is None
+
+    # Subprocess cwd inside volume
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", f"import time; import os; os.chdir('{tmp_path}'); time.sleep(60)"
+    )
+    # Wait for process to chdir
+    for _ in range(100):
+        if os.readlink(f"/proc/{proc.pid}/cwd") == tmp_path.as_posix():
+            break
+        await asyncio.sleep(0.05)
+    assert re.match(
+        f"^cwd of '{re.escape(sys.executable)} -c .*' is inside volume$", _open_files_error_annotation(tmp_path)
+    )
+    proc.kill()
+    await proc.wait()
+    assert _open_files_error_annotation(tmp_path) is None
+
+
+@pytest.mark.parametrize("name", ["has space", "has/slash", "a" * 65])
+def test_invalid_name(name):
+    with pytest.raises(InvalidError, match="Invalid Volume name"):
+        modal.Volume.from_name(name)
+
+
+@pytest.fixture()
+def unset_main_thread_event_loop():
+    try:
+        event_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        event_loop = None
+
+    asyncio.set_event_loop(None)
+    try:
+        yield
+    finally:
+        asyncio.set_event_loop(event_loop)  # reset so we don't break other tests
+
+
+@pytest.mark.usefixtures("unset_main_thread_event_loop")
+def test_lock_is_py39_safe(client):
+    vol = modal.Volume.from_name("my_vol", create_if_missing=True, client=client)
+    vol.reload()
+
+
+def test_remove_file_not_found(client):
+    vol = modal.Volume.from_name("my_vol", create_if_missing=True, client=client)
+    with pytest.raises(FileNotFoundError):
+        vol.remove_file("a")
+
+
+def test_volume_list(servicer, client):
+    for i in range(5):
+        modal.Volume.from_name(f"test-volume-{i}", create_if_missing=True).hydrate(client)
+    if sys.platform == "win32":
+        time.sleep(1 / 32)
+
+    volume_list = modal.Volume.objects.list(client=client)
+    assert len(volume_list) == 5
+    assert all(v.name.startswith("test-volume-") for v in volume_list)
+    assert all(v.info().created_by == servicer.default_username for v in volume_list)
+
+    volume_list = modal.Volume.objects.list(max_objects=2, client=client)
+    assert len(volume_list) == 2
+
+
+def test_volume_list_metadata_version(servicer, client):
+    modal.Volume.from_name("v1-volume", create_if_missing=True).hydrate(client)
+    modal.Volume.from_name("v2-volume", create_if_missing=True, version=api_pb2.VOLUME_FS_VERSION_V2).hydrate(client)
+
+    volume_list = modal.Volume.objects.list(client=client)
+    volumes_by_name = {v.name: v for v in volume_list}
+
+    assert volumes_by_name["v1-volume"]._is_v1
+    assert not volumes_by_name["v2-volume"]._is_v1
+
+
+def test_volume_create(servicer, client):
+    modal.Volume.objects.create(name="test-volume-create", client=client)
+    modal.Volume.from_name("test-volume-create").hydrate(client)
+    with pytest.raises(AlreadyExistsError):
+        modal.Volume.objects.create(name="test-volume-create", client=client)
+    modal.Volume.objects.create(name="test-volume-create", allow_existing=True, client=client)
+    with pytest.raises(InvalidError, match="Invalid Volume name"):
+        modal.Volume.objects.create(name="has space", client=client)
+
+
+def test_volume_create_version(servicer, client):
+    for version in [1, 2]:
+        modal.Volume.objects.create(name=f"should-be-v{version}", version=version, client=client)
+        vol_id = servicer.deployed_volumes[(f"should-be-v{version}", "main")]
+        assert servicer.volumes[vol_id].version == version
+
+    with pytest.raises(InvalidError, match="VolumeFS version must be either 1 or 2"):
+        modal.Volume.objects.create(name="should-be-v3", version=3, client=client)
+
+
+def test_volume_create_version_mismatch(servicer, client):
+    modal.Volume.objects.create(name="vol-v1", version=1, client=client)
+
+    with pytest.raises(InvalidError, match="exists but has version v1, not v2"):
+        modal.Volume.objects.create(name="vol-v1", version=2, allow_existing=True, client=client)
+
+    modal.Volume.objects.create(name="vol-v1", version=1, allow_existing=True, client=client)
+    modal.Volume.objects.create(name="vol-v1", allow_existing=True, client=client)
+
+    modal.Volume.objects.create(name="vol-v2", version=2, client=client)
+
+    with pytest.raises(InvalidError, match="exists but has version v2, not v1"):
+        modal.Volume.objects.create(name="vol-v2", version=1, allow_existing=True, client=client)
+
+    modal.Volume.objects.create(name="vol-v2", version=2, allow_existing=True, client=client)
+    modal.Volume.objects.create(name="vol-v2", allow_existing=True, client=client)
+
+
+@pytest.mark.parametrize("create_if_missing", [True, False])
+def test_volume_from_name_version_mismatch(servicer, client, create_if_missing):
+    modal.Volume.from_name("vol-fn-v1", create_if_missing=True, version=1).hydrate(client)
+
+    with pytest.raises(InvalidError, match="exists but has version v1, not v2"):
+        modal.Volume.from_name("vol-fn-v1", version=2, create_if_missing=create_if_missing).hydrate(client)
+
+    modal.Volume.from_name("vol-fn-v1", version=1, create_if_missing=create_if_missing).hydrate(client)
+    modal.Volume.from_name("vol-fn-v1", create_if_missing=create_if_missing).hydrate(client)
+
+    modal.Volume.from_name("vol-fn-v2", create_if_missing=True, version=2).hydrate(client)
+
+    with pytest.raises(InvalidError, match="exists but has version v2, not v1"):
+        modal.Volume.from_name("vol-fn-v2", version=1, create_if_missing=create_if_missing).hydrate(client)
+
+    modal.Volume.from_name("vol-fn-v2", version=2, create_if_missing=create_if_missing).hydrate(client)
+    modal.Volume.from_name("vol-fn-v2", create_if_missing=create_if_missing).hydrate(client)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_read_file_http_500_error(monkeypatch, servicer, client, version):
+    import pickle
+
+    # Disable retries during test run
+    monkeypatch.setattr(modal.volume, "retry", lambda *args, **kwargs: lambda f: f)
+
+    # Setup URL with special block_id that triggers 500 error
+    with servicer.intercept() as ctx:
+        url = f"{servicer.blob_host}/block/test-get-request:error-500:"
+        response = api_pb2.VolumeGetFile2Response(get_urls=[url], size=100, start=0, len=100)
+        ctx.add_response("VolumeGetFile2", response)
+
+        async with modal.Volume.ephemeral(client=client, version=version) as vol:
+            with pytest.raises(ExecutionError) as exc_info:
+                async for _ in vol.read_file.aio("foo.bin"):  # TODO(elias): deprecate .aio syntax optional
+                    ...
+            assert "500" in str(exc_info.value)
+            # Verify the exception is picklable so it can cross Modal's function boundary.
+            pickle.loads(pickle.dumps(exc_info.value))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_read_file_http_503_error(monkeypatch, servicer, client, version):
+    """503 from clobber-worker signals upstream storage unavailability; surface as ServiceError."""
+    import pickle
+
+    # Disable retries during test run
+    monkeypatch.setattr(modal.volume, "retry", lambda *args, **kwargs: lambda f: f)
+
+    with servicer.intercept() as ctx:
+        url = f"{servicer.blob_host}/block/test-get-request:error-503:"
+        response = api_pb2.VolumeGetFile2Response(get_urls=[url], size=100, start=0, len=100)
+        ctx.add_response("VolumeGetFile2", response)
+
+        async with modal.Volume.ephemeral(client=client, version=version) as vol:
+            with pytest.raises(ServiceError) as exc_info:
+                async for _ in vol.read_file.aio("foo.bin"):
+                    ...
+            assert "service temporarily unavailable" in str(exc_info.value).lower()
+            pickle.loads(pickle.dumps(exc_info.value))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_read_file_into_fileobj_http_404_error(monkeypatch, servicer, client, version):
+    # Disable retries during test run
+    monkeypatch.setattr(modal.volume, "retry", lambda *args, **kwargs: lambda f: f)
+
+    # Setup URL with special block_id that triggers 404 error
+    with servicer.intercept() as ctx:
+        url = f"{servicer.blob_host}/block/test-get-request:error-404:"
+        response = api_pb2.VolumeGetFile2Response(get_urls=[url], size=100, start=0, len=100)
+        ctx.add_response("VolumeGetFile2", response)
+
+        async with modal.Volume.ephemeral(client=client, version=version) as vol:
+            output = io.BytesIO()
+            with pytest.raises(ExecutionError) as exc_info:
+                await vol.read_file_into_fileobj.aio("foo.bin", output)
+
+            assert "404" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_read_file_digest_mismatch(monkeypatch, servicer, client, version):
+    monkeypatch.setattr(modal.volume, "retry", lambda *args, **kwargs: lambda f: f)
+
+    with servicer.intercept() as ctx:
+        url = f"{servicer.blob_host}/block/test-get-request:bad-digest:100"
+        response = api_pb2.VolumeGetFile2Response(get_urls=[url], size=100, start=0, len=100)
+        ctx.add_response("VolumeGetFile2", response)
+
+        async with modal.Volume.ephemeral(client=client, version=version) as vol:
+            with pytest.raises(ExecutionError) as exc_info:
+                async for _ in vol.read_file.aio("foo.bin"):
+                    ...
+            assert "corrupted" in str(exc_info.value)
+
+            ctx.add_response("VolumeGetFile2", response)
+            output = io.BytesIO()
+            with pytest.raises(ExecutionError) as exc_info:
+                await vol.read_file_into_fileobj.aio("foo.bin", output)
+            assert "corrupted" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_read_file_into_fileobj_wrong_length(monkeypatch, servicer, client, version):
+    monkeypatch.setattr(modal.volume, "retry", lambda *args, **kwargs: lambda f: f)
+
+    with servicer.intercept() as ctx:
+        # Block 1 is longer than its slice; it may not be written outside it. Block 0
+        # is shorter than its slice, which is what a zero-trimmed block looks like.
+        short_url = f"{servicer.blob_host}/block/test-get-request:raw:1:{BLOCK_SIZE - 1}"
+        long_url = f"{servicer.blob_host}/block/test-get-request:raw:2:{BLOCK_SIZE + 1}"
+        response = api_pb2.VolumeGetFile2Response(
+            get_urls=[short_url, long_url], size=2 * BLOCK_SIZE, start=0, len=2 * BLOCK_SIZE
+        )
+        ctx.add_response("VolumeGetFile2", response)
+
+        async with modal.Volume.ephemeral(client=client, version=version) as vol:
+            output = io.BytesIO()
+            with pytest.raises(ExecutionError, match="expected"):
+                await vol.read_file_into_fileobj.aio("foo.bin", output)
+            # Nothing was written past the end of the second block.
+            assert len(output.getvalue()) <= 2 * BLOCK_SIZE
+
+
+@pytest.mark.asyncio
+async def test_read_block_body_stops_at_expected_length():
+    """A body is abandoned once it passes its budget, rather than buffered in full."""
+    from modal.volume import _read_block_body
+
+    chunks_served = 0
+
+    class FakeContent:
+        async def iter_any(self):
+            nonlocal chunks_served
+            while True:
+                chunks_served += 1
+                yield b"x" * 1024
+
+    class FakeResponse:
+        headers: dict[str, str] = {}
+        content = FakeContent()
+
+    with pytest.raises(ExecutionError, match="longer than the expected 2048 bytes"):
+        await _read_block_body(FakeResponse(), 2048)
+
+    assert chunks_served == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_read_file_oversized_block(monkeypatch, servicer, client, version):
+    monkeypatch.setattr(modal.volume, "retry", lambda *args, **kwargs: lambda f: f)
+
+    with servicer.intercept() as ctx:
+        # The block carries far more than the 100 bytes the file occupies in it.
+        url = f"{servicer.blob_host}/block/test-get-request:raw:1:{BLOCK_SIZE}"
+        response = api_pb2.VolumeGetFile2Response(get_urls=[url], size=100, start=0, len=100)
+        ctx.add_response("VolumeGetFile2", response)
+
+        async with modal.Volume.ephemeral(client=client, version=version) as vol:
+            with pytest.raises(ExecutionError, match="longer than the expected 100 bytes"):
+                async for _ in vol.read_file.aio("foo.bin"):
+                    ...
+
+
+class _RecordingBytesIO(io.BytesIO):
+    """A file object that counts writes made after the download was supposed to be over."""
+
+    def __init__(self):
+        super().__init__()
+        self.accepting_writes = True
+        self.late_writes = 0
+
+    def write(self, b) -> int:
+        if not self.accepting_writes:
+            self.late_writes += 1
+        return super().write(b)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_read_file_into_fileobj_cancels_siblings(monkeypatch, servicer, client, version):
+    """When one block fails, the blocks still downloading are cancelled before the error surfaces."""
+    monkeypatch.setattr(modal.volume, "retry", lambda *args, **kwargs: lambda f: f)
+    # Both blocks must be in flight at once, no matter how many CPUs the test host has.
+    monkeypatch.setattr(multiprocessing, "cpu_count", lambda: 4)
+
+    with servicer.intercept() as ctx:
+        # Block 0 keeps writing for several seconds; block 1 fails while it is under way.
+        drip_url = f"{servicer.blob_host}/block/test-get-request:drip:1:100:0.05"
+        error_url = f"{servicer.blob_host}/block/test-get-request:error-500:0.5"
+        response = api_pb2.VolumeGetFile2Response(
+            get_urls=[drip_url, error_url], size=2 * BLOCK_SIZE, start=0, len=2 * BLOCK_SIZE
+        )
+        ctx.add_response("VolumeGetFile2", response)
+
+        async with modal.Volume.ephemeral(client=client, version=version) as vol:
+            output = _RecordingBytesIO()
+            t0 = time.monotonic()
+            with pytest.raises(ExecutionError, match="500"):
+                await asyncio.wait_for(vol.read_file_into_fileobj.aio("foo.bin", output), timeout=5)
+            elapsed = time.monotonic() - t0
+
+            # The still-downloading block was cancelled rather than waited out.
+            assert elapsed < 3
+            # It was genuinely mid-download when the sibling failed.
+            assert len(output.getvalue()) > 0
+
+            # Nothing may reach the file object once the caller has been told the download failed.
+            output.accepting_writes = False
+            await asyncio.sleep(1.5)
+            assert output.late_writes == 0
+
+
+@pytest.mark.parametrize("version", VERSIONS)
+@pytest.mark.asyncio
+async def test_volume_read_file_into_fileobj_read_timeout(monkeypatch, servicer, client, version):
+    """A block that makes no progress hits the inactivity timeout instead of hanging."""
+    monkeypatch.setattr(modal.volume, "retry", lambda *args, **kwargs: lambda f: f)
+    monkeypatch.setenv("MODAL_VOLUME_BLOCK_READ_TIMEOUT", "0.1")
+
+    with servicer.intercept() as ctx:
+        url = f"{servicer.blob_host}/block/test-get-request:stall:0.5"
+        response = api_pb2.VolumeGetFile2Response(get_urls=[url], size=100, start=0, len=100)
+        ctx.add_response("VolumeGetFile2", response)
+
+        async with modal.Volume.ephemeral(client=client, version=version) as vol:
+            output = io.BytesIO()
+            t0 = time.monotonic()
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(vol.read_file_into_fileobj.aio("foo.bin", output), timeout=5)
+            # The client gave up on its own, well before the server would have responded.
+            assert time.monotonic() - t0 < 3
+
+
+@pytest.mark.asyncio
+async def test_raise_on_block_response_error_bounds_body():
+    """Only a bounded prefix of an error body is read, even when the body never ends."""
+    from modal.volume import _raise_on_block_response_error
+
+    bytes_served = 0
+
+    class FakeContent:
+        async def read(self, n: int) -> bytes:
+            nonlocal bytes_served
+            bytes_served += n
+            return b"e" * n
+
+        def at_eof(self) -> bool:
+            return False
+
+    class FakeResponse:
+        status = 500
+        reason = "Internal Server Error"
+        content = FakeContent()
+
+        def get_encoding(self) -> str:
+            return "utf-8"
+
+    with pytest.raises(ExecutionError, match="500") as exc_info:
+        await _raise_on_block_response_error(FakeResponse())
+
+    # A small diagnostic prefix is read and quoted; the endless remainder is left alone.
+    assert 0 < bytes_served <= 64 * 1024
+    assert str(exc_info.value).endswith("...")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_read_file_streaming_error_body(monkeypatch, servicer, client, version):
+    """An error response whose body never ends is rejected without being buffered in full."""
+    monkeypatch.setattr(modal.volume, "retry", lambda *args, **kwargs: lambda f: f)
+
+    with servicer.intercept() as ctx:
+        url = f"{servicer.blob_host}/block/test-get-request:error-drip:0.001"
+        response = api_pb2.VolumeGetFile2Response(get_urls=[url], size=100, start=0, len=100)
+        ctx.add_response("VolumeGetFile2", response)
+        ctx.add_response("VolumeGetFile2", response)
+
+        async with modal.Volume.ephemeral(client=client, version=version) as vol:
+            t0 = time.monotonic()
+            with pytest.raises(ExecutionError, match="500"):
+                async for _ in vol.read_file.aio("foo.bin"):
+                    ...
+            with pytest.raises(ExecutionError, match="500"):
+                await vol.read_file_into_fileobj.aio("foo.bin", io.BytesIO())
+            assert time.monotonic() - t0 < 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", VERSIONS)
+async def test_volume_read_file_into_fileobj_progress_after_retry(servicer, client, version):
+    """A retried block does not report the bytes of the failed attempt a second time."""
+    with servicer.intercept() as ctx:
+        url = f"{servicer.blob_host}/block/test-get-request:flaky:{time.monotonic_ns()}:1:100"
+        response = api_pb2.VolumeGetFile2Response(get_urls=[url], size=100, start=0, len=100)
+        ctx.add_response("VolumeGetFile2", response)
+
+        advanced = 0
+
+        def progress_cb(*_, advance: int = 0, **__):
+            nonlocal advanced
+            advanced += advance
+
+        async with modal.Volume.ephemeral(client=client, version=version) as vol:
+            output = io.BytesIO()
+            await vol.read_file_into_fileobj.aio("foo.bin", output, progress_cb=progress_cb)
+            assert output.getvalue() == b"\x01" * 100
+            assert advanced == 100
+
+
+def test_parse_repr_digest():
+    from modal.volume import _BlockDigestVerifier, _parse_repr_digest
+
+    data = b"hello world"
+    digest = hashlib.sha256(data).digest()
+    encoded = base64.b64encode(digest).decode()
+
+    assert _parse_repr_digest(None) is None
+    assert _parse_repr_digest("") is None
+    assert _parse_repr_digest(f"sha-256=:{encoded}:") == digest
+    # Unknown or malformed members are skipped, per RFC 9530.
+    assert _parse_repr_digest("sha-512=:AAAA:") is None
+    assert _parse_repr_digest(f"sha-512=:AAAA:, sha-256=:{encoded}:") == digest
+    # Parameters carry no meaning and are dropped; a repeated key takes its last value.
+    assert _parse_repr_digest(f"sha-256=:{encoded}:;len=11") == digest
+    other = base64.b64encode(hashlib.sha256(b"other").digest()).decode()
+    assert _parse_repr_digest(f"sha-256=:{other}:, sha-256=:{encoded}:") == digest
+    assert _parse_repr_digest(f"sha-256=:{encoded}:, sha-256=:AAAA:") == digest
+    # A comma inside a quoted parameter string does not start a new member.
+    assert _parse_repr_digest(f'sha-256=:{encoded}:;p="a, sha-256=:{other}:;q"') == digest
+    assert _parse_repr_digest(f'sha-256=:{encoded}:;p="a\\", sha-256=:{other}:;q"') == digest
+    assert _parse_repr_digest(f'sha-512=:AAAA:;p="x,y", sha-256=:{encoded}:') == digest
+    # A private algorithm key whose hash covers only a prefix of the body is
+    # skipped like any other unknown key, leaving the body unverified.
+    assert _parse_repr_digest(f"modal-sha-256-prefix=:{encoded}:;len=11") is None
+
+    verifier = _BlockDigestVerifier(_parse_repr_digest(f"sha-256=:{encoded}:"))
+    verifier.update(data[:5])
+    verifier.update(data[5:])
+    verifier.finish()
+
+    verifier = _BlockDigestVerifier(_parse_repr_digest(f"sha-256=:{encoded}:"))
+    verifier.update(b"hello worle")
+    with pytest.raises(ExecutionError, match="corrupted"):
+        verifier.finish()
+
+    # A body that stops early hashes to something else.
+    verifier = _BlockDigestVerifier(_parse_repr_digest(f"sha-256=:{encoded}:"))
+    verifier.update(data[:5])
+    with pytest.raises(ExecutionError, match="corrupted"):
+        verifier.finish()
+
+    verifier = _BlockDigestVerifier(None)
+    verifier.update(b"anything")
+    verifier.finish()

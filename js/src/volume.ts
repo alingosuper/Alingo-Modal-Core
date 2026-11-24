@@ -1,0 +1,257 @@
+import {
+  ObjectCreationType,
+  VolumeFsVersion,
+  type VolumeMount,
+} from "../proto/modal_proto/api";
+import { type ModalClient } from "./client";
+import { ClientError, Status } from "nice-grpc";
+import { NotFoundError, InvalidError } from "./errors";
+import { EphemeralHeartbeatManager } from "./ephemeral";
+
+function volumeFsVersionProto(version: number | undefined): VolumeFsVersion {
+  switch (version) {
+    case undefined:
+      return VolumeFsVersion.VOLUME_FS_VERSION_UNSPECIFIED;
+    case 1:
+      return VolumeFsVersion.VOLUME_FS_VERSION_V1;
+    case 2:
+      return VolumeFsVersion.VOLUME_FS_VERSION_V2;
+    default:
+      throw new InvalidError("VolumeFS version must be either 1 or 2");
+  }
+}
+
+function normalizeVolumeFsVersion(version: VolumeFsVersion): VolumeFsVersion {
+  return version === VolumeFsVersion.VOLUME_FS_VERSION_UNSPECIFIED
+    ? VolumeFsVersion.VOLUME_FS_VERSION_V1
+    : version;
+}
+
+/** Optional parameters for {@link VolumeService#fromName client.volumes.fromName()}. */
+export type VolumeFromNameParams = {
+  environment?: string;
+  createIfMissing?: boolean;
+  /** Experimental VolumeFS version; omit to accept either version. */
+  version?: 1 | 2;
+};
+
+/** Optional parameters for {@link VolumeService#ephemeral client.volumes.ephemeral()}. */
+export type VolumeEphemeralParams = {
+  environment?: string;
+};
+
+/** Optional parameters for {@link VolumeService#delete client.volumes.delete()}. */
+export type VolumeDeleteParams = {
+  environment?: string;
+  allowMissing?: boolean;
+};
+
+/**
+ * Service for managing {@link Volume}s.
+ *
+ * Normally only ever accessed via the client as:
+ * ```typescript
+ * const modal = new ModalClient();
+ * const volume = await modal.volumes.fromName("my-volume");
+ * ```
+ */
+export class VolumeService {
+  readonly #client: ModalClient;
+  constructor(client: ModalClient) {
+    this.#client = client;
+  }
+
+  /**
+   * Reference a {@link Volume} by its name.
+   */
+  async fromName(name: string, params?: VolumeFromNameParams): Promise<Volume> {
+    const requestedVersion = volumeFsVersionProto(params?.version);
+    try {
+      const resp = await this.#client.cpClient.volumeGetOrCreate({
+        deploymentName: name,
+        environmentName: this.#client.environmentName(params?.environment),
+        objectCreationType: params?.createIfMissing
+          ? ObjectCreationType.OBJECT_CREATION_TYPE_CREATE_IF_MISSING
+          : ObjectCreationType.OBJECT_CREATION_TYPE_UNSPECIFIED,
+        version: requestedVersion,
+      });
+      if (params?.version !== undefined) {
+        const actualVersion = normalizeVolumeFsVersion(
+          resp.metadata?.version ??
+            VolumeFsVersion.VOLUME_FS_VERSION_UNSPECIFIED,
+        );
+        const normalizedRequestedVersion =
+          normalizeVolumeFsVersion(requestedVersion);
+        if (actualVersion !== normalizedRequestedVersion) {
+          throw new InvalidError(
+            `Volume '${name}' exists but has version v${actualVersion}, not v${normalizedRequestedVersion} as requested. ` +
+              "To access this Volume, either omit the version parameter or use the correct version.",
+          );
+        }
+      }
+      this.#client.logger.debug(
+        "Retrieved Volume",
+        "volume_id",
+        resp.volumeId,
+        "volume_name",
+        name,
+      );
+      return new Volume(resp.volumeId, name);
+    } catch (err) {
+      if (err instanceof ClientError && err.code === Status.NOT_FOUND)
+        throw new NotFoundError(err.details);
+      throw err;
+    }
+  }
+
+  /**
+   * Create a nameless, temporary {@link Volume}.
+   * It persists until closeEphemeral() is called, or the process exits.
+   */
+  async ephemeral(params: VolumeEphemeralParams = {}): Promise<Volume> {
+    const resp = await this.#client.cpClient.volumeGetOrCreate({
+      objectCreationType: ObjectCreationType.OBJECT_CREATION_TYPE_EPHEMERAL,
+      environmentName: this.#client.environmentName(params.environment),
+    });
+
+    this.#client.logger.debug(
+      "Created ephemeral Volume",
+      "volume_id",
+      resp.volumeId,
+    );
+
+    const ephemeralHbManager = new EphemeralHeartbeatManager(() =>
+      this.#client.cpClient.volumeHeartbeat({ volumeId: resp.volumeId }),
+    );
+
+    return new Volume(resp.volumeId, undefined, undefined, ephemeralHbManager);
+  }
+
+  /**
+   * Delete a named {@link Volume}.
+   *
+   * Warning: Deletion is irreversible and will affect any Apps currently using the Volume.
+   */
+  async delete(name: string, params?: VolumeDeleteParams): Promise<void> {
+    try {
+      const volume = await this.fromName(name, {
+        environment: params?.environment,
+        createIfMissing: false,
+      });
+      await this.#client.cpClient.volumeDelete({
+        volumeId: volume.volumeId,
+      });
+      this.#client.logger.debug(
+        "Deleted Volume",
+        "volume_name",
+        name,
+        "volume_id",
+        volume.volumeId,
+      );
+    } catch (err) {
+      const isNotFound =
+        err instanceof NotFoundError ||
+        (err instanceof ClientError && err.code === Status.NOT_FOUND);
+      if (isNotFound && params?.allowMissing) {
+        return;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Resolved mount configuration stored on a Volume. `subPath: undefined` means "mount the
+ * whole volume" (no sub-path set on the resulting VolumeMount proto).
+ */
+type ResolvedMountOptions = {
+  readOnly: boolean;
+  subPath: string | undefined;
+};
+
+const DEFAULT_MOUNT_OPTIONS: ResolvedMountOptions = {
+  readOnly: false,
+  subPath: undefined,
+};
+
+/** Volumes provide persistent storage that can be mounted in Modal {@link Function_ Function}s. */
+export class Volume {
+  readonly volumeId: string;
+  readonly name?: string;
+  /**
+   * @hidden
+   * @internal
+   */
+  readonly _mountOptions: ResolvedMountOptions = DEFAULT_MOUNT_OPTIONS;
+  readonly #ephemeralHbManager?: EphemeralHeartbeatManager;
+
+  /** @ignore */
+  constructor(
+    volumeId: string,
+    name?: string,
+    mountOptions?: ResolvedMountOptions,
+    ephemeralHbManager?: EphemeralHeartbeatManager,
+  ) {
+    this.volumeId = volumeId;
+    this.name = name;
+    if (mountOptions) {
+      this._mountOptions = mountOptions;
+    }
+    this.#ephemeralHbManager = ephemeralHbManager;
+  }
+
+  /**
+   * Configure options used when mounting this Volume. Fields left undefined preserve their value
+   * from any previous withMountOptions call on the same Volume (stacking).
+   */
+  withMountOptions(params: VolumeMountOptionsParams = {}): Volume {
+    let subPath = this._mountOptions.subPath;
+    if (params.subPath !== undefined) {
+      subPath = params.subPath === "/" ? undefined : params.subPath;
+    }
+    return new Volume(
+      this.volumeId,
+      this.name,
+      {
+        readOnly: params.readOnly ?? this._mountOptions.readOnly,
+        subPath,
+      },
+      this.#ephemeralHbManager,
+    );
+  }
+
+  /** Delete the ephemeral Volume. Only usable with emphemeral Volumes. */
+  closeEphemeral(): void {
+    if (this.#ephemeralHbManager) {
+      this.#ephemeralHbManager.stop();
+    } else {
+      throw new InvalidError("Volume is not ephemeral.");
+    }
+  }
+}
+
+/**
+ * Builds the VolumeMount proto from a Volume's mount configuration.
+ * @internal
+ */
+export function volumeToMountProto(
+  mountPath: string,
+  volume: Volume,
+): VolumeMount {
+  // Default to unconfigured options for callers that synthesize Volume-shaped
+  // mocks via `as Volume` without going through the constructor.
+  const opts = volume._mountOptions ?? DEFAULT_MOUNT_OPTIONS;
+  return {
+    volumeId: volume.volumeId,
+    mountPath,
+    allowBackgroundCommits: true,
+    readOnly: opts.readOnly,
+    subPath: opts.subPath,
+  };
+}
+
+/** Options for mounting a {@link Volume}. */
+export type VolumeMountOptionsParams = {
+  readOnly?: boolean;
+  subPath?: string;
+};

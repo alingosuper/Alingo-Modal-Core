@@ -1,0 +1,645 @@
+import {
+  GenericResult,
+  GenericResult_GenericStatus,
+  RegistryAuthType,
+  ImageGetOrCreateResponse,
+  ImageRegistryConfig,
+  Image as ImageProto,
+  GPUConfig,
+} from "../proto/modal_proto/api";
+import { type ModalClient } from "./client";
+import { App, parseGpuConfig } from "./app";
+import { Secret, mergeEnvIntoSecrets, hydrateSecrets } from "./secret";
+import { ClientError } from "nice-grpc";
+import { Status } from "nice-grpc";
+import { NotFoundError, InvalidError } from "./errors";
+import { checkObjectName } from "./name_utils";
+
+const DEFAULT_IMAGE_TAG = "latest";
+
+function validateImageName(name: string): void {
+  checkObjectName(name, "Image");
+  if (name.startsWith("im-")) {
+    throw new InvalidError(
+      "Image name cannot start with 'im-' (reserved for image IDs).",
+    );
+  }
+}
+
+function validateImageTag(tag: string): void {
+  checkObjectName(tag, "Image tag");
+}
+
+/**
+ * Parse an image reference, returning [namespacePrefix, nameTag].
+ *
+ * If the name contains a '/', the part before the last '/' is extracted as
+ * a namespace prefix (intended for environment/name or workspace/env/name
+ * syntax). The actual image name (after the last '/') is validated as a
+ * standard image name.
+ */
+function parseNamedImageRef(value: string): [string, string] {
+  const separatorIndex = value.indexOf(":");
+  let imageName: string;
+  let tag: string;
+  if (separatorIndex === -1) {
+    imageName = value;
+    tag = DEFAULT_IMAGE_TAG;
+  } else {
+    imageName = value.slice(0, separatorIndex);
+    tag = value.slice(separatorIndex + 1);
+  }
+
+  let prefix = "";
+  const lastSlashIndex = imageName.lastIndexOf("/");
+  if (lastSlashIndex !== -1) {
+    prefix = imageName.slice(0, lastSlashIndex);
+    const after = imageName.slice(lastSlashIndex + 1);
+    if (prefix === "") {
+      throw new InvalidError(
+        "Invalid Image name: '/' prefix must be non-empty.",
+      );
+    }
+    if (after === "") {
+      throw new InvalidError(
+        "Invalid Image name: name after '/' must be non-empty.",
+      );
+    }
+    imageName = after;
+  }
+
+  validateImageName(imageName);
+  validateImageTag(tag);
+
+  const fullName = prefix ? `${prefix}/${imageName}` : imageName;
+  return [prefix, `${fullName}:${tag}`];
+}
+
+/** Optional parameters for {@link ImageService#fromRegistry client.images.fromRegistry()}. */
+export type ImageFromRegistryParams = {
+  /** A {@link Secret} with credentials for registry authentication. */
+  secret?: Secret;
+  /** Platform of the Image as `linux/<arch>`, e.g. `"linux/arm64"`. */
+  platform?: string;
+};
+
+/** Optional parameters for {@link ImageService#fromName client.images.fromName()}. */
+export type ImageFromNameParams = {
+  /** Modal Environment to resolve the named Image in. */
+  environment?: string;
+};
+
+/**
+ * A closure that hydrates the registry-auth {@link Secret} (if any) and builds
+ * the {@link ImageRegistryConfig} for the base build layer. It runs at build
+ * time rather than when the Image is constructed, since the Secret may be lazy
+ * (created via {@link SecretService#fromObject}).
+ */
+type BuildRegistryConfig = (
+  client: ModalClient,
+) => Promise<ImageRegistryConfig>;
+
+const REGISTRY_AUTH_KEY_SETS: [RegistryAuthType, string, string[][]][] = [
+  [
+    RegistryAuthType.REGISTRY_AUTH_TYPE_AWS,
+    "AWS",
+    [
+      ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
+      ["AWS_ROLE_ARN", "AWS_REGION"],
+    ],
+  ],
+  [RegistryAuthType.REGISTRY_AUTH_TYPE_GCP, "GCP", [["SERVICE_ACCOUNT_JSON"]]],
+  [
+    RegistryAuthType.REGISTRY_AUTH_TYPE_STATIC_CREDS,
+    "username and password",
+    [["REGISTRY_USERNAME", "REGISTRY_PASSWORD"]],
+  ],
+];
+
+const REGISTRY_SECRET_KEYS_HELP =
+  "Registry Secret must include exactly one of: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGION " +
+  "(or AWS_ROLE_ARN and AWS_REGION) for AWS ECR; SERVICE_ACCOUNT_JSON for GCP Artifact Registry; " +
+  "or REGISTRY_USERNAME and REGISTRY_PASSWORD for other registries.";
+
+function inferRegistryAuthType(keys: string[]): RegistryAuthType {
+  const keySet = new Set(keys);
+  const matches = REGISTRY_AUTH_KEY_SETS.filter(([, , keySets]) =>
+    keySets.some((required) => required.every((key) => keySet.has(key))),
+  );
+  if (matches.length === 0) {
+    const found = [...keySet].sort().join(", ") || "none";
+    throw new InvalidError(
+      `${REGISTRY_SECRET_KEYS_HELP} Found keys: ${found}.`,
+    );
+  }
+  if (matches.length > 1) {
+    const names = matches.map(([, name]) => name).join(", ");
+    throw new InvalidError(
+      `Registry Secret has keys for more than one kind of authentication (${names}). ${REGISTRY_SECRET_KEYS_HELP}`,
+    );
+  }
+  return matches[0][0];
+}
+
+/**
+ * Returns a closure that hydrates the registry-auth Secret (if any) and builds
+ * the ImageRegistryConfig. It runs at build time so that lazy Secrets (created
+ * via fromObject) are resolved against the build's client.
+ */
+function registryConfigBuilder(
+  authType: RegistryAuthType,
+  secret?: Secret,
+): BuildRegistryConfig {
+  return async (client: ModalClient) => {
+    let secretId = "";
+    let registryAuthType = authType;
+    if (secret) {
+      await hydrateSecrets(client, [secret]);
+      secretId = secret.secretId;
+      if (authType === RegistryAuthType.REGISTRY_AUTH_TYPE_UNSPECIFIED) {
+        registryAuthType = inferRegistryAuthType(await secret._getKeys(client));
+      }
+    }
+    return ImageRegistryConfig.create({ registryAuthType, secretId });
+  };
+}
+
+/**
+ * Service for managing {@link Image}s.
+ *
+ * Normally only ever accessed via the client as:
+ * ```typescript
+ * const modal = new ModalClient();
+ * const image = await modal.images.fromRegistry("alpine");
+ * ```
+ */
+export class ImageService {
+  readonly #client: ModalClient;
+  constructor(client: ModalClient) {
+    this.#client = client;
+  }
+
+  /**
+   * Creates an {@link Image} from an Image ID
+   *
+   * @param imageId - Image ID.
+   */
+  async fromId(imageId: string): Promise<Image> {
+    try {
+      const resp = await this.#client.cpClient.imageFromId({ imageId });
+      return new Image(this.#client, resp.imageId, "");
+    } catch (err) {
+      if (err instanceof ClientError && err.code === Status.NOT_FOUND)
+        throw new NotFoundError(err.details);
+      if (
+        err instanceof ClientError &&
+        err.code === Status.FAILED_PRECONDITION &&
+        err.details.includes("Could not find image with ID")
+      )
+        throw new NotFoundError(err.details);
+      throw err;
+    }
+  }
+
+  /**
+   * Reference a named {@link Image} that was previously published.
+   *
+   * @param name - Name of the published Image, optionally including a tag as `name:tag`.
+   * If no tag is included, `:latest` is used.
+   * @param params - Optional environment.
+   */
+  async fromName(
+    name: string,
+    params: ImageFromNameParams = {},
+  ): Promise<Image> {
+    const [namespacePrefix, tag] = parseNamedImageRef(name);
+
+    let environmentName: string;
+    if (namespacePrefix) {
+      if (params.environment) {
+        throw new InvalidError(
+          "Cannot specify 'environment' when the image name contains a '/'.",
+        );
+      }
+      environmentName = "";
+    } else {
+      environmentName = this.#client.environmentName(params.environment);
+    }
+
+    try {
+      const resp = await this.#client.cpClient.imageGetByTag({
+        environmentName,
+        tag,
+      });
+      return new Image(this.#client, resp.imageId, "");
+    } catch (err) {
+      if (err instanceof ClientError && err.code === Status.NOT_FOUND)
+        throw new NotFoundError(err.details);
+      throw err;
+    }
+  }
+
+  /**
+   * Creates an {@link Image} from a raw registry tag, optionally using a {@link Secret} for authentication.
+   *
+   * The keys of the Secret select the auth type: `AWS_*` for AWS ECR, `SERVICE_ACCOUNT_JSON`
+   * for GCP, or `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`.
+   *
+   * @param tag - The registry tag for the Image.
+   * @param params - Optional. A Secret containing credentials for registry
+   * authentication, or {@link ImageFromRegistryParams}.
+   */
+  fromRegistry(tag: string, params?: Secret | ImageFromRegistryParams): Image {
+    const { secret, platform } =
+      params instanceof Secret
+        ? { secret: params, platform: undefined }
+        : (params ?? {});
+    let buildRegistryConfig;
+    if (secret) {
+      if (!(secret instanceof Secret)) {
+        throw new TypeError(
+          "secret must be a reference to an existing Secret, e.g. `await client.secrets.fromName('my_secret')`",
+        );
+      }
+      buildRegistryConfig = registryConfigBuilder(
+        RegistryAuthType.REGISTRY_AUTH_TYPE_UNSPECIFIED,
+        secret,
+      );
+    }
+    return new Image(
+      this.#client,
+      "",
+      tag,
+      buildRegistryConfig,
+      undefined,
+      undefined,
+      platform,
+    );
+  }
+
+  /**
+   * Creates an {@link Image} from a raw registry tag, optionally using a {@link Secret} for authentication.
+   *
+   * @param tag - The registry tag for the Image.
+   * @param secret - A Secret containing credentials for registry authentication.
+   */
+  fromAwsEcr(tag: string, secret: Secret): Image {
+    if (!(secret instanceof Secret)) {
+      throw new TypeError(
+        "secret must be a reference to an existing Secret, e.g. `await client.secrets.fromName('my_secret')`",
+      );
+    }
+    const buildRegistryConfig = registryConfigBuilder(
+      RegistryAuthType.REGISTRY_AUTH_TYPE_AWS,
+      secret,
+    );
+    return new Image(this.#client, "", tag, buildRegistryConfig);
+  }
+
+  /**
+   * Creates an {@link Image} from a raw registry tag, optionally using a {@link Secret} for authentication.
+   *
+   * @param tag - The registry tag for the Image.
+   * @param secret - A Secret containing credentials for registry authentication.
+   */
+  fromGcpArtifactRegistry(tag: string, secret: Secret): Image {
+    if (!(secret instanceof Secret)) {
+      throw new TypeError(
+        "secret must be a reference to an existing Secret, e.g. `await client.secrets.fromName('my_secret')`",
+      );
+    }
+    const buildRegistryConfig = registryConfigBuilder(
+      RegistryAuthType.REGISTRY_AUTH_TYPE_GCP,
+      secret,
+    );
+    return new Image(this.#client, "", tag, buildRegistryConfig);
+  }
+
+  /**
+   * Delete an {@link Image} by ID.
+   *
+   * Deletion is irreversible and will prevent Functions/Sandboxes from using the Image.
+   *
+   * Note: When building an Image, each chained method call will create an
+   * intermediate Image layer, each with its own ID. Deleting an Image will not
+   * delete any of its intermediate layers, only the image identified by the
+   * provided ID.
+   */
+  async delete(imageId: string, _: ImageDeleteParams = {}): Promise<void> {
+    try {
+      await this.#client.cpClient.imageDelete({ imageId });
+    } catch (err) {
+      if (err instanceof ClientError && err.code === Status.NOT_FOUND)
+        throw new NotFoundError(err.details);
+      if (
+        err instanceof ClientError &&
+        err.code === Status.FAILED_PRECONDITION &&
+        err.details.includes("Could not find image with ID")
+      )
+        throw new NotFoundError(err.details);
+      throw err;
+    }
+  }
+}
+
+/** Optional parameters for {@link ImageService#delete client.images.delete()}. */
+export type ImageDeleteParams = Record<never, never>;
+
+/** Optional parameters for {@link Image#publish Image.publish()}. */
+export type ImagePublishParams = {
+  /** Modal Environment to publish the named Image in. */
+  environment?: string;
+};
+
+/** Optional parameters for {@link Image#dockerfileCommands Image.dockerfileCommands()}. */
+export type ImageDockerfileCommandsParams = {
+  /** Environment variables to set in the build environment. */
+  env?: Record<string, string>;
+
+  /** {@link Secret}s that will be made available as environment variables to this layer's build environment. */
+  secrets?: Secret[];
+
+  /** GPU reservation for this layer's build environment (e.g. "A100", "T4:2", "A100-80GB:4"). */
+  gpu?: string;
+
+  /** Ignore cached builds for this layer, similar to 'docker build --no-cache'. */
+  forceBuild?: boolean;
+};
+
+/** Represents a single image layer with its build configuration. */
+type Layer = {
+  commands: string[];
+  env?: Record<string, string>;
+  secrets?: Secret[];
+  gpuConfig?: GPUConfig;
+  forceBuild?: boolean;
+};
+
+/** A container image, used for starting {@link Sandbox}es. */
+export class Image {
+  #client: ModalClient;
+  #imageId: string;
+  #tag: string;
+  // Image ID of the parent image layer to use as `FROM base`.
+  #baseImageId: string;
+  // When set, hydrates the registry-auth Secret (if any) and returns the
+  // ImageRegistryConfig for the base build layer. Runs at build time, since the
+  // Secret may be lazy. Undefined when not pulling from a private registry.
+  #buildRegistryConfig?: BuildRegistryConfig;
+  #layers: Layer[];
+  #platform?: string;
+
+  /** @ignore */
+  constructor(
+    client: ModalClient,
+    imageId: string,
+    tag: string,
+    buildRegistryConfig?: BuildRegistryConfig,
+    layers?: Layer[],
+    baseImageId?: string,
+    platform?: string,
+  ) {
+    this.#client = client;
+    this.#platform = platform;
+    this.#imageId = imageId;
+    this.#tag = tag;
+    this.#baseImageId = baseImageId || "";
+    this.#buildRegistryConfig = buildRegistryConfig;
+    this.#layers = layers || [
+      {
+        commands: [],
+        env: undefined,
+        secrets: undefined,
+        gpuConfig: undefined,
+        forceBuild: false,
+      },
+    ];
+  }
+  get imageId(): string {
+    return this.#imageId;
+  }
+
+  private static validateDockerfileCommands(commands: string[]): void {
+    for (const command of commands) {
+      const trimmed = command.trim().toUpperCase();
+      if (trimmed.startsWith("COPY ") && !trimmed.startsWith("COPY --FROM=")) {
+        throw new InvalidError(
+          "COPY commands that copy from local context are not yet supported.",
+        );
+      }
+    }
+  }
+
+  /**
+   * Extend an image with arbitrary Dockerfile-like commands.
+   *
+   * Each call creates a new Image layer that will be built sequentially.
+   * The provided options apply only to this layer.
+   *
+   * @param commands - Array of Dockerfile commands as strings
+   * @param params - Optional configuration for this layer's build
+   * @returns A new Image instance
+   */
+  dockerfileCommands(
+    commands: string[],
+    params?: ImageDockerfileCommandsParams,
+  ): Image {
+    if (commands.length === 0) {
+      return this;
+    }
+
+    Image.validateDockerfileCommands(commands);
+
+    const newLayer: Layer = {
+      commands: [...commands],
+      env: params?.env,
+      secrets: params?.secrets,
+      gpuConfig: params?.gpu ? parseGpuConfig(params.gpu) : undefined,
+      forceBuild: params?.forceBuild,
+    };
+
+    const baseImageId = this.#imageId || this.#baseImageId;
+    const layers = this.#imageId === "" ? this.#layers : [];
+
+    return new Image(
+      this.#client,
+      "",
+      this.#tag,
+      this.#buildRegistryConfig,
+      [...layers, newLayer],
+      baseImageId,
+      this.#platform,
+    );
+  }
+
+  /**
+   * Eagerly builds an Image on Modal.
+   *
+   * @param app - App to use to build the Image.
+   */
+  async build(app: App): Promise<Image> {
+    if (this.imageId !== "") {
+      // Image is already built with an Image ID
+      return this;
+    }
+
+    this.#client.logger.debug("Building image", "app_id", app.appId);
+
+    let baseImageId: string | undefined = this.#baseImageId || undefined;
+    const imageBuilderVersion = await this.#client.getImageBuilderVersion(
+      app.environmentName,
+    );
+
+    for (let i = 0; i < this.#layers.length; i++) {
+      const layer = this.#layers[i];
+
+      const mergedSecrets = await mergeEnvIntoSecrets(
+        this.#client,
+        layer.env,
+        layer.secrets,
+      );
+      await hydrateSecrets(this.#client, mergedSecrets);
+
+      const secretIds = mergedSecrets.map((secret) => secret.secretId);
+      const gpuConfig = layer.gpuConfig;
+
+      let dockerfileCommands: string[];
+      let baseImages: Array<{ dockerTag: string; imageId: string }>;
+
+      if (i === 0 && baseImageId) {
+        dockerfileCommands = ["FROM base", ...layer.commands];
+        baseImages = [{ dockerTag: "base", imageId: baseImageId }];
+      } else if (i === 0) {
+        dockerfileCommands = [`FROM ${this.#tag}`, ...layer.commands];
+        baseImages = [];
+      } else {
+        dockerfileCommands = ["FROM base", ...layer.commands];
+        baseImages = [{ dockerTag: "base", imageId: baseImageId! }];
+      }
+
+      const imageRegistryConfig =
+        i === 0 && !baseImageId && this.#buildRegistryConfig
+          ? await this.#buildRegistryConfig(this.#client)
+          : undefined;
+      const platform = i === 0 && !baseImageId ? this.#platform : undefined;
+
+      let resp: ImageGetOrCreateResponse;
+      try {
+        resp = await this.#client.cpClient.imageGetOrCreate({
+          appId: app.appId,
+          image: ImageProto.create({
+            dockerfileCommands,
+            imageRegistryConfig,
+            secretIds,
+            gpuConfig,
+            contextFiles: [],
+            baseImages,
+            platform,
+          }),
+          builderVersion: imageBuilderVersion,
+          forceBuild: layer.forceBuild || false,
+        });
+      } catch (err) {
+        if (err instanceof ClientError && err.code === Status.NOT_FOUND)
+          throw new NotFoundError(err.details);
+        throw err;
+      }
+
+      let result: GenericResult;
+
+      if (resp.result?.status) {
+        // Image has already been built
+        result = resp.result;
+      } else {
+        // Not built or in the process of building - wait for build
+        let lastEntryId = "";
+        let resultJoined: GenericResult | undefined = undefined;
+        while (!resultJoined) {
+          for await (const item of this.#client.cpClient.imageJoinStreaming({
+            imageId: resp.imageId,
+            timeout: 55,
+            lastEntryId,
+          })) {
+            if (item.entryId) lastEntryId = item.entryId;
+            if (item.result?.status) {
+              resultJoined = item.result;
+              break;
+            }
+            // Ignore all log lines and progress updates.
+          }
+        }
+        result = resultJoined;
+      }
+
+      if (
+        result.status === GenericResult_GenericStatus.GENERIC_STATUS_FAILURE ||
+        result.status ===
+          GenericResult_GenericStatus.GENERIC_STATUS_MEMORY_MANAGER_EVICTION
+      ) {
+        throw new Error(
+          `Image build for ${resp.imageId} failed with the exception:\n${result.exception}`,
+        );
+      } else if (
+        result.status === GenericResult_GenericStatus.GENERIC_STATUS_TERMINATED
+      ) {
+        throw new Error(
+          `Image build for ${resp.imageId} terminated due to external shut-down. Please try again.`,
+        );
+      } else if (
+        result.status === GenericResult_GenericStatus.GENERIC_STATUS_TIMEOUT
+      ) {
+        throw new Error(
+          `Image build for ${resp.imageId} timed out. Please try again with a larger timeout parameter.`,
+        );
+      } else if (
+        result.status !== GenericResult_GenericStatus.GENERIC_STATUS_SUCCESS
+      ) {
+        throw new Error(
+          `Image build for ${resp.imageId} failed with unknown status: ${result.status}`,
+        );
+      }
+
+      // the new image is the base for the next layer
+      baseImageId = resp.imageId;
+    }
+    this.#imageId = baseImageId!;
+    this.#client.logger.debug("Image build completed", "image_id", baseImageId);
+    return this;
+  }
+
+  /**
+   * Publish this built Image under a stable name and tag.
+   *
+   * @param name - Name to publish the Image under, optionally including a tag as `name:tag`.
+   * If no tag is included, `:latest` is used.
+   * @param params - Optional environment.
+   */
+  async publish(name: string, params: ImagePublishParams = {}): Promise<void> {
+    const [namespacePrefix, tag] = parseNamedImageRef(name);
+
+    if (this.#imageId === "") {
+      throw new InvalidError(
+        "Cannot publish an image that has not been built yet. Call build() first.",
+      );
+    }
+
+    let environmentName: string;
+    if (namespacePrefix) {
+      if (params.environment) {
+        throw new InvalidError(
+          "Cannot specify 'environment' when the image name contains a '/'.",
+        );
+      }
+      environmentName = "";
+    } else {
+      environmentName = this.#client.environmentName(params.environment);
+    }
+
+    await this.#client.cpClient.imagePublish({
+      imageId: this.#imageId,
+      environmentName,
+      allowPublic: false,
+      tag,
+    });
+  }
+}

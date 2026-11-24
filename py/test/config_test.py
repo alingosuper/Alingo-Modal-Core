@@ -1,0 +1,297 @@
+# Copyright Modal Labs 2022
+import json
+import os
+import pathlib
+import pytest
+import subprocess
+import sys
+
+import toml
+
+import modal
+from modal._utils.async_utils import synchronize_api
+from modal.config import Config, _lookup_workspace, _transform_headers, config
+from modal.exception import InvalidError
+
+
+class CLIException(Exception):
+    pass
+
+
+def _cli(args, env={}):
+    lib_dir = pathlib.Path(modal.__file__).parent.parent
+    args = [sys.executable, "-m", "modal.cli.entry_point"] + args
+    env = {
+        **os.environ,
+        **env,
+        # For windows
+        "PYTHONUTF8": "1",
+    }
+    ret = subprocess.run(args, cwd=lib_dir, env=env, capture_output=True)
+    stdout = ret.stdout.decode()
+    stderr = ret.stderr.decode()
+    if ret.returncode != 0:
+        raise CLIException(f"Failed with {ret.returncode} stdout: {stdout} stderr: {stderr}")
+    return stdout
+
+
+def _get_config(env={}):
+    stdout = _cli(["config", "show", "--no-redact"], env=env)
+    return json.loads(stdout)
+
+
+def test_config():
+    config = _get_config()
+    assert config["server_url"]
+    assert "function_runtime_debug" not in config
+
+
+def test_config_show_internal_fields():
+    stdout = _cli(["config", "show"])
+    config = json.loads(stdout)
+    assert "function_runtime_debug" not in config
+
+    stdout = _cli(["config", "show", "--include-internal"])
+    config = json.loads(stdout)
+    assert "function_runtime_debug" in config
+
+
+def test_config_to_dict_internal_settings():
+    assert "function_runtime_debug" not in config.to_dict()
+    assert config.to_dict(include_internal=True)["function_runtime_debug"] is False
+
+
+def test_config_env_override():
+    config = _get_config(env={"MODAL_SERVER_URL": "xyz.corp"})
+    assert config["server_url"] == "xyz.corp"
+
+
+def test_config_oauth_refresh_token_env_override():
+    config = _get_config(env={"MODAL_OAUTH_REFRESH_TOKEN": "ak-oauth.as-oauth"})
+    assert config["oauth_refresh_token"] == "ak-oauth.as-oauth"
+
+
+def test_config_oauth_jwt_key_env_override():
+    config = _get_config(env={"MODAL_OAUTH_JWT_KEY": "private-key"})
+    assert config["oauth_jwt_key"] == "private-key"
+
+
+def test_config_store_user(servicer, modal_config):
+    with modal_config(show_on_error=True) as config_file_path:
+        env = {"MODAL_SERVER_URL": servicer.client_addr}
+
+        servicer.required_creds = {"abc": "xyz", "foo": "bar1", "foo2": "bar2", "ABC": "XYZ", "foo3": "bar3"}
+
+        # No token by default
+        config = _get_config(env=env)
+        assert config["token_id"] is None
+
+        # Set creds to abc / xyz
+        _cli(["token", "set", "--token-id", "abc", "--token-secret", "xyz"], env=env)
+
+        # Make sure an incorrect token fails
+        with pytest.raises(CLIException):
+            _cli(["token", "set", "--token-id", "abc", "--token-secret", "incorrect"], env=env)
+
+        # Set creds to foo / bar1 for the prof_1 profile
+        _cli(
+            ["token", "set", "--token-id", "foo", "--token-secret", "bar1", "--profile", "prof_1", "--no-activate"],
+            env=env,
+        )
+
+        # Set creds to foo2 / bar2 for the prof_2 profile (given as an env var)
+        _cli(
+            ["token", "set", "--token-id", "foo2", "--token-secret", "bar2", "--no-activate"],
+            env={"MODAL_PROFILE": "prof_2", **env},
+        )
+
+        # Now these should be stored in the user's home directory
+        config = _get_config(env=env)
+        assert config["token_id"] == "abc"
+        assert config["token_secret"] == "xyz"
+
+        # Make sure it can be overridden too
+        config = _get_config(env={"MODAL_TOKEN_ID": "foo", **env})
+        assert config["token_id"] == "foo"
+        assert config["token_secret"] == "xyz"
+
+        # Check that the profile is named after the workspace username by default
+        config = _get_config(env={"MODAL_PROFILE": "test-username", **env})
+        assert config["token_id"] == "abc"
+        assert config["token_secret"] == "xyz"
+
+        # Check that we can get the prof_1 env creds too
+        config = _get_config(env={"MODAL_PROFILE": "prof_1", **env})
+        assert config["token_id"] == "foo"
+        assert config["token_secret"] == "bar1"
+
+        # Check that we can get the prof_2 env creds too
+        config = _get_config(env={"MODAL_PROFILE": "prof_2", **env})
+        assert config["token_id"] == "foo2"
+        assert config["token_secret"] == "bar2"
+
+        # Check that an empty string falls back to the active profile
+        config = _get_config(env={"MODAL_PROFILE": "", **env})
+        assert config["token_secret"] == "xyz"
+
+        # Test that only the first profile was explicitly activated
+        for profile, profile_config in toml.load(config_file_path).items():
+            if profile == "test-username":
+                assert profile_config["active"] is True
+            else:
+                assert "active" not in profile_config
+
+        # Check that we can overwrite the default profile
+        _cli(["token", "set", "--token-id", "ABC", "--token-secret", "XYZ"], env=env)
+        assert toml.load(config_file_path)["test-username"]["token_id"] == "ABC"
+
+        # Check that we activate a profile by default while setting a token
+        _cli(
+            ["token", "set", "--token-id", "foo3", "--token-secret", "bar3", "--profile", "prof_3"],
+            env=env,
+        )
+        for profile, profile_config in toml.load(config_file_path).items():
+            if profile == "prof_3":
+                assert profile_config["active"] is True
+            else:
+                assert "active" not in profile_config
+
+
+def test_config_env_override_arbitrary_env():
+    """config.override_locally() replaces existing env var if not part of config."""
+    key = "NVIDIA_VISIBLE_DEVICES"
+    value = "0,1"
+
+    # Place old value in memory.
+    os.environ[key] = "none"
+
+    # Expect value to be overwritten.
+    config.override_locally(key, value)
+    assert os.getenv(key) == value
+
+
+@pytest.mark.asyncio
+async def test_workspace_lookup(servicer, server_url_env):
+    servicer.required_creds = {"ak-abc": "as-xyz"}
+    resp = await synchronize_api(_lookup_workspace).aio(servicer.client_addr, "ak-abc", "as-xyz")
+    assert resp.username == "test-username"
+
+
+@pytest.mark.asyncio
+async def test_workspace_lookup_oauth(servicer, credentials):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    token_id, token_secret = credentials
+    servicer.required_creds = {token_id: token_secret}
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    resp = await synchronize_api(_lookup_workspace).aio(
+        servicer.client_addr,
+        oauth_refresh_token=f"{token_id}.{token_secret}",
+        oauth_client_id="oc-client-id",
+        oauth_jwt_key=private_key_pem,
+    )
+    assert resp.username == "test-username"
+    assert servicer.last_metadata["x-modal-refresh-token"] == f"{token_id}.{token_secret}"
+    assert "x-modal-token-id" not in servicer.last_metadata
+    assert "x-modal-token-secret" not in servicer.last_metadata
+    assert servicer.last_metadata["x-modal-oauth-client-id"] == "oc-client-id"
+    assert servicer.last_metadata["x-modal-oauth-client-assertion"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("oauth_credentials", "missing_credentials"),
+    [
+        ({"oauth_refresh_token": "refresh-token"}, "client ID, JWT key"),
+        (
+            {"oauth_client_id": "oc-client-id", "oauth_jwt_key": "private-key"},
+            "refresh token",
+        ),
+        (
+            {"oauth_refresh_token": "refresh-token", "oauth_jwt_key": "private-key"},
+            "client ID",
+        ),
+    ],
+)
+async def test_workspace_lookup_incomplete_oauth(oauth_credentials, missing_credentials):
+    with pytest.raises(InvalidError, match=f"OAuth credentials are incomplete; missing {missing_credentials}."):
+        await synchronize_api(_lookup_workspace).aio("http://unused", **oauth_credentials)
+
+
+@pytest.mark.parametrize("arg", ["false", "'false'", "'False'", "'0'", 0, "''"])
+def test_config_boolean(modal_config, arg):
+    modal_toml = f"""
+    [prof-1]
+    token_id = 'ak-abc'
+    token_secret = 'as_xyz'
+    force_build = {arg}
+    """
+    with modal_config(modal_toml):
+        assert not Config().get("force_build", profile="prof-1")
+
+
+def test_malformed_config_better(modal_config):
+    modal_toml = """
+    token_id = 'ak-abc'
+    token_secret = 'as_xyz'
+    """
+    with pytest.raises(InvalidError, match="must contain table sections"):
+        with modal_config(modal_toml):
+            pass
+
+    modal_toml = """
+    [default]
+    token_id
+    """
+    with pytest.raises(InvalidError, match="Key name found without value"):
+        with modal_config(modal_toml):
+            pass
+
+
+@pytest.mark.parametrize("suffix", ["a" * 9, "abc-xyz"])
+def test_dev_suffix_rules(modal_config, suffix):
+    modal_toml = f"""
+    [default]
+    dev_suffix = "{suffix}"
+    """
+    with modal_config(modal_toml):
+        with pytest.raises(InvalidError, match="alphanumeric string"):
+            Config().get("dev_suffix")
+
+
+@pytest.mark.parametrize("wait, expected", [("0", 0), ("13", 13)])
+def test_max_throttle_wait(modal_config, wait, expected):
+    modal_toml = f"""
+    [default]
+    max_throttle_wait = '{wait}'
+    """
+    with modal_config(modal_toml):
+        result = Config().get("max_throttle_wait")
+        assert result == expected
+
+
+@pytest.mark.parametrize(
+    "input, output, failure_message",
+    [
+        ("", {}, None),
+        ("header: value", {"header": "value"}, None),
+        ("header:value,header2: value2", {"header": "value", "header2": "value2"}, None),
+        ("url-header:https://example.com", {"url-header": "https://example.com"}, None),
+        ("too-many-commas:hello,there", None, "Must be a comma-separated list"),
+        ("empty:", None, "must contain at least one non-whitespace character"),
+        (":", None, "must contain at least one non-whitespace character"),
+    ],
+)
+def test_extra_headers_parsing(input, output, failure_message):
+    if output is not None:
+        assert _transform_headers(input) == output
+
+    elif failure_message is not None:
+        with pytest.raises(ValueError, match=failure_message):
+            _transform_headers(input)

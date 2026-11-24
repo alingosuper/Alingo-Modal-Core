@@ -1,0 +1,107 @@
+# Modal Go SDK
+
+[![Go Reference Documentation](https://pkg.go.dev/badge/github.com/modal-labs/Alingo-Modal-Core/go)](https://pkg.go.dev/github.com/modal-labs/Alingo-Modal-Core/go)
+
+The [Modal](https://modal.com/) Go SDK provides convenient, on-demand access to
+serverless cloud compute on Modal from golang projects. Use it to safely run
+arbitrary code in Modal Sandboxes, call Modal Functions, and interact with Modal
+resources.
+
+We're approaching feature parity with the main
+[Modal Python SDK](https://github.com/modal-labs/Alingo-Modal-Core), although
+defining Modal Functions will likely remain exclusive to Python.
+
+## Installation
+
+Install the latest version:
+
+```bash
+go get -u github.com/modal-labs/Alingo-Modal-Core/go
+```
+
+Import in your application:
+
+```go
+import modal "github.com/modal-labs/Alingo-Modal-Core/go"
+```
+
+Go package: https://pkg.go.dev/github.com/modal-labs/Alingo-Modal-Core/go
+
+### Authenticating with Modal
+
+You also need to authenticate with Modal (see
+[Getting started](https://modal.com/docs/guide#getting-started)). Either sign in
+with the Modal CLI using `pip install modal && modal setup`, or in machine
+environments set these environment variables:
+
+```bash
+# Replace these with your actual token!
+export MODAL_TOKEN_ID=ak-NOTAREALTOKENSTRINGXYZ
+export MODAL_TOKEN_SECRET=as-FAKESECRETSTRINGABCDEF
+```
+
+OAuth integrations can instead set `MODAL_OAUTH_REFRESH_TOKEN`,
+`MODAL_OAUTH_CLIENT_ID`, and `MODAL_OAUTH_JWT_KEY` (an unencrypted RSA private
+key in PEM). See the
+[custom client example](./examples/custom-client/main.go) for explicit client
+configuration.
+
+### Telemetry and Observability
+
+The Modal Go SDK supports custom gRPC interceptors for telemetry, tracing, and
+observability. You can add custom unary and stream interceptors to measure API
+call latency, trace requests, and integrate with observability tools like
+OpenTelemetry, DataDog, and others. See the
+[telemetry example](./examples/telemetry/main.go) for more details.
+
+## Requirements
+
+Go 1.25 or later.
+
+## Documentation
+
+See the main [Modal documentation](https://modal.com/docs) and
+[user guides](https://modal.com/docs/guide) for high-level overviews. For
+details, see the
+[API reference documentation for for Go](https://pkg.go.dev/github.com/modal-labs/Alingo-Modal-Core/go#section-documentation).
+
+We also provide a number of examples:
+
+- [Call a deployed Function](./examples/function-call/main.go)
+- [Spawn a deployed Function](./examples/function-spawn/main.go)
+- [Call a deployed Cls](./examples/cls-call/main.go)
+- [Call a deployed Cls, and override its options](./examples/cls-call-with-options/main.go)
+- [Call a deployed Cls, and override its routing region](./examples/cls-routing-region/main.go)
+- [Create a Sandbox](./examples/sandbox/main.go)
+- [Create a named Sandbox](./examples/sandbox-named/main.go)
+- [Create a Sandbox with GPU](./examples/sandbox-gpu/main.go)
+- [Create a Sandbox using a private image from AWS ECR](./examples/sandbox-private-image/main.go)
+- [Run a Sidecar and snapshot its filesystem](./examples/sandbox-sidecar/main.go)
+- [Persist a workspace across Sidecars](./examples/sandbox-sidecar-directory-snapshot/main.go)
+- [Mount a Volume in a Sidecar](./examples/sandbox-sidecar-volume/main.go)
+- [Mount a cloud bucket in a Sidecar](./examples/sandbox-sidecar-cloud-bucket/main.go)
+- [Give a Sidecar its own identity token](./examples/sandbox-sidecar-identity-token/main.go)
+- [Take a snapshot of the filesystem of a Sandbox](./examples/sandbox-filesystem-snapshot/main.go)
+- [Snapshot the filesystem of a Sandbox when it exits](./examples/sandbox-exit-snapshot/main.go)
+- [Snapshot a directory, and mount it in a running Sandbox](./examples/sandbox-directory-snapshot/main.go)
+- [Snapshot and restore a directory with a customer-supplied encryption key](./examples/sandbox-directory-snapshot-csek/main.go)
+- [Execute Sandbox commands](./examples/sandbox-exec/main.go)
+- [Running a coding agent in a Sandbox](./examples/sandbox-agent/main.go)
+- [Check the status and exit code of a Sandbox](./examples/sandbox-poll/main.go)
+- [Access Sandbox filesystem](./examples/sandbox-fs/main.go)
+- [Expose ports on a Sandbox using Tunnels](./examples/sandbox-tunnels/main.go)
+- [Create connect tokens for a Sandbox](./examples/sandbox-connect-token/main.go)
+- [Include Secrets in Sandbox](./examples/sandbox-secrets/main.go)
+- [Mount a Volume to a Sandbox](./examples/sandbox-volume/main.go), and same but
+  [with an ephemeral Volume](./examples/sandbox-volume-ephemeral/main.go)
+- [Mount a cloud bucket to a Sandbox](./examples/sandbox-cloud-bucket/main.go)
+- [Update the outbound network policy of a running Sandbox](./examples/sandbox-network-policy/main.go)
+- [Eagerly build an Image for a Sandbox](./examples/sandbox-prewarm/main.go)
+- [Building custom Images](./examples/image-building/main.go)
+- [Add telemetry and tracing with custom interceptors](./examples/telemetry/main.go)
+- [Configure a client with OAuth credentials](./examples/custom-client/main.go)
+
+## Support
+
+For usage questions and other support, please reach out on the
+[Modal Community Slack](https://modal.com/slack).

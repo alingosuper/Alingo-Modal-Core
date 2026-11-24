@@ -1,0 +1,2241 @@
+package modal
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"iter"
+	"log/slog"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	pb "github.com/modal-labs/Alingo-Modal-Core/go/proto/modal_proto"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// SandboxService provides Sandbox related operations.
+type SandboxService interface {
+	Create(ctx context.Context, app *App, image *Image, params *SandboxCreateParams) (*Sandbox, error)
+	ExperimentalCreate(ctx context.Context, app *App, image *Image, params *SandboxCreateParams) (*Sandbox, error)
+	FromID(ctx context.Context, sandboxID string, params *SandboxFromIDParams) (*Sandbox, error)
+	FromName(ctx context.Context, appName, name string, params *SandboxFromNameParams) (*Sandbox, error)
+	ExperimentalFromName(ctx context.Context, appName, name string, params *SandboxExperimentalFromNameParams) (*Sandbox, error)
+	ExperimentalFromSnapshot(ctx context.Context, snapshot *SandboxSnapshot, params *SandboxExperimentalFromSnapshotParams) (*Sandbox, error)
+	List(ctx context.Context, params *SandboxListParams) (iter.Seq2[*Sandbox, error], error)
+	ExperimentalList(ctx context.Context, params *SandboxExperimentalListParams) (iter.Seq2[*Sandbox, error], error)
+}
+
+type sandboxServiceImpl struct{ client *Client }
+
+const (
+	defaultProbeInterval                = 100 * time.Millisecond
+	maxProbeIntervalMilliseconds uint64 = ^uint64(0) >> 32
+)
+
+const (
+	customerSuppliedEncryptionKeyMinLength = 16
+	customerSuppliedEncryptionKeyMaxLength = 512
+)
+
+const v1SandboxIDAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+type sandboxVersion int
+
+const (
+	sandboxVersionV1 sandboxVersion = iota + 1
+	sandboxVersionV2
+)
+
+func isV1SandboxID(sandboxID string) bool {
+	prefix, suffix, ok := strings.Cut(sandboxID, "-")
+	if !ok || prefix != "sb" || len(suffix) != 22 {
+		return false
+	}
+	for _, ch := range suffix {
+		if !strings.ContainsRune(v1SandboxIDAlphabet, ch) {
+			return false
+		}
+	}
+	return true
+}
+
+// getSandboxVersion determines which backend a Sandbox ID belongs to. IDs
+// that don't match the V1 shape are assumed to be V2, so that Sandbox IDs
+// minted in newer formats route to the newer backend instead of failing
+// client-side.
+func getSandboxVersion(sandboxID string) sandboxVersion {
+	if isV1SandboxID(sandboxID) {
+		return sandboxVersionV1
+	}
+	return sandboxVersionV2
+}
+
+// Probe configures a sandbox readiness probe.
+type Probe struct {
+	tcpPort    *uint32
+	execArgv   []string
+	intervalMs uint32
+}
+
+type TCPProbeParams struct {
+	Interval time.Duration
+}
+
+// NewTCPProbe creates a TCP readiness probe.
+func NewTCPProbe(port int, params *TCPProbeParams) (*Probe, error) {
+	if params == nil {
+		params = &TCPProbeParams{}
+	}
+	if params.Interval == 0 {
+		params.Interval = defaultProbeInterval
+	}
+	if port <= 0 || port > 65535 {
+		return nil, InvalidError{Exception: fmt.Sprintf("NewTCPProbe expects port in [1, 65535], got %d", port)}
+	}
+	intervalMs, err := validateProbeIntervalMs(params.Interval, "NewTCPProbe")
+	if err != nil {
+		return nil, err
+	}
+	tcpPort := uint32(port)
+	return &Probe{
+		tcpPort:    &tcpPort,
+		intervalMs: intervalMs,
+	}, nil
+}
+
+type ExecProbeParams struct {
+	Interval time.Duration
+}
+
+// NewExecProbe creates an exec readiness probe.
+func NewExecProbe(argv []string, params *ExecProbeParams) (*Probe, error) {
+	if params == nil {
+		params = &ExecProbeParams{}
+	}
+	if params.Interval == 0 {
+		params.Interval = defaultProbeInterval
+	}
+	if len(argv) == 0 {
+		return nil, InvalidError{Exception: "NewExecProbe requires at least one argument"}
+	}
+	intervalMs, err := validateProbeIntervalMs(params.Interval, "NewExecProbe")
+	if err != nil {
+		return nil, err
+	}
+	return &Probe{
+		execArgv:   append([]string(nil), argv...),
+		intervalMs: intervalMs,
+	}, nil
+}
+
+func validateProbeIntervalMs(interval time.Duration, name string) (uint32, error) {
+	if interval <= 0 {
+		return 0, InvalidError{Exception: fmt.Sprintf("%s expects interval > 0, got %v", name, interval)}
+	}
+	if interval%time.Millisecond != 0 {
+		return 0, InvalidError{Exception: fmt.Sprintf("%s expects interval to be a whole number of milliseconds, got %v", name, interval)}
+	}
+	intervalMs := uint64(interval / time.Millisecond)
+	if intervalMs > maxProbeIntervalMilliseconds {
+		return 0, InvalidError{Exception: fmt.Sprintf("%s interval is too large, got %v", name, interval)}
+	}
+	return uint32(intervalMs), nil
+}
+
+func (p *Probe) toProto() (*pb.Probe, error) {
+	if p == nil {
+		return nil, nil
+	}
+	if (p.tcpPort == nil) == (p.execArgv == nil) {
+		return nil, InvalidError{Exception: "Probe must be created with NewTCPProbe(...) or NewExecProbe(...)"}
+	}
+	if p.intervalMs == 0 {
+		return nil, InvalidError{Exception: "Probe interval must be greater than 0"}
+	}
+
+	intervalMs := p.intervalMs
+	if p.tcpPort != nil {
+		return pb.Probe_builder{
+			TcpPort:    p.tcpPort,
+			IntervalMs: &intervalMs,
+		}.Build(), nil
+	}
+
+	return pb.Probe_builder{
+		ExecCommand: pb.Probe_ExecCommand_builder{Argv: p.execArgv}.Build(),
+		IntervalMs:  &intervalMs,
+	}.Build(), nil
+}
+
+// Allowlist is a set of allowed values for one dimension of network
+// access (CIDRs or domain names).
+type Allowlist struct {
+	Entries []string
+}
+
+// SandboxRuntime is the runtime a Sandbox runs in.
+type SandboxRuntime string
+
+const (
+	// SandboxRuntimeGVisor runs the Sandbox in a gVisor container.
+	SandboxRuntimeGVisor SandboxRuntime = "gvisor"
+	// SandboxRuntimeVM runs the Sandbox in a virtual machine.
+	SandboxRuntimeVM SandboxRuntime = "vm"
+)
+
+// toProto returns the value for the Sandbox definition's runtime field, or nil
+// to let Modal pick.
+func (r SandboxRuntime) toProto() (*string, error) {
+	switch r {
+	case "":
+		return nil, nil
+	case SandboxRuntimeGVisor, SandboxRuntimeVM:
+		name := string(r)
+		return &name, nil
+	default:
+		return nil, fmt.Errorf("invalid Runtime %q: must be %q or %q", string(r), SandboxRuntimeGVisor, SandboxRuntimeVM)
+	}
+}
+
+// SandboxCreateParams are options for creating a Modal Sandbox.
+type SandboxCreateParams struct {
+	CPU               float64                      // CPU request in fractional, physical cores. Modal Sandboxes support bursting above the CPU request, so most users don't need to specify a request.
+	CPULimit          float64                      // Hard limit in fractional, physical CPU cores. Zero means no limit.
+	MemoryMiB         int                          // Memory request in MiB. Modal Sandboxes support bursting above the memory request, so most users don't need to specify a request.
+	MemoryLimitMiB    int                          // Hard memory limit in MiB. Zero means no limit.
+	Runtime           SandboxRuntime               // Runtime under which the Sandbox executes, or unset to let Modal pick.
+	GPU               string                       // GPU reservation for the Sandbox (e.g. "A100", "T4:2", "A100-80GB:4").
+	Timeout           time.Duration                // Maximum lifetime of the Sandbox. Defaults to 5 minutes. If you pass zero you get the default 5 minutes.
+	IdleTimeout       time.Duration                // The amount of time that a Sandbox can be idle before being terminated.
+	Workdir           string                       // Working directory of the Sandbox.
+	Command           []string                     // Command to run in the Sandbox on startup.
+	Env               map[string]string            // Environment variables to set in the Sandbox.
+	Secrets           []*Secret                    // Secrets to inject into the Sandbox as environment variables.
+	Volumes           map[string]*Volume           // Mount points for Volumes.
+	CloudBucketMounts map[string]*CloudBucketMount // Mount points for cloud buckets.
+	PTY               bool                         // Enable a PTY for the Sandbox entrypoint command. When enabled, all output (stdout and stderr from the process) is multiplexed into stdout, and the stderr stream is effectively empty.
+	EncryptedPorts    []int                        // List of encrypted ports to tunnel into the Sandbox, with TLS encryption.
+	H2Ports           []int                        // List of encrypted ports to tunnel into the Sandbox, using HTTP/2.
+	UnencryptedPorts  []int                        // List of ports to tunnel into the Sandbox without encryption.
+	BlockNetwork      bool                         // Whether to block all network access from the Sandbox.
+	// CIDRs the Sandbox is allowed to access. Non-nil enables allowlist mode; nil means open access. Cannot be used with BlockNetwork.
+	//
+	// Deprecated: Use OutboundPolicy with an OutboundRouteIP instead. OutboundCIDRAllowlist will be removed in a future release.
+	OutboundCIDRAllowlist *Allowlist
+	// Domain names the Sandbox is allowed to access (supports wildcard prefixes like *.example.com). Non-nil enables allowlist mode; nil means open access. Cannot be used with BlockNetwork.
+	//
+	// Deprecated: Use OutboundPolicy with an OutboundRouteTLS instead, or an OutboundRouteHTTPS for HTTPS-specific features. OutboundDomainAllowlist will be removed in a future release.
+	OutboundDomainAllowlist    *Allowlist
+	InboundCIDRAllowlist       []string          // List of CIDRs allowed to connect inbound to the Sandbox (encrypted tunnels and connection tokens). If empty, all IPs are allowed.
+	I6PN                       bool              // Enable private IPv6 networking (i6pn) so Sandboxes in the same workspace can reach each other at their i6pn.modal.local address. Pin every Sandbox in the group to the same specific region. Cannot be used with BlockNetwork.
+	Cloud                      string            // Cloud provider to run the Sandbox on.
+	Regions                    []string          // Region(s) to run the Sandbox on.
+	Verbose                    bool              // Enable verbose logging.
+	Proxy                      *Proxy            // Reference to a Modal Proxy to use in front of this Sandbox.
+	ReadinessProbe             *Probe            // Probe used to determine when the Sandbox is ready. If not configured, the Sandbox is ready when it starts.
+	Name                       string            // Optional name for the Sandbox. Unique within an App.
+	Tags                       map[string]string // Tags to attach to the Sandbox. Filterable via SandboxList.
+	ExperimentalOptions        map[string]any    // Experimental options. Values must be bool or string. Set "enable_exit_snapshot" to true to capture a filesystem snapshot when the Sandbox exits, retrievable with Sandbox.ExperimentalGetExitSnapshot.
+	CustomDomain               string            // If non-empty, connections to this Sandbox will be subdomains of this domain rather than the default. This requires prior manual setup by Modal and is only available for Enterprise customers.
+	IncludeOidcIdentityToken   bool              // If true, the sandbox will receive a MODAL_IDENTITY_TOKEN env var for OIDC-based auth (e.g. to AWS, GCP).
+	ExperimentalEnableSnapshot bool              // Enable memory snapshots.
+	ExperimentalPersistent     bool
+	// Configuration for replacing headers in outbound HTTPS requests from the Sandbox. Secrets referenced by the policy are resolved outside the Sandbox and are never visible to the workload.
+	//
+	// Deprecated: Use OutboundPolicy with OutboundRouteHTTPS routes that set HeaderReplacements instead. ExperimentalOutboundPolicy will be removed in version 0.12.0.
+	ExperimentalOutboundPolicy *ExperimentalOutboundPolicy
+	OutboundPolicy             *OutboundPolicy // Route-based outbound network policy. Nil keeps all outbound traffic allowed. Cannot be used with BlockNetwork, OutboundCIDRAllowlist, OutboundDomainAllowlist or ExperimentalOutboundPolicy. Can be replaced later with Sandbox.SetOutboundPolicy.
+}
+
+// buildOutboundNetworkAccess builds the outbound network policy for the given
+// params, defaulting to open access when nothing is specified. A non-nil
+// allowlist enables allowlist mode (empty Entries blocks that dimension).
+// Shared by the Sandbox and sidecar create paths.
+func buildOutboundNetworkAccess(blockNetwork bool, outboundCIDRAllowlist, outboundDomainAllowlist *Allowlist) (*pb.NetworkAccess, error) {
+	if blockNetwork {
+		if outboundCIDRAllowlist != nil {
+			return nil, fmt.Errorf("OutboundCIDRAllowlist cannot be used when BlockNetwork is enabled")
+		}
+		if outboundDomainAllowlist != nil {
+			return nil, fmt.Errorf("OutboundDomainAllowlist cannot be used when BlockNetwork is enabled")
+		}
+		return pb.NetworkAccess_builder{
+			NetworkAccessType: pb.NetworkAccess_BLOCKED,
+			AllowedCidrs:      []string{},
+			AllowedDomains:    []string{},
+		}.Build(), nil
+	}
+	if outboundCIDRAllowlist != nil || outboundDomainAllowlist != nil {
+		var cidrs []string
+		var domains []string
+		if outboundCIDRAllowlist != nil {
+			cidrs = outboundCIDRAllowlist.Entries
+		}
+		if outboundDomainAllowlist != nil {
+			domains = outboundDomainAllowlist.Entries
+		}
+		return pb.NetworkAccess_builder{
+			NetworkAccessType: pb.NetworkAccess_ALLOWLIST,
+			AllowedCidrs:      cidrs,
+			AllowedDomains:    domains,
+		}.Build(), nil
+	}
+	return pb.NetworkAccess_builder{
+		NetworkAccessType: pb.NetworkAccess_OPEN,
+		AllowedCidrs:      []string{},
+		AllowedDomains:    []string{},
+	}.Build(), nil
+}
+
+// buildSandboxCreateRequestProto builds a SandboxCreateRequest proto from options.
+// validateOutboundPolicies checks the outbound policies in params and the
+// options they can't be combined with. Create calls it before any server call,
+// since hydrating Secrets can create Secrets on the server.
+func validateOutboundPolicies(params *SandboxCreateParams) error {
+	if params.ExperimentalOutboundPolicy != nil {
+		if err := params.ExperimentalOutboundPolicy.validate(); err != nil {
+			return err
+		}
+		if params.BlockNetwork {
+			return fmt.Errorf("ExperimentalOutboundPolicy cannot be used when BlockNetwork is enabled")
+		}
+		if allowlist := params.OutboundDomainAllowlist; allowlist != nil && len(allowlist.Entries) > 0 {
+			return fmt.Errorf("ExperimentalOutboundPolicy cannot be used with OutboundDomainAllowlist")
+		}
+	}
+	if params.OutboundPolicy != nil {
+		if err := params.OutboundPolicy.validate(); err != nil {
+			return err
+		}
+		switch {
+		case params.BlockNetwork:
+			return fmt.Errorf("OutboundPolicy cannot be used when BlockNetwork is enabled; " +
+				"end Routes with OutboundRouteAny{Redirect: OutboundBlock{}} instead")
+		case params.OutboundCIDRAllowlist != nil:
+			return fmt.Errorf("OutboundPolicy cannot be used with OutboundCIDRAllowlist; " +
+				"use an OutboundRouteIP, followed by OutboundRouteAny{Redirect: OutboundBlock{}}, instead")
+		case params.OutboundDomainAllowlist != nil:
+			return fmt.Errorf("OutboundPolicy cannot be used with OutboundDomainAllowlist; " +
+				"use an OutboundRouteTLS, followed by OutboundRouteAny{Redirect: OutboundBlock{}}, instead")
+		case params.ExperimentalOutboundPolicy != nil:
+			return fmt.Errorf("OutboundPolicy cannot be used with ExperimentalOutboundPolicy; " +
+				"use OutboundRouteHTTPS routes with HeaderReplacements in a policy with AllowTLSDecryption instead")
+		}
+	}
+	return nil
+}
+
+// warnedDeprecations holds the deprecated names already warned about in this process.
+var warnedDeprecations sync.Map
+
+// warnDeprecated logs message the first time the deprecated name is used in this process.
+func warnDeprecated(ctx context.Context, logger *slog.Logger, name, message string) {
+	if logger == nil {
+		return
+	}
+	if _, warned := warnedDeprecations.LoadOrStore(name, struct{}{}); !warned {
+		logger.WarnContext(ctx, message)
+	}
+}
+
+// warnDeprecatedNetworkParams warns about the outbound network parameters that OutboundPolicy replaces.
+func warnDeprecatedNetworkParams(ctx context.Context, logger *slog.Logger, params *SandboxCreateParams) {
+	if params == nil {
+		return
+	}
+	if params.OutboundCIDRAllowlist != nil {
+		warnDeprecated(ctx, logger, "OutboundCIDRAllowlist",
+			"OutboundCIDRAllowlist is deprecated and will be removed in a future release; use OutboundPolicy with an OutboundRouteIP instead")
+	}
+	if params.OutboundDomainAllowlist != nil {
+		warnDeprecated(ctx, logger, "OutboundDomainAllowlist",
+			"OutboundDomainAllowlist is deprecated and will be removed in a future release; use OutboundPolicy with an OutboundRouteTLS instead, or an OutboundRouteHTTPS for HTTPS-specific features")
+	}
+	if params.ExperimentalOutboundPolicy != nil {
+		warnDeprecated(ctx, logger, "ExperimentalOutboundPolicy",
+			"ExperimentalOutboundPolicy is deprecated and will be removed in version 0.12.0; use OutboundPolicy with OutboundRouteHTTPS routes that set HeaderReplacements instead")
+	}
+}
+
+func buildSandboxCreateRequestProto(appID, imageID string, params SandboxCreateParams) (*pb.SandboxCreateRequest, error) {
+	gpuConfig, err := parseGPUConfig(params.GPU)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := validateWorkdir(params.Workdir); err != nil {
+		return nil, err
+	}
+
+	if params.Name != "" {
+		if err := checkObjectName(params.Name, "Sandbox"); err != nil {
+			return nil, err
+		}
+	}
+
+	runtime, err := params.Runtime.toProto()
+	if err != nil {
+		return nil, err
+	}
+
+	var volumeMounts []*pb.VolumeMount
+	if params.Volumes != nil {
+		volumeMounts = make([]*pb.VolumeMount, 0, len(params.Volumes))
+		for mountPath, volume := range params.Volumes {
+			volumeMounts = append(volumeMounts, volumeToMountProto(mountPath, volume))
+		}
+	}
+
+	cloudBucketMounts, err := buildCloudBucketMountProtos(params.CloudBucketMounts)
+	if err != nil {
+		return nil, err
+	}
+
+	var ptyInfo *pb.PTYInfo
+	if params.PTY {
+		ptyInfo = defaultSandboxPTYInfo()
+	}
+
+	openPorts := make([]*pb.PortSpec, 0)
+	for _, port := range params.EncryptedPorts {
+		openPorts = append(openPorts, pb.PortSpec_builder{
+			Port:        uint32(port),
+			Unencrypted: false,
+		}.Build())
+	}
+	for _, port := range params.H2Ports {
+		openPorts = append(openPorts, pb.PortSpec_builder{
+			Port:        uint32(port),
+			Unencrypted: false,
+			TunnelType:  pb.TunnelType_TUNNEL_TYPE_H2.Enum(),
+		}.Build())
+	}
+	for _, port := range params.UnencryptedPorts {
+		openPorts = append(openPorts, pb.PortSpec_builder{
+			Port:        uint32(port),
+			Unencrypted: true,
+		}.Build())
+	}
+
+	portSpecs := pb.PortSpecs_builder{
+		Ports: openPorts,
+	}.Build()
+
+	secretIds, err := collectSecretIDs(params.Secrets)
+	if err != nil {
+		return nil, err
+	}
+
+	if params.BlockNetwork {
+		if params.I6PN {
+			return nil, fmt.Errorf("BlockNetwork disables all networking, including i6pn. To keep i6pn while blocking public egress, use an empty outbound allowlist (OutboundCIDRAllowlist: &Allowlist{}) instead")
+		}
+		if params.InboundCIDRAllowlist != nil {
+			return nil, fmt.Errorf("InboundCIDRAllowlist cannot be used when BlockNetwork is enabled")
+		}
+	}
+	if err := validateOutboundPolicies(&params); err != nil {
+		return nil, err
+	}
+	networkAccess, err := buildOutboundNetworkAccess(params.BlockNetwork, params.OutboundCIDRAllowlist, params.OutboundDomainAllowlist)
+	if err != nil {
+		return nil, err
+	}
+
+	var schedulerPlacement *pb.SchedulerPlacement
+	if len(params.Regions) > 0 {
+		schedulerPlacement = pb.SchedulerPlacement_builder{Regions: params.Regions}.Build()
+	}
+
+	var proxyID *string
+	if params.Proxy != nil {
+		proxyID = &params.Proxy.ProxyID
+	}
+
+	var workdir *string
+	if params.Workdir != "" {
+		workdir = &params.Workdir
+	}
+
+	if params.Timeout < 0 {
+		return nil, fmt.Errorf("timeout must be non-negative, got %v", params.Timeout)
+	}
+	if params.Timeout%time.Second != 0 {
+		return nil, fmt.Errorf("timeout must be a whole number of seconds, got %v", params.Timeout)
+	}
+	timeoutSecs := uint32(params.Timeout / time.Second)
+	// Ideally we would forbid an explicit zero Timeout, but we can't distinguish between the
+	// SandboxCreateParams{Timeout: 0} case that we'd like to warn about, and the SandboxCreateParams{} case
+	// where Timeout gets initialized to zero by default.
+	// Since Timeout=0 doesn't really make sense, we default to 5 minutes even if it's explicitly set to 0.
+	if timeoutSecs == 0 {
+		timeoutSecs = 300
+	}
+
+	var idleTimeoutSecs *uint32
+	if params.IdleTimeout != 0 {
+		if params.IdleTimeout < 0 {
+			return nil, fmt.Errorf("idleTimeout must be non-negative, got %v", params.IdleTimeout)
+		}
+		if params.IdleTimeout%time.Second != 0 {
+			return nil, fmt.Errorf("idleTimeout must be a whole number of seconds, got %v", params.IdleTimeout)
+		}
+		v := uint32(params.IdleTimeout / time.Second)
+		idleTimeoutSecs = &v
+	}
+
+	var milliCPU, milliCPUMax *uint32
+	if params.CPU == 0 && params.CPULimit > 0 {
+		return nil, fmt.Errorf("must also specify non-zero CPU request when CPULimit is specified")
+	}
+	if params.CPU != 0 {
+		if params.CPU <= 0 {
+			return nil, fmt.Errorf("the CPU request (%f) must be a positive number", params.CPU)
+		}
+		v := uint32(1000 * params.CPU)
+		milliCPU = &v
+		if params.CPULimit > 0 {
+			if params.CPULimit < params.CPU {
+				return nil, fmt.Errorf("the CPU request (%f) cannot be higher than CPULimit (%f)", params.CPU, params.CPULimit)
+			}
+			vMax := uint32(1000 * params.CPULimit)
+			milliCPUMax = &vMax
+		}
+	}
+
+	var memoryMb, memoryMbMax uint32
+	if params.MemoryMiB == 0 && params.MemoryLimitMiB > 0 {
+		return nil, fmt.Errorf("must also specify non-zero MemoryMiB request when MemoryLimitMiB is specified")
+	}
+	if params.MemoryMiB != 0 {
+		if params.MemoryMiB <= 0 {
+			return nil, fmt.Errorf("the MemoryMiB request (%d) must be a positive number", params.MemoryMiB)
+		}
+		memoryMb = uint32(params.MemoryMiB)
+		if params.MemoryLimitMiB > 0 {
+			if params.MemoryLimitMiB < params.MemoryMiB {
+				return nil, fmt.Errorf("the MemoryMiB request (%d) cannot be higher than MemoryLimitMiB (%d)", params.MemoryMiB, params.MemoryLimitMiB)
+			}
+			memoryMbMax = uint32(params.MemoryLimitMiB)
+		}
+	}
+
+	resourcesBuilder := pb.Resources_builder{
+		GpuConfig: gpuConfig,
+	}
+	if milliCPU != nil {
+		resourcesBuilder.MilliCpu = *milliCPU
+	}
+	if milliCPUMax != nil {
+		resourcesBuilder.MilliCpuMax = *milliCPUMax
+	}
+	if memoryMb > 0 {
+		resourcesBuilder.MemoryMb = memoryMb
+	}
+	if memoryMbMax > 0 {
+		resourcesBuilder.MemoryMbMax = memoryMbMax
+	}
+
+	// The public interface uses map[string]any so that we can add support for any experimental
+	// option type in the future. The experimental_options_v2 proto map accepts arbitrary strings,
+	// but for now we deliberately restrict values to booleans and strings.
+	protoExperimentalOptions := map[string]string{}
+	for name, value := range params.ExperimentalOptions {
+		switch v := value.(type) {
+		case bool:
+			protoExperimentalOptions[name] = strconv.FormatBool(v)
+		case string:
+			protoExperimentalOptions[name] = v
+		default:
+			return nil, fmt.Errorf("experimental option '%s' must be a bool or string, got %T", name, value)
+		}
+	}
+
+	readinessProbe, err := params.ReadinessProbe.toProto()
+	if err != nil {
+		return nil, err
+	}
+
+	tagsList := make([]*pb.SandboxTag, 0, len(params.Tags))
+	for k, v := range params.Tags {
+		tagsList = append(tagsList, pb.SandboxTag_builder{TagName: k, TagValue: v}.Build())
+	}
+
+	return pb.SandboxCreateRequest_builder{
+		AppId: appID,
+		Tags:  tagsList,
+		Definition: pb.Sandbox_builder{
+			EntrypointArgs:             params.Command,
+			ImageId:                    imageID,
+			SecretIds:                  secretIds,
+			TimeoutSecs:                timeoutSecs,
+			IdleTimeoutSecs:            idleTimeoutSecs,
+			Workdir:                    workdir,
+			NetworkAccess:              networkAccess,
+			ExperimentalOutboundPolicy: params.ExperimentalOutboundPolicy.toProto(),
+			OutboundPolicy:             params.OutboundPolicy.toProto(),
+			Resources:                  resourcesBuilder.Build(),
+			VolumeMounts:               volumeMounts,
+			CloudBucketMounts:          cloudBucketMounts,
+			PtyInfo:                    ptyInfo,
+			OpenPorts:                  portSpecs,
+			CloudProviderStr:           params.Cloud,
+			SchedulerPlacement:         schedulerPlacement,
+			Verbose:                    params.Verbose,
+			ProxyId:                    proxyID,
+			ReadinessProbe:             readinessProbe,
+			Name:                       &params.Name,
+			ExperimentalOptionsV2:      protoExperimentalOptions,
+			CustomDomain:               params.CustomDomain,
+			IncludeOidcIdentityToken:   params.IncludeOidcIdentityToken,
+			InboundCidrAllowlist:       params.InboundCIDRAllowlist,
+			I6PnEnabled:                params.I6PN,
+			EnableSnapshot:             params.ExperimentalEnableSnapshot,
+			Runtime:                    runtime,
+		}.Build(),
+	}.Build(), nil
+}
+
+func buildSandboxCreateV2RequestProto(appID, imageID string, params SandboxCreateParams, secretSources []*pb.SecretSource) (*pb.SandboxCreateV2Request, error) {
+	if params.GPU != "" {
+		return nil, fmt.Errorf("GPUs are not supported by ExperimentalCreate")
+	}
+
+	req, err := buildSandboxCreateRequestProto(appID, imageID, params)
+	if err != nil {
+		return nil, err
+	}
+
+	return pb.SandboxCreateV2Request_builder{
+		AppId:         req.GetAppId(),
+		Definition:    req.GetDefinition(),
+		SecretSources: secretSources,
+		Tags:          req.GetTags(),
+	}.Build(), nil
+}
+
+// Create creates a new Sandbox in the App with the specified Image and options.
+func (s *sandboxServiceImpl) Create(ctx context.Context, app *App, image *Image, params *SandboxCreateParams) (*Sandbox, error) {
+	if params == nil {
+		params = &SandboxCreateParams{}
+	}
+	if err := validateOutboundPolicies(params); err != nil {
+		return nil, err
+	}
+	impl, err := implCreateForParams(s.client, params)(ctx, s.client, app, image, params)
+	if err != nil {
+		return nil, err
+	}
+	return newSandboxFromImpl(impl), nil
+}
+
+// sandboxCreateFunc creates a Sandbox on one backend.
+type sandboxCreateFunc func(ctx context.Context, client *Client, app *App, image *Image, params *SandboxCreateParams) (sandboxImpl, error)
+
+// implCreateForParams selects the backend that creates the Sandbox described
+// by params.
+func implCreateForParams(client *Client, params *SandboxCreateParams) sandboxCreateFunc {
+	if params.ExperimentalPersistent {
+		return createSandboxPersistent
+	}
+	// GPUs are not supported on V2, so those calls use the V1 backend
+	// regardless of the setting.
+	if params.GPU != "" {
+		return createSandboxV1
+	}
+	if client.profile.SandboxV2 {
+		return createSandboxV2
+	}
+	return createSandboxV1
+}
+
+// ExperimentalCreate creates a new Sandbox using the experimental V2 backend.
+//
+// Supported features include exec, encrypted tunnels, wait/poll/terminate,
+// CPU and memory configuration, region placement, volumes, cloud bucket
+// mounts (with static credentials via Secret or OidcAuthRoleArn), OIDC identity
+// tokens, proxies, filesystem snapshots, and custom domains (CustomDomain
+// allows connections to the Sandbox via a subdomain of that parent domain
+// rather than a default Modal domain; requires prior setup by Modal).
+//
+// Set ExperimentalEnableSnapshot to create a Sandbox that can be snapshotted
+// with [Sandbox.ExperimentalSnapshot]. Features like network file systems and
+// GPUs are not supported.
+//
+// V2 sandboxes created with this method are not currently returned by List. A
+// named Sandbox can be looked up with ExperimentalFromName; otherwise store
+// Sandbox.SandboxID and use FromID to reattach.
+func (s *sandboxServiceImpl) ExperimentalCreate(ctx context.Context, app *App, image *Image, params *SandboxCreateParams) (*Sandbox, error) {
+	if params == nil {
+		params = &SandboxCreateParams{}
+	}
+	if err := validateOutboundPolicies(params); err != nil {
+		return nil, err
+	}
+	create := createSandboxV2
+	if params.ExperimentalPersistent {
+		create = createSandboxPersistent
+	}
+	impl, err := create(ctx, s.client, app, image, params)
+	if err != nil {
+		return nil, err
+	}
+	return newSandboxFromImpl(impl), nil
+}
+
+// StdioBehavior defines how the standard input/output/error streams should behave.
+type StdioBehavior string
+
+const (
+	// Pipe allows the Sandbox to pipe the streams.
+	Pipe StdioBehavior = "pipe"
+	// Ignore ignores the streams, meaning they will not be available.
+	Ignore StdioBehavior = "ignore"
+)
+
+// Tunnel represents a port forwarded from within a running Modal Sandbox.
+type Tunnel struct {
+	Host            string // The public hostname for the tunnel
+	Port            int    // The public port for the tunnel
+	UnencryptedHost string // The unencrypted hostname (if applicable)
+	UnencryptedPort int    // The unencrypted port (if applicable)
+}
+
+// URL gets the public HTTPS URL of the forwarded port.
+func (t *Tunnel) URL() string {
+	if t.Port == 443 {
+		return fmt.Sprintf("https://%s", t.Host)
+	}
+	return fmt.Sprintf("https://%s:%d", t.Host, t.Port)
+}
+
+// TLSSocket gets the public TLS socket as a (host, port) tuple.
+func (t *Tunnel) TLSSocket() (string, int) {
+	return t.Host, t.Port
+}
+
+// TCPSocket gets the public TCP socket as a (host, port) tuple.
+func (t *Tunnel) TCPSocket() (string, int, error) {
+	if t.UnencryptedHost == "" || t.UnencryptedPort == 0 {
+		return "", 0, InvalidError{Exception: "This tunnel is not configured for unencrypted TCP."}
+	}
+	return t.UnencryptedHost, t.UnencryptedPort, nil
+}
+
+// Sandbox represents a Modal Sandbox, which can run commands and manage
+// input/output streams for a remote process.
+type Sandbox struct {
+	SandboxID string
+	Stdin     io.WriteCloser
+	Stdout    io.ReadCloser
+	Stderr    io.ReadCloser
+
+	// Filesystem provides high-level filesystem operations for this Sandbox.
+	Filesystem *SandboxFilesystem
+
+	// ExperimentalSidecars provides operations on Sandbox Sidecar containers.
+	//
+	// EXPERIMENTAL: the API is subject to change.
+	ExperimentalSidecars SidecarService
+
+	// Logs provides access to entrypoint logs emitted by this Sandbox.
+	Logs *SandboxLogsManager
+
+	impl   sandboxImpl
+	client *Client
+
+	attached atomic.Bool
+}
+
+func defaultSandboxPTYInfo() *pb.PTYInfo {
+	return pb.PTYInfo_builder{
+		Enabled:                true,
+		WinszRows:              24,
+		WinszCols:              80,
+		EnvTerm:                "xterm-256color",
+		EnvColorterm:           "truecolor",
+		PtyType:                pb.PTYInfo_PTY_TYPE_SHELL,
+		NoTerminateOnIdleStdin: true,
+	}.Build()
+}
+
+// newSandbox creates a Sandbox handle for a server-returned ID.
+func newSandbox(client *Client, sandboxID string) *Sandbox {
+	return newSandboxFromImpl(newSandboxImpl(client, sandboxID, sandboxImplParams{}))
+}
+
+// newSandboxFromImpl wraps a backend implementation in a Sandbox handle.
+func newSandboxFromImpl(impl sandboxImpl) *Sandbox {
+	client := impl.modalClient()
+	sb := &Sandbox{SandboxID: impl.sandboxID(), impl: impl, client: client}
+	sb.Filesystem = &SandboxFilesystem{sandbox: sb, logger: client.logger}
+	sb.ExperimentalSidecars = &sidecarServiceImpl{sandbox: sb}
+	sb.attached.Store(true)
+
+	sb.Stdin = impl.stdin()
+	sb.Stdout = impl.outputStream(pb.FileDescriptor_FILE_DESCRIPTOR_STDOUT)
+	sb.Stderr = impl.outputStream(pb.FileDescriptor_FILE_DESCRIPTOR_STDERR)
+	sb.Logs = &SandboxLogsManager{client: client, sandboxID: sb.SandboxID, getAppIDFunc: impl.getAppID, getTaskIDFunc: impl.resolveTaskIDForLogs}
+	return sb
+}
+
+// FromID returns a running Sandbox object from an ID.
+func (s *sandboxServiceImpl) FromID(ctx context.Context, sandboxID string, params *SandboxFromIDParams) (*Sandbox, error) {
+	return newSandbox(s.client, sandboxID), nil
+}
+
+// SandboxFromIDParams are options for SandboxService.FromID.
+type SandboxFromIDParams struct{}
+
+// SandboxFromNameParams are options for finding deployed Sandbox objects by name.
+type SandboxFromNameParams struct {
+	Environment string
+	// If IncludeTerminated is set to true and no Sandbox with the name is
+	// currently running, the most recent terminated Sandbox will be returned instead.
+	IncludeTerminated bool
+}
+
+// SandboxWaitParams are options for Sandbox.Wait.
+type SandboxWaitParams struct{}
+
+// SandboxWaitUntilReadyParams are options for Sandbox.WaitUntilReady.
+type SandboxWaitUntilReadyParams struct{}
+
+// SandboxTunnelsParams are options for Sandbox.Tunnels.
+type SandboxTunnelsParams struct{}
+
+// SandboxMountImageParams are options for Sandbox.MountImage.
+type SandboxMountImageParams struct {
+	// ExperimentalEncryptionKey is a customer-supplied encryption key used to decrypt the image.
+	// Use the same key that encrypted the snapshot.
+	ExperimentalEncryptionKey []byte
+}
+
+// SandboxUnmountImageParams are options for Sandbox.UnmountImage.
+type SandboxUnmountImageParams struct{}
+
+// SandboxReloadVolumesParams are options for Sandbox.ReloadVolumes.
+type SandboxReloadVolumesParams struct {
+	// Timeout bounds how long the call waits. Defaults to 55 seconds.
+	Timeout time.Duration
+}
+
+// SandboxUpdateNetworkPolicyParams are options for Sandbox.UpdateNetworkPolicy.
+//
+// Each dimension is independent: a nil *Allowlist leaves that dimension
+// unchanged, while a non-nil value replaces it (an empty Entries blocks all
+// egress; an allow-all entry such as "0.0.0.0/0" or "*" allows everything).
+//
+// Currently, both dimensions must be provided (the underlying transport does
+// not yet support partial updates). This requirement will be relaxed in a
+// future release.
+type SandboxUpdateNetworkPolicyParams struct {
+	OutboundCIDRAllowlist   *Allowlist
+	OutboundDomainAllowlist *Allowlist
+}
+
+// SandboxPollParams are options for Sandbox.Poll.
+type SandboxPollParams struct{}
+
+// SandboxSetTagsParams are options for Sandbox.SetTags.
+type SandboxSetTagsParams struct{}
+
+// SandboxExperimentalSetNameParams are options for Sandbox.ExperimentalSetName.
+type SandboxExperimentalSetNameParams struct{}
+
+// SandboxGetTagsParams are options for Sandbox.GetTags.
+type SandboxGetTagsParams struct{}
+
+// ContainerProcessWaitParams are options for ContainerProcess.Wait.
+type ContainerProcessWaitParams struct{}
+
+// FromName gets a running Sandbox by name from a deployed App.
+//
+// Raises a NotFoundError if no running Sandbox is found with the given name,
+// unless IncludeTerminated is set, in which case the most recently created
+// Sandbox with the name is returned even if it has terminated.
+// A Sandbox's name is the `Name` argument passed to `App.CreateSandbox`.
+func (s *sandboxServiceImpl) FromName(ctx context.Context, appName, name string, params *SandboxFromNameParams) (*Sandbox, error) {
+	if params == nil {
+		params = &SandboxFromNameParams{}
+	}
+
+	if params.IncludeTerminated || s.client.profile.SandboxV2 {
+		sb, err := s.ExperimentalFromName(ctx, appName, name, &SandboxExperimentalFromNameParams{
+			Environment:       params.Environment,
+			IncludeTerminated: params.IncludeTerminated,
+		})
+		var notFound NotFoundError
+		if err == nil {
+			return sb, nil
+		} else if params.IncludeTerminated || !errors.As(err, &notFound) {
+			return nil, err
+		}
+	}
+
+	impl, err := sandboxFromNameV1(ctx, s.client, appName, name, params)
+	if err != nil {
+		return nil, err
+	}
+	return newSandboxFromImpl(impl), nil
+}
+
+// SandboxExperimentalFromNameParams are options for SandboxService.ExperimentalFromName.
+type SandboxExperimentalFromNameParams struct {
+	Environment string
+	// If IncludeTerminated is set to true and no Sandbox with the name is
+	// currently running, the most recent terminated Sandbox will be returned instead.
+	IncludeTerminated bool
+}
+
+// ExperimentalFromName gets a running V2 Sandbox by name from a deployed App,
+// i.e. a Sandbox created via ExperimentalCreate.
+//
+// EXPERIMENTAL: the API is subject to change.
+func (s *sandboxServiceImpl) ExperimentalFromName(ctx context.Context, appName, name string, params *SandboxExperimentalFromNameParams) (*Sandbox, error) {
+	if params == nil {
+		params = &SandboxExperimentalFromNameParams{}
+	}
+	impl, err := sandboxFromNameV2(ctx, s.client, appName, name, params)
+	if err != nil {
+		return nil, err
+	}
+	return newSandboxFromImpl(impl), nil
+}
+
+// SandboxSnapshot is a stored Sandbox memory snapshot created by calling
+// ExperimentalSnapshot on a Sandbox instance. This includes both the filesystem
+// and memory state of the original Sandbox at the time the snapshot was taken.
+type SandboxSnapshot struct {
+	SnapshotID string
+
+	isV2   *bool // whether the snapshot came from a V2 sandbox. nil until hydrated
+	client *Client
+}
+
+func (s *SandboxSnapshot) hydrate(ctx context.Context) error {
+	if s.isV2 != nil {
+		return nil
+	}
+	// hydration doesn't actually do much apart from validating the existance of the id
+	// which is implicitly done by trying to start a sandbox from the snapshot as well
+	resp, err := s.client.cpClient.SandboxSnapshotGet(ctx, pb.SandboxSnapshotGetRequest_builder{
+		SnapshotId: s.SnapshotID,
+	}.Build())
+	if err != nil {
+		return err
+	}
+	isV2 := resp.GetHandleMetadata().GetIsV2()
+	s.isV2 = &isV2
+	return nil
+}
+
+// SandboxSnapshotService provides operations for stored Sandbox memory snapshots.
+type SandboxSnapshotService interface {
+	FromID(ctx context.Context, snapshotID string, params *SandboxSnapshotFromIDParams) (*SandboxSnapshot, error)
+}
+
+type sandboxSnapshotServiceImpl struct{ client *Client }
+
+// SandboxSnapshotFromIDParams are options for SandboxSnapshotService.FromID.
+type SandboxSnapshotFromIDParams struct{}
+
+// FromID constructs a SandboxSnapshot for an existing snapshot ID.
+func (s *sandboxSnapshotServiceImpl) FromID(ctx context.Context, snapshotID string, params *SandboxSnapshotFromIDParams) (*SandboxSnapshot, error) {
+	return &SandboxSnapshot{SnapshotID: snapshotID, client: s.client}, nil
+}
+
+// SandboxExperimentalFromSnapshotParams are options for SandboxService.ExperimentalFromSnapshot.
+type SandboxExperimentalFromSnapshotParams struct {
+	// Name for the restored Sandbox. Nil reuses the original Sandbox's name, a
+	// pointer to an empty string leaves it unnamed, and a pointer to a non-empty
+	// string overrides it.
+	Name *string
+}
+
+// ExperimentalFromSnapshot restores a Sandbox from a memory snapshot.
+//
+// The restore targets the same backend the snapshot was taken from. A V1
+// snapshot restores as a V1 sandbox, a V2 snapshot as a V2 sandbox.
+//
+// EXPERIMENTAL: the API is subject to change.
+func (s *sandboxServiceImpl) ExperimentalFromSnapshot(ctx context.Context, snapshot *SandboxSnapshot, params *SandboxExperimentalFromSnapshotParams) (*Sandbox, error) {
+	if params == nil {
+		params = &SandboxExperimentalFromSnapshotParams{}
+	}
+
+	if err := snapshot.hydrate(ctx); err != nil {
+		return nil, err
+	}
+	useV2 := snapshot.isV2 != nil && *snapshot.isV2
+
+	overrideType := pb.SandboxRestoreRequest_SANDBOX_NAME_OVERRIDE_TYPE_UNSPECIFIED
+	var nameOverride string
+	if params.Name != nil {
+		if *params.Name == "" {
+			overrideType = pb.SandboxRestoreRequest_SANDBOX_NAME_OVERRIDE_TYPE_NONE
+		} else {
+			if err := checkObjectName(*params.Name, "Sandbox"); err != nil {
+				return nil, err
+			}
+			overrideType = pb.SandboxRestoreRequest_SANDBOX_NAME_OVERRIDE_TYPE_STRING
+			nameOverride = *params.Name
+		}
+	}
+
+	fromSnapshot := sandboxFromSnapshotV1
+	if useV2 {
+		fromSnapshot = sandboxFromSnapshotV2
+	}
+	impl, err := fromSnapshot(ctx, s.client, snapshot, overrideType, nameOverride)
+	if err != nil {
+		return nil, err
+	}
+	return newSandboxFromImpl(impl), nil
+}
+
+// SandboxExecParams defines options for executing commands in a Sandbox.
+type SandboxExecParams struct {
+	// Stdout defines whether to pipe or ignore standard output.
+	Stdout StdioBehavior
+	// Stderr defines whether to pipe or ignore standard error.
+	Stderr StdioBehavior
+	// Workdir is the working directory to run the command in.
+	Workdir string
+	// Timeout is the timeout for command execution. Defaults to 0 (no timeout).
+	Timeout time.Duration
+	// Environment variables to set for the command.
+	Env map[string]string
+	// Secrets to inject as environment variables for the command.
+	Secrets []*Secret
+	// PTY defines whether to enable a PTY for the command. When enabled, all output (stdout and
+	// stderr from the process) is multiplexed into stdout, and the stderr stream is effectively empty.
+	PTY bool
+}
+
+// validateExecArgs checks if command arguments exceed ARG_MAX.
+func validateExecArgs(args []string) error {
+	// The maximum number of bytes that can be passed to an exec on Linux.
+	// Though this is technically a 'server side' limit, it is unlikely to change.
+	// getconf ARG_MAX will show this value on a host.
+	//
+	// By probing in production, the limit is 131072 bytes (2**17).
+	// We need some bytes of overhead for the rest of the command line besides the args,
+	// e.g. 'runsc exec ...'. So we use 2**16 as the limit.
+
+	argMaxBytes := 1 << 16
+
+	// Avoid "[Errno 7] Argument list too long" errors.
+	totalLen := 0
+	for _, arg := range args {
+		totalLen += len(arg)
+	}
+	if totalLen > argMaxBytes {
+		return InvalidError{Exception: fmt.Sprintf(
+			"Total length of CMD arguments must be less than %d bytes. Got %d bytes.",
+			argMaxBytes, totalLen,
+		)}
+	}
+	return nil
+}
+
+func validateWorkdir(workdir string) error {
+	if workdir != "" && !strings.HasPrefix(workdir, "/") {
+		return InvalidError{Exception: fmt.Sprintf("workdir must be an absolute path, got: %q", workdir)}
+	}
+	return nil
+}
+
+// hydrateSandboxSecrets hydrates the given Secrets together with the credential
+// Secrets of any cloud bucket mounts, so all their SecretIDs are available
+// before building the SandboxCreate request. It gathers them into a fresh slice
+// to avoid appending onto the caller's secrets slice.
+func hydrateSandboxSecrets(ctx context.Context, client *Client, secrets []*Secret, mounts map[string]*CloudBucketMount) error {
+	toHydrate := make([]*Secret, 0, len(secrets)+len(mounts))
+	toHydrate = append(toHydrate, secrets...)
+	for _, mount := range mounts {
+		if mount != nil && mount.Secret != nil {
+			toHydrate = append(toHydrate, mount.Secret)
+		}
+	}
+	return hydrateSecrets(ctx, client, toHydrate)
+}
+
+func collectSecretIDs(secrets []*Secret) ([]string, error) {
+	secretIds := make([]string, 0, len(secrets))
+	for i, secret := range secrets {
+		if secret == nil {
+			return nil, InvalidError{Exception: fmt.Sprintf("secret at index %d must not be nil", i)}
+		}
+		if secret.SecretID == "" {
+			return nil, InvalidError{Exception: fmt.Sprintf("secret at index %d has not been hydrated", i)}
+		}
+		secretIds = append(secretIds, secret.SecretID)
+	}
+	return secretIds, nil
+}
+
+// buildTaskExecStartRequestProto builds a TaskExecStartRequest proto from command and options.
+// containerID, if non-empty, routes the exec to a sidecar container instead of the main container.
+func buildTaskExecStartRequestProto(taskID, execID string, command []string, params SandboxExecParams, containerID string) (*pb.TaskExecStartRequest, error) {
+	if params.Timeout < 0 {
+		return nil, fmt.Errorf("timeout must be non-negative, got %v", params.Timeout)
+	}
+	if params.Timeout != 0 && params.Timeout%time.Second != 0 {
+		return nil, fmt.Errorf("timeout must be a whole number of seconds, got %v", params.Timeout)
+	}
+	if err := validateWorkdir(params.Workdir); err != nil {
+		return nil, err
+	}
+
+	sources, err := secretSources(params.Secrets, params.Env)
+	if err != nil {
+		return nil, err
+	}
+
+	var stdoutConfig pb.TaskExecStdoutConfig
+	switch params.Stdout {
+	case Pipe, "":
+		stdoutConfig = pb.TaskExecStdoutConfig_TASK_EXEC_STDOUT_CONFIG_PIPE
+	case Ignore:
+		stdoutConfig = pb.TaskExecStdoutConfig_TASK_EXEC_STDOUT_CONFIG_DEVNULL
+	default:
+		return nil, fmt.Errorf("unsupported stdout behavior: %s", params.Stdout)
+	}
+
+	var stderrConfig pb.TaskExecStderrConfig
+	switch params.Stderr {
+	case Pipe, "":
+		stderrConfig = pb.TaskExecStderrConfig_TASK_EXEC_STDERR_CONFIG_PIPE
+	case Ignore:
+		stderrConfig = pb.TaskExecStderrConfig_TASK_EXEC_STDERR_CONFIG_DEVNULL
+	default:
+		return nil, fmt.Errorf("unsupported stderr behavior: %s", params.Stderr)
+	}
+
+	var ptyInfo *pb.PTYInfo
+	if params.PTY {
+		ptyInfo = defaultSandboxPTYInfo()
+	}
+
+	builder := pb.TaskExecStartRequest_builder{
+		TaskId:        taskID,
+		ExecId:        execID,
+		CommandArgs:   command,
+		StdoutConfig:  stdoutConfig,
+		StderrConfig:  stderrConfig,
+		Workdir:       nil,
+		SecretSources: sources,
+		PtyInfo:       ptyInfo,
+		RuntimeDebug:  false,
+		ContainerId:   containerID,
+	}
+
+	if params.Workdir != "" {
+		builder.Workdir = &params.Workdir
+	}
+
+	if params.Timeout > 0 {
+		timeoutSecs := uint32(params.Timeout / time.Second)
+		builder.TimeoutSecs = &timeoutSecs
+	}
+
+	return builder.Build(), nil
+}
+
+// Exec runs a command in the Sandbox and returns the process handle.
+func (sb *Sandbox) Exec(ctx context.Context, command []string, params *SandboxExecParams) (*ContainerProcess, error) {
+	return sb.execInternal(ctx, command, params, "")
+}
+
+// execForFilesystem satisfies the sandboxForFilesystem interface for Sandbox.
+func (sb *Sandbox) execForFilesystem(ctx context.Context, command []string, params *SandboxExecParams) (*ContainerProcess, error) {
+	return sb.execInternal(ctx, command, params, "")
+}
+
+// execInternal is the shared implementation behind Sandbox.Exec and
+// SidecarContainer.Exec.
+func (sb *Sandbox) execInternal(ctx context.Context, command []string, params *SandboxExecParams, containerID string) (*ContainerProcess, error) {
+	if err := sb.ensureAttached(); err != nil {
+		return nil, err
+	}
+	return sb.impl.exec(ctx, command, params, containerID)
+}
+
+// SandboxCreateConnectTokenParams are optional parameters for CreateConnectToken.
+type SandboxCreateConnectTokenParams struct {
+	// Optional user-provided metadata string that will be added to the headers by the proxy when forwarding requests to the Sandbox.
+	UserMetadata string
+	// Container port that requests are routed to when using this token. Defaults to 8080.
+	Port int
+}
+
+// SandboxCreateConnectCredentials contains the URL and token for connecting to a Sandbox.
+type SandboxCreateConnectCredentials struct {
+	URL   string
+	Token string
+}
+
+// CreateConnectToken creates a token for making HTTP connections to the Sandbox.
+func (sb *Sandbox) CreateConnectToken(ctx context.Context, params *SandboxCreateConnectTokenParams) (*SandboxCreateConnectCredentials, error) {
+	if err := sb.ensureAttached(); err != nil {
+		return nil, err
+	}
+
+	if params == nil {
+		params = &SandboxCreateConnectTokenParams{}
+	}
+	if params.Port < 0 || params.Port > 65535 {
+		return nil, InvalidError{Exception: fmt.Sprintf("CreateConnectToken expects Port in [1, 65535], got %d", params.Port)}
+	}
+	if params.Port == 0 {
+		params.Port = 8080
+	}
+	return sb.impl.createConnectToken(ctx, uint32(params.Port), params.UserMetadata)
+}
+
+// waitForScheduling blocks until the Sandbox has a task. If the wait fails for
+// any reason other than the Sandbox having already finished, it terminates the
+// Sandbox so a queued one cannot start later with no caller.
+func (sb *Sandbox) waitForScheduling(ctx context.Context, timeout time.Duration) error {
+	return sb.impl.waitForScheduling(ctx, timeout)
+}
+
+func (sb *Sandbox) getCommandRouter(ctx context.Context) (string, *taskCommandRouterClient, error) {
+	if err := sb.ensureAttached(); err != nil {
+		return "", nil, err
+	}
+	return sb.impl.getCommandRouter(ctx)
+}
+
+func (sb *Sandbox) ensureAttached() error {
+	if !sb.attached.Load() {
+		return ClientClosedError{Exception: "Unable to perform operation on a detached sandbox"}
+	}
+	return nil
+}
+
+// SandboxExperimentalPauseParams are options for Sandbox.ExperimentalPause.
+type SandboxExperimentalPauseParams struct{}
+
+// SandboxExperimentalResumeParams are options for Sandbox.ExperimentalResume.
+type SandboxExperimentalResumeParams struct{}
+
+// ExperimentalPause stops the Sandbox's current container, keeping its state so
+// it can be resumed.
+//
+// Only supported for experimental persistent Sandboxes.
+//
+// EXPERIMENTAL: the API is subject to change.
+func (sb *Sandbox) ExperimentalPause(ctx context.Context, params *SandboxExperimentalPauseParams) error {
+	if err := sb.ensureAttached(); err != nil {
+		return err
+	}
+	return sb.impl.pause(ctx)
+}
+
+// ExperimentalResume resumes a paused Sandbox from its saved state.
+//
+// Only supported for experimental persistent Sandboxes.
+//
+// EXPERIMENTAL: the API is subject to change.
+func (sb *Sandbox) ExperimentalResume(ctx context.Context, params *SandboxExperimentalResumeParams) error {
+	if err := sb.ensureAttached(); err != nil {
+		return err
+	}
+	return sb.impl.resume(ctx)
+}
+
+// Detach disconnects from the running Sandbox
+//
+// It does not block on or interrupt ongoing reads or calls. Connection resources
+// are closed promptly once those operations finish.
+func (sb *Sandbox) Detach() error {
+	if !sb.attached.Swap(false) {
+		return nil
+	}
+	sb.impl.close()
+	return nil
+}
+
+// SandboxTerminateParams are options for Terminate.
+type SandboxTerminateParams struct {
+	Wait bool // Wait, when true, will wait for the Sandbox to terminate and return the exit code.
+}
+
+// Terminate stops the Sandbox.
+func (sb *Sandbox) Terminate(ctx context.Context, params *SandboxTerminateParams) (int, error) {
+	if err := sb.ensureAttached(); err != nil {
+		return 0, err
+	}
+
+	if params == nil {
+		params = &SandboxTerminateParams{}
+	}
+
+	if err := sb.impl.terminate(ctx); err != nil {
+		return 0, err
+	}
+	returnCode := 0
+
+	if params.Wait {
+		var err error
+		returnCode, err = sb.Wait(ctx, nil)
+		if err != nil {
+			return returnCode, err
+		}
+	}
+
+	// The Sandbox stays attached: its output is worth reading after it stops,
+	// and the connection goes back on its own once nothing is using it.
+	return returnCode, nil
+}
+
+// Wait blocks until the Sandbox exits, and returns its exit code.
+func (sb *Sandbox) Wait(ctx context.Context, params *SandboxWaitParams) (int, error) {
+	return sb.impl.wait(ctx)
+}
+
+// WaitUntilReady blocks until the Sandbox is ready.
+// A Sandbox with a readiness probe is ready once the probe passes;
+// a Sandbox without one is ready once it starts.
+func (sb *Sandbox) WaitUntilReady(ctx context.Context, timeout time.Duration, params *SandboxWaitUntilReadyParams) error {
+	if err := sb.ensureAttached(); err != nil {
+		return err
+	}
+	if timeout <= 0 {
+		return InvalidError{Exception: fmt.Sprintf("timeout must be positive, got %v", timeout)}
+	}
+	return sb.impl.waitUntilReady(ctx, timeout)
+}
+
+// Tunnels gets Tunnel metadata for the Sandbox.
+// Returns SandboxTimeoutError if the tunnels are not available after the timeout.
+// Returns a map of Tunnel objects keyed by the container port.
+func (sb *Sandbox) Tunnels(ctx context.Context, timeout time.Duration, params *SandboxTunnelsParams) (map[int]*Tunnel, error) {
+	if err := sb.ensureAttached(); err != nil {
+		return nil, err
+	}
+	return sb.impl.tunnels(ctx, timeout)
+}
+
+// NoExpiryTTL is the sentinel [time.Duration] value for
+// [SandboxSnapshotFilesystemParams.TTL], [SidecarSnapshotFilesystemParams.TTL], or
+// [SandboxSnapshotDirectoryParams.TTL] that disables expiry on the resulting Image,
+// retaining it indefinitely.
+const NoExpiryTTL time.Duration = -1
+
+// SandboxSnapshotFilesystemParams configures a [Sandbox.SnapshotFilesystem] call.
+type SandboxSnapshotFilesystemParams struct {
+	// Timeout is the overall budget for the snapshot call. Zero means the
+	// default (55 seconds). If it elapses before a snapshot completes, a
+	// TimeoutError is returned.
+	Timeout time.Duration
+	// TTL is the lifetime of the resulting image.
+	//
+	// Zero (or omitted) means use the default of 30 days, as a hard
+	// cutoff measured from creation. A positive value sets a custom
+	// lifetime; sub-second values are rejected. Pass [NoExpiryTTL] to
+	// retain the image indefinitely.
+	//
+	// See [NoExpiryTTL].
+	TTL time.Duration
+}
+
+// SandboxSnapshotDirectoryParams configures a [Sandbox.SnapshotDirectory] call.
+type SandboxSnapshotDirectoryParams struct {
+	// Timeout is the overall budget for the snapshot call. Zero means the
+	// default (55 seconds). If it elapses before a snapshot completes, a
+	// TimeoutError is returned.
+	Timeout time.Duration
+	// TTL is the lifetime of the resulting image.
+	//
+	// Zero (or omitted) means use the default of 30 days, as a hard
+	// cutoff measured from creation. A positive value sets a custom
+	// lifetime; sub-second values are rejected. Pass [NoExpiryTTL] to
+	// retain the image indefinitely.
+	//
+	// See [NoExpiryTTL].
+	TTL time.Duration
+	// ExperimentalEncryptionKey is a customer-supplied encryption key used to
+	// encrypt the resulting snapshot. The same key is required when mounting the image.
+	// Modal does not persist the key.
+	ExperimentalEncryptionKey []byte
+}
+
+func validateExperimentalEncryptionKey(key []byte) ([]byte, error) {
+	if key == nil {
+		return nil, nil
+	}
+	if len(key) < customerSuppliedEncryptionKeyMinLength || len(key) > customerSuppliedEncryptionKeyMaxLength {
+		return nil, InvalidError{Exception: fmt.Sprintf(
+			"experimental encryption key must be between %d and %d bytes, got %d bytes",
+			customerSuppliedEncryptionKeyMinLength,
+			customerSuppliedEncryptionKeyMaxLength,
+			len(key),
+		)}
+	}
+	return key, nil
+}
+
+func buildTaskMountDirectoryRequestProto(taskID, path, imageID, containerID string, params *SandboxMountImageParams) (*pb.TaskMountDirectoryRequest, error) {
+	if params == nil {
+		params = &SandboxMountImageParams{}
+	}
+	encryptionKey, err := validateExperimentalEncryptionKey(params.ExperimentalEncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	return pb.TaskMountDirectoryRequest_builder{
+		TaskId:                        taskID,
+		Path:                          []byte(path),
+		ImageId:                       imageID,
+		CustomerSuppliedEncryptionKey: encryptionKey,
+		ContainerId:                   containerID,
+	}.Build(), nil
+}
+
+func resolveMountImageID(image *Image) (string, error) {
+	if image == nil {
+		return "", nil
+	}
+	if image.ImageID == "" {
+		return "", InvalidError{Exception: "Image must be built before mounting. Call `image.Build(app)` first."}
+	}
+	return image.ImageID, nil
+}
+
+func buildTaskSnapshotDirectoryRequestProto(taskID, path, snapshotID, containerID string, ttlSeconds int64, params *SandboxSnapshotDirectoryParams) (*pb.TaskSnapshotDirectoryRequest, error) {
+	if params == nil {
+		params = &SandboxSnapshotDirectoryParams{}
+	}
+	encryptionKey, err := validateExperimentalEncryptionKey(params.ExperimentalEncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	return pb.TaskSnapshotDirectoryRequest_builder{
+		TaskId:                        taskID,
+		Path:                          []byte(path),
+		SnapshotId:                    snapshotID,
+		TtlSeconds:                    &ttlSeconds,
+		CustomerSuppliedEncryptionKey: encryptionKey,
+		ContainerId:                   containerID,
+	}.Build(), nil
+}
+
+// resolveTTL converts a user-facing [time.Duration] to the wire-format
+// seconds expected by the snapshot RPCs.
+func resolveTTL(ttl time.Duration) (int64, error) {
+	if ttl == 0 {
+		return 30 * 24 * 3600, nil
+	}
+	if ttl == NoExpiryTTL {
+		return -1, nil
+	}
+	if ttl < time.Second {
+		return 0, InvalidError{Exception: fmt.Sprintf("TTL must be at least 1 second, got %v", ttl)}
+	}
+	if ttl%time.Second != 0 {
+		return 0, InvalidError{Exception: fmt.Sprintf("TTL must be a whole number of seconds, got %v", ttl)}
+	}
+	return int64(ttl / time.Second), nil
+}
+
+// SnapshotFilesystem takes a snapshot of the Sandbox's filesystem.
+// Returns an Image object which can be used to spawn a new Sandbox with the same filesystem.
+//
+// If params is nil, the resulting image is retained for 30 days as a hard
+// cutoff measured from creation, and the call has a 55-second timeout.
+// See [SandboxSnapshotFilesystemParams] for control over both.
+func (sb *Sandbox) SnapshotFilesystem(ctx context.Context, params *SandboxSnapshotFilesystemParams) (*Image, error) {
+	if err := sb.ensureAttached(); err != nil {
+		return nil, err
+	}
+	var ttl time.Duration
+	timeout := 55 * time.Second
+	if params != nil {
+		ttl = params.TTL
+		if params.Timeout != 0 {
+			timeout = params.Timeout
+		}
+	}
+	return sb.impl.snapshotFilesystem(ctx, timeout, ttl, "")
+}
+
+// SandboxExperimentalGetExitSnapshotParams are options for Sandbox.ExperimentalGetExitSnapshot.
+type SandboxExperimentalGetExitSnapshotParams struct {
+	// Timeout is the total time to wait, spread across repeated long polls of
+	// at most exitSnapshotLongPollTimeout each. nil (the default) waits until
+	// the snapshot reaches a terminal state. 0 performs an immediate check
+	// without waiting.
+	Timeout *time.Duration
+}
+
+const (
+	// Exit snapshot polling holds a server-side long poll for at most exitSnapshotLongPollTimeout
+	// and then re-polls from the client, so a request is never held open indefinitely however
+	// long the caller waits.
+	exitSnapshotLongPollTimeout = 10 * time.Second
+	// Margin added to each poll's network deadline over the server-side hold, covering the
+	// response's return trip so an answer sent just before the hold expires isn't lost to the
+	// client-side deadline.
+	exitSnapshotPollDeadlineMargin = 5 * time.Second
+	// The fetch loop absorbs transient poll failures and re-polls. It gives up once this many
+	// polls fail in a row, so an extended outage still surfaces to the caller.
+	exitSnapshotMaxConsecutivePollFailures = 3
+	// Pause between failed polls, so failures that reject instantly (e.g. a refused connection)
+	// don't burn through the failure budget in milliseconds.
+	exitSnapshotPollFailureBackoff = time.Second
+)
+
+// ExperimentalGetExitSnapshot gets the exit filesystem snapshot image.
+//
+// An exit snapshot captures the Sandbox filesystem when the Sandbox exits,
+// whether its entrypoint finishes gracefully, abruptly, or it is stopped with
+// Sandbox.Terminate. The resulting Image can be passed to
+// SandboxService.Create to start a new Sandbox from the saved filesystem.
+//
+// Exit snapshots are opt-in: the Sandbox must have been created with
+// SandboxCreateParams.ExperimentalOptions containing
+// "enable_exit_snapshot": true. Calling this on a Sandbox created without
+// that option returns InvalidError.
+//
+// Returns InvalidError if the Timeout is negative, or if exit snapshots were
+// not enabled when the Sandbox was created.
+// Returns TimeoutError if the Timeout elapses before the snapshot reaches a
+// terminal state. This includes a Timeout of 0 when the snapshot is still pending.
+// Returns SnapshotCreationError if the snapshot operation is done and failed.
+// Polling again will not produce an Image; filesystem state is gone.
+// Returns NotFoundError if the Sandbox does not exist.
+//
+// EXPERIMENTAL: the API is subject to change.
+func (sb *Sandbox) ExperimentalGetExitSnapshot(ctx context.Context, params *SandboxExperimentalGetExitSnapshotParams) (*Image, error) {
+	return sb.impl.getExitSnapshot(ctx, params)
+}
+
+// SandboxExperimentalSnapshotParams are options for Sandbox.ExperimentalSnapshot.
+type SandboxExperimentalSnapshotParams struct{}
+
+// ExperimentalSnapshot snapshots the filesystem and memory of the Sandbox.
+//
+// Returns a SandboxSnapshot which can be restored into a new Sandbox with
+// SandboxService.ExperimentalFromSnapshot. The Sandbox must have been created
+// with SandboxCreateParams.ExperimentalEnableSnapshot set.
+//
+// EXPERIMENTAL: the API is subject to change.
+func (sb *Sandbox) ExperimentalSnapshot(ctx context.Context, params *SandboxExperimentalSnapshotParams) (*SandboxSnapshot, error) {
+	if err := sb.ensureAttached(); err != nil {
+		return nil, err
+	}
+	return sb.impl.snapshotMemory(ctx)
+}
+
+// MountImage mounts an Image at a path in the Sandbox filesystem.
+//
+// If image is nil, mounts an empty directory.
+func (sb *Sandbox) MountImage(ctx context.Context, path string, image *Image, params *SandboxMountImageParams) error {
+	if err := sb.ensureAttached(); err != nil {
+		return err
+	}
+	return sb.impl.mountImage(ctx, path, image, params)
+}
+
+// UnmountImage removes an image mount from a path in the Sandbox filesystem.
+func (sb *Sandbox) UnmountImage(ctx context.Context, path string, params *SandboxUnmountImageParams) error {
+	if err := sb.ensureAttached(); err != nil {
+		return err
+	}
+	return sb.impl.unmountImage(ctx, path)
+}
+
+// ReloadVolumes reloads all Volumes mounted in the Sandbox.
+//
+// Blocks until the reload completes, or returns a TimeoutError on timeout (the
+// reload may still complete in the background).
+func (sb *Sandbox) ReloadVolumes(ctx context.Context, params *SandboxReloadVolumesParams) error {
+	if err := sb.ensureAttached(); err != nil {
+		return err
+	}
+	var timeout time.Duration
+	if params != nil {
+		timeout = params.Timeout
+	}
+	return sb.impl.reloadVolumes(ctx, "", timeout)
+}
+
+func buildUpdateNetworkPolicyProto(taskID string, params SandboxUpdateNetworkPolicyParams) *pb.TaskSetNetworkAccessRequest {
+	return pb.TaskSetNetworkAccessRequest_builder{
+		TaskId: taskID,
+		NetworkAccess: pb.NetworkAccess_builder{
+			NetworkAccessType: pb.NetworkAccess_ALLOWLIST,
+			AllowedCidrs:      params.OutboundCIDRAllowlist.Entries,
+			AllowedDomains:    params.OutboundDomainAllowlist.Entries,
+		}.Build(),
+	}.Build()
+}
+
+// UpdateNetworkPolicy updates the outbound network policy of a running Sandbox.
+//
+// Established connections that the new policy no longer permits are terminated.
+// Fails once the Sandbox's outbound policy has been set with
+// Sandbox.SetOutboundPolicy.
+//
+// Deprecated: Use Sandbox.SetOutboundPolicy instead. UpdateNetworkPolicy will be removed in a future release.
+func (sb *Sandbox) UpdateNetworkPolicy(ctx context.Context, params *SandboxUpdateNetworkPolicyParams) error {
+	if err := sb.ensureAttached(); err != nil {
+		return err
+	}
+	if params == nil {
+		params = &SandboxUpdateNetworkPolicyParams{}
+	}
+	if params.OutboundCIDRAllowlist == nil || params.OutboundDomainAllowlist == nil {
+		return InvalidError{Exception: "UpdateNetworkPolicy currently requires both OutboundCIDRAllowlist and OutboundDomainAllowlist to be set"}
+	}
+	warnDeprecated(ctx, sb.client.logger, "UpdateNetworkPolicy",
+		"Sandbox.UpdateNetworkPolicy is deprecated and will be removed in a future release; use Sandbox.SetOutboundPolicy instead")
+	return sb.impl.updateNetworkPolicy(ctx, *params)
+}
+
+// SetOutboundPolicy replaces the outbound policy of a running Sandbox.
+//
+// The new policy replaces the Sandbox's whole outbound network configuration:
+// the OutboundPolicy it was created or last set with, its OutboundCIDRAllowlist
+// and OutboundDomainAllowlist, and its ExperimentalOutboundPolicy. The
+// InboundCIDRAllowlist is unchanged. Established connections that the new
+// policy doesn't allow are terminated.
+//
+// AllowTLSDecryption is fixed when the Sandbox is created, so the new policy
+// must keep it: true if the Sandbox was created with an OutboundPolicy that
+// allows TLS decryption or with an ExperimentalOutboundPolicy, false
+// otherwise.
+//
+// Fails for Sandboxes created with BlockNetwork. Once a Sandbox's outbound
+// policy is set this way, its outbound allowlists and experimental outbound
+// policy can no longer be updated, and it can no longer be memory-snapshotted.
+//
+// If the Sandbox is still starting, this waits up to about a minute for it. A
+// Sandbox that has finished can't be updated. Updates are rate limited per
+// Sandbox.
+func (sb *Sandbox) SetOutboundPolicy(ctx context.Context, policy *OutboundPolicy) error {
+	if err := sb.ensureAttached(); err != nil {
+		return err
+	}
+	if policy == nil {
+		return InvalidError{Exception: "SetOutboundPolicy requires an OutboundPolicy"}
+	}
+	if err := policy.validate(); err != nil {
+		return err
+	}
+	if err := hydrateSecrets(ctx, sb.client, policy.secrets()); err != nil {
+		return err
+	}
+	req := pb.SandboxSetOutboundPolicyRequest_builder{
+		SandboxId:      sb.SandboxID,
+		OutboundPolicy: policy.toProto(),
+	}.Build()
+	deadline := time.Now().Add(setOutboundPolicyStartingTimeout)
+	for {
+		err := sb.impl.setOutboundPolicy(ctx, req)
+		// A Sandbox that is still starting is unavailable until it can apply
+		// the policy.
+		if status.Code(err) != codes.Unavailable || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(setOutboundPolicyStartingInterval):
+		}
+	}
+}
+
+// ExperimentalUpdateOutboundPolicy replaces the outbound policy of a running Sandbox.
+//
+// The new policy replaces all existing policy configuration on the Sandbox;
+// build a policy including any existing rules you want to keep.
+//
+// Only Sandboxes created with an ExperimentalOutboundPolicy can be updated this way.
+// It also fails once the Sandbox's outbound policy has been set with
+// Sandbox.SetOutboundPolicy.
+//
+// Deprecated: Use Sandbox.SetOutboundPolicy instead. ExperimentalUpdateOutboundPolicy will be removed in version 0.12.0.
+func (sb *Sandbox) ExperimentalUpdateOutboundPolicy(ctx context.Context, policy *ExperimentalOutboundPolicy) error {
+	if err := sb.ensureAttached(); err != nil {
+		return err
+	}
+	if policy == nil {
+		policy = &ExperimentalOutboundPolicy{}
+	}
+	if err := policy.validate(); err != nil {
+		return err
+	}
+	warnDeprecated(ctx, sb.client.logger, "ExperimentalUpdateOutboundPolicy",
+		"Sandbox.ExperimentalUpdateOutboundPolicy is deprecated and will be removed in version 0.12.0; use Sandbox.SetOutboundPolicy instead")
+	return sb.impl.updateOutboundPolicy(ctx, policy)
+}
+
+// SnapshotDirectory snapshots and creates a new image from a directory in the running sandbox.
+//
+// If params is nil, the resulting image is retained for 30 days as a hard
+// cutoff measured from creation, and the call has a 55-second timeout.
+// See [SandboxSnapshotDirectoryParams] for control over both.
+func (sb *Sandbox) SnapshotDirectory(ctx context.Context, path string, params *SandboxSnapshotDirectoryParams) (*Image, error) {
+	if err := sb.ensureAttached(); err != nil {
+		return nil, err
+	}
+	var ttl time.Duration
+	timeout := 55 * time.Second
+	if params != nil {
+		ttl = params.TTL
+		if params.Timeout != 0 {
+			timeout = params.Timeout
+		}
+	}
+	return sb.impl.snapshotDirectory(ctx, path, timeout, ttl, params)
+}
+
+// Poll checks if the Sandbox has finished running.
+// Returns nil if the Sandbox is still running, else returns the exit code.
+func (sb *Sandbox) Poll(ctx context.Context, params *SandboxPollParams) (*int, error) {
+	if err := sb.ensureAttached(); err != nil {
+		return nil, err
+	}
+	return sb.impl.poll(ctx)
+}
+
+// SetTags sets key-value tags on the Sandbox. Tags can be used to filter results in SandboxList.
+func (sb *Sandbox) SetTags(ctx context.Context, tags map[string]string, params *SandboxSetTagsParams) error {
+	if err := sb.ensureAttached(); err != nil {
+		return err
+	}
+	return sb.impl.setTags(ctx, tags)
+}
+
+// ExperimentalSetName assigns a name to a running V2 Sandbox that was created
+// without one, i.e. a Sandbox created via ExperimentalCreate. A name may only be
+// set once, and only on a Sandbox that has never had one; afterwards the Sandbox
+// can be looked up with ExperimentalFromName. Names must be unique within an App.
+//
+// EXPERIMENTAL: the API is subject to change.
+func (sb *Sandbox) ExperimentalSetName(ctx context.Context, name string, params *SandboxExperimentalSetNameParams) error {
+	if err := sb.ensureAttached(); err != nil {
+		return err
+	}
+	return sb.impl.setName(ctx, name)
+}
+
+// GetTags fetches any tags (key-value pairs) currently attached to this Sandbox from the server.
+func (sb *Sandbox) GetTags(ctx context.Context, params *SandboxGetTagsParams) (map[string]string, error) {
+	if err := sb.ensureAttached(); err != nil {
+		return nil, err
+	}
+	return sb.impl.getTags(ctx)
+}
+
+// SandboxListParams are options for listing Sandboxes.
+type SandboxListParams struct {
+	AppID       string            // Filter by App ID
+	Tags        map[string]string // Only include Sandboxes that have all these tags
+	Environment string            // Override environment for this request
+}
+
+// List lists Sandboxes for the current environment (or provided App ID), optionally filtered by tags.
+func (s *sandboxServiceImpl) List(ctx context.Context, params *SandboxListParams) (iter.Seq2[*Sandbox, error], error) {
+	if params == nil {
+		params = &SandboxListParams{}
+	}
+
+	if s.client.profile.SandboxV2 {
+		return s.ExperimentalList(ctx, &SandboxExperimentalListParams{
+			AppID:       params.AppID,
+			Tags:        params.Tags,
+			Environment: params.Environment,
+		})
+	}
+	return sandboxesFromImpls(listSandboxesV1(ctx, s.client, params)), nil
+}
+
+func sandboxesFromImpls(impls iter.Seq2[sandboxImpl, error]) iter.Seq2[*Sandbox, error] {
+	return func(yield func(*Sandbox, error) bool) {
+		for impl, err := range impls {
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			if !yield(newSandboxFromImpl(impl), nil) {
+				return
+			}
+		}
+	}
+}
+
+// SandboxExperimentalListParams are options for SandboxService.ExperimentalList.
+type SandboxExperimentalListParams struct {
+	AppID       string            // The App to list Sandboxes under. Omit to list across the environment (deprecated).
+	Tags        map[string]string // Only include Sandboxes that have all these tags.
+	Environment string            // Override environment for this request (used only when AppID is empty).
+}
+
+// ExperimentalList lists all sandboxes (v1 and v2).
+// Pass AppID to scope to an App; omit it to list across the
+// environment (deprecated — prefer scoping by AppID). If Tags are specified,
+// only Sandboxes that have all those tags are returned.
+//
+// EXPERIMENTAL: the API is subject to change.
+func (s *sandboxServiceImpl) ExperimentalList(ctx context.Context, params *SandboxExperimentalListParams) (iter.Seq2[*Sandbox, error], error) {
+	if params == nil {
+		params = &SandboxExperimentalListParams{}
+	}
+	return sandboxesFromImpls(listSandboxesV2(ctx, s.client, params)), nil
+}
+
+func getReturnCode(result *pb.GenericResult) *int {
+	if result == nil || result.GetStatus() == pb.GenericResult_GENERIC_STATUS_UNSPECIFIED {
+		return nil
+	}
+
+	// Statuses are converted to exitcodes so we can conform to subprocess API.
+	var exitCode int
+	switch result.GetStatus() {
+	case pb.GenericResult_GENERIC_STATUS_TIMEOUT:
+		exitCode = 124
+	case pb.GenericResult_GENERIC_STATUS_TERMINATED:
+		exitCode = 137
+	default:
+		exitCode = int(result.GetExitcode())
+	}
+
+	return &exitCode
+}
+
+// ContainerProcess represents a process running in a Modal container, allowing
+// interaction with its standard input/output/error streams.
+//
+// It is created by executing a command in a Sandbox.
+type ContainerProcess struct {
+	Stdin  io.WriteCloser
+	Stdout io.ReadCloser
+	Stderr io.ReadCloser
+
+	taskID              string
+	execID              string
+	commandRouterClient *taskCommandRouterClient
+	deadline            *time.Time
+}
+
+func newContainerProcess(commandRouterClient *taskCommandRouterClient, logger *slog.Logger, taskID, execID string, params SandboxExecParams, deadline *time.Time) *ContainerProcess {
+	stdoutBehavior := Pipe
+	stderrBehavior := Pipe
+	if params.Stdout != "" {
+		stdoutBehavior = params.Stdout
+	}
+	if params.Stderr != "" {
+		stderrBehavior = params.Stderr
+	}
+
+	cp := &ContainerProcess{
+		taskID:              taskID,
+		execID:              execID,
+		commandRouterClient: commandRouterClient,
+		deadline:            deadline,
+	}
+	cp.Stdin = inputStreamCp(commandRouterClient, taskID, execID)
+
+	if stdoutBehavior == Ignore {
+		cp.Stdout = io.NopCloser(bytes.NewReader(nil))
+	} else {
+		cp.Stdout = &lazyStreamReader{
+			initFunc: func() io.ReadCloser {
+				return outputStreamCp(commandRouterClient, taskID, execID, pb.FileDescriptor_FILE_DESCRIPTOR_STDOUT, deadline)
+			},
+		}
+	}
+	if stderrBehavior == Ignore {
+		cp.Stderr = io.NopCloser(bytes.NewReader(nil))
+	} else {
+		cp.Stderr = &lazyStreamReader{
+			initFunc: func() io.ReadCloser {
+				return outputStreamCp(commandRouterClient, taskID, execID, pb.FileDescriptor_FILE_DESCRIPTOR_STDERR, deadline)
+			},
+		}
+	}
+
+	return cp
+}
+
+// stdinWriteStream streams source into the process's stdin.
+func (cp *ContainerProcess) stdinWriteStream(ctx context.Context, source io.ReadSeeker) (int64, error) {
+	return cp.commandRouterClient.ExecStdinWriteStream(ctx, cp.taskID, cp.execID, source)
+}
+
+// Wait blocks until the container process exits and returns its exit code.
+func (cp *ContainerProcess) Wait(ctx context.Context, params *ContainerProcessWaitParams) (int, error) {
+	resp, err := cp.commandRouterClient.ExecWait(ctx, cp.taskID, cp.execID, cp.deadline)
+	if err != nil {
+		return 0, err
+	}
+	switch resp.WhichExitStatus() {
+	case pb.TaskExecWaitResponse_Code_case:
+		return int(resp.GetCode()), nil
+	case pb.TaskExecWaitResponse_Signal_case:
+		return 128 + int(resp.GetSignal()), nil
+	default:
+		return 0, InvalidError{Exception: "Unexpected exit status"}
+	}
+}
+
+func inputStreamSb(cpClient pb.ModalClientClient, sandboxID string) io.WriteCloser {
+	return &sbStdin{sandboxID: sandboxID, index: 1, cpClient: cpClient}
+}
+
+type sbStdin struct {
+	sandboxID string
+	cpClient  pb.ModalClientClient
+
+	mu    sync.Mutex // protects index
+	index uint32
+}
+
+func (sbs *sbStdin) Write(p []byte) (int, error) {
+	sbs.mu.Lock()
+	defer sbs.mu.Unlock()
+	index := sbs.index
+	sbs.index++
+	_, err := sbs.cpClient.SandboxStdinWrite(context.Background(), pb.SandboxStdinWriteRequest_builder{
+		SandboxId: sbs.sandboxID,
+		Input:     p,
+		Index:     index,
+	}.Build())
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (sbs *sbStdin) Close() error {
+	sbs.mu.Lock()
+	defer sbs.mu.Unlock()
+	_, err := sbs.cpClient.SandboxStdinWrite(context.Background(), pb.SandboxStdinWriteRequest_builder{
+		SandboxId: sbs.sandboxID,
+		Index:     sbs.index,
+		Eof:       true,
+	}.Build())
+	if st, ok := status.FromError(err); ok && st.Code() == codes.FailedPrecondition {
+		return nil
+	}
+	return err
+}
+
+func inputStreamCp(commandRouterClient *taskCommandRouterClient, taskID, execID string) io.WriteCloser {
+	return &cpStdin{taskID: taskID, execID: execID, offset: 0, commandRouterClient: commandRouterClient}
+}
+
+type cpStdin struct {
+	taskID              string
+	execID              string
+	commandRouterClient *taskCommandRouterClient
+	offset              uint64
+}
+
+func (cps *cpStdin) Write(p []byte) (int, error) {
+	err := cps.commandRouterClient.ExecStdinWrite(context.Background(), cps.taskID, cps.execID, cps.offset, p, false)
+	if err != nil {
+		return 0, err
+	}
+	cps.offset += uint64(len(p))
+	return len(p), nil
+}
+
+func (cps *cpStdin) Close() error {
+	return cps.commandRouterClient.ExecStdinWrite(context.Background(), cps.taskID, cps.execID, cps.offset, nil, true)
+}
+
+// lazyStreamReader defers stream initialization until the first read, preventing goroutine
+// leaks for unused streams. Without lazy initialization, output stream goroutines are created
+// eagerly and block on stream.Recv() calls.
+type lazyStreamReader struct {
+	once      sync.Once
+	reader    io.ReadCloser
+	initFunc  func() io.ReadCloser
+	readCheck func() error
+	cancel    context.CancelFunc
+}
+
+func (l *lazyStreamReader) Read(p []byte) (int, error) {
+	if l.readCheck != nil {
+		if err := l.readCheck(); err != nil {
+			return 0, err
+		}
+	}
+	l.once.Do(func() {
+		l.reader = l.initFunc()
+	})
+	return l.reader.Read(p)
+}
+
+func (l *lazyStreamReader) Close() error {
+	if l.cancel != nil {
+		l.cancel()
+	}
+	l.once.Do(func() {
+		l.reader = io.NopCloser(bytes.NewReader(nil))
+	})
+	if l.reader != nil {
+		return l.reader.Close()
+	}
+	return nil
+}
+
+// logStreamReader reads a Sandbox's stdout or stderr from the control plane.
+//
+// Like the exec stdio reader, nothing is pulled until Read asks: a batch of log
+// items is fetched by the read that wants it, and a caller who stops reading
+// leaves no goroutine behind them. It holds nothing beyond the batch it is
+// handing over, though what grpc-go has already received is still buffered
+// under it.
+type logStreamReader struct {
+	chunkReader
+
+	cpClient  pb.ModalClientClient
+	sandboxID string
+	fd        pb.FileDescriptor
+
+	stream grpc.ServerStreamingClient[pb.TaskLogsBatch]
+	// Where the next batch resumes, so a reopened stream carries on rather than
+	// repeating logs the caller has seen.
+	lastEntryID      string
+	retriesRemaining int
+	retryDelay       time.Duration
+	completed        bool
+
+	// How long the open stream may sit unread before it is given back, and the
+	// machinery to do it. An open stream that nobody cancels holds what is
+	// behind it — a goroutine among other things — until the process ends, so a
+	// reader who walks away releases nothing on its own.
+	idleTimeout time.Duration
+	idleMu      sync.Mutex
+	idle        idleCountdown
+	// closed prevents a fetch from rearming the idle countdown after Close.
+	closed bool
+	// Cancels the RPC behind stream, and says whether that has happened. A
+	// release can only land between fetches. Buffered bytes remain readable
+	// after release, and the next fetch reopens the stream.
+	streamCancel context.CancelFunc
+	released     bool
+}
+
+// Close stops the idle release; chunkReader.Close cancels the context the
+// stream was opened under, which ends the stream with it.
+func (r *logStreamReader) Close() error {
+	r.idleMu.Lock()
+	r.closed = true
+	r.idle.stop()
+	r.idleMu.Unlock()
+	return r.chunkReader.Close()
+}
+
+// pinStream holds off idle release while fetching output, including retries.
+func (r *logStreamReader) pinStream() {
+	r.idleMu.Lock()
+	defer r.idleMu.Unlock()
+	r.idle.stop()
+}
+
+func (r *logStreamReader) armIdleRelease() {
+	r.idleMu.Lock()
+	defer r.idleMu.Unlock()
+	if !r.closed {
+		r.idle.arm(r.idleTimeout, r.releaseIfIdle)
+	}
+}
+
+// releaseIfIdle gives the stream back. Only the stream goes: the reader stays
+// usable, and the next Read reopens from lastEntryID.
+func (r *logStreamReader) releaseIfIdle(seq uint64) {
+	r.idleMu.Lock()
+	if !r.idle.fired(seq) {
+		r.idleMu.Unlock()
+		return
+	}
+	cancel := r.streamCancel
+	r.streamCancel = nil
+	if cancel != nil {
+		r.released = true
+	}
+	r.idleMu.Unlock()
+
+	// Only the stream's own context is cancelled, and never under the reader's
+	// lock: a Read blocked on the stream holds that lock, and this must not
+	// wait on one.
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// takeReleased answers, once, whether the stream was given back since the last
+// read looked.
+func (r *logStreamReader) takeReleased() bool {
+	r.idleMu.Lock()
+	defer r.idleMu.Unlock()
+	released := r.released
+	r.released = false
+	return released
+}
+
+func (r *logStreamReader) setStreamCancel(cancel context.CancelFunc) {
+	r.idleMu.Lock()
+	defer r.idleMu.Unlock()
+	r.streamCancel = cancel
+}
+
+func outputStreamSb(
+	cpClient pb.ModalClientClient,
+	sandboxID string,
+	fd pb.FileDescriptor,
+	idleTimeout time.Duration,
+) io.ReadCloser {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &logStreamReader{
+		cpClient:         cpClient,
+		sandboxID:        sandboxID,
+		fd:               fd,
+		lastEntryID:      "0-0",
+		retriesRemaining: sbLogsMaxRetries,
+		retryDelay:       sbLogsRetryInitialDelay,
+		idleTimeout:      idleTimeout,
+	}
+	r.ctx, r.cancel = ctx, cancel
+	r.fetch, r.dropStream = r.fill, r.closeStream
+	return r
+}
+
+const sbLogsMaxRetries = 10
+
+const (
+	sbLogsRetryInitialDelay = 10 * time.Millisecond
+	sbLogsRetryDelayFactor  = 2.0
+)
+
+func (r *logStreamReader) closeStream() {
+	r.idleMu.Lock()
+	cancel := r.streamCancel
+	r.streamCancel = nil
+	r.idleMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	r.stream = nil
+}
+
+func (r *logStreamReader) recoverFrom(err error) (retry bool, fatal error) {
+	if !isRetryableGrpc(err) || r.retriesRemaining <= 0 {
+		return false, err
+	}
+
+	timer := time.NewTimer(r.retryDelay)
+	defer timer.Stop()
+	select {
+	case <-r.ctx.Done():
+		return false, r.ctx.Err()
+	case <-timer.C:
+	}
+	r.retryDelay = time.Duration(float64(r.retryDelay) * sbLogsRetryDelayFactor)
+	r.retriesRemaining--
+	return true, nil
+}
+
+func (r *logStreamReader) resetRetry() {
+	r.retryDelay = sbLogsRetryInitialDelay
+	r.retriesRemaining = sbLogsMaxRetries
+}
+
+// fill pulls the next batch of log items into pending, reopening the stream as
+// it needs to. The control plane ends a stream every 55 seconds, so reopening
+// at lastEntryID is the ordinary path rather than an error one.
+func (r *logStreamReader) fill() error {
+	// chunkReader serializes fetches. Reading buffered bytes does not keep the
+	// RPC active, but a fetch holds it through receives and retries.
+	r.pinStream()
+	defer r.armIdleRelease()
+
+	for {
+		if r.completed {
+			return io.EOF
+		}
+		if err := r.ctx.Err(); err != nil {
+			return err
+		}
+		if r.takeReleased() {
+			// Given back while nobody was reading: reopen from lastEntryID
+			// rather than ask a stream that is already gone.
+			r.closeStream()
+		}
+
+		if r.stream == nil {
+			streamCtx, streamCancel := context.WithCancel(r.ctx)
+			stream, err := r.cpClient.SandboxGetLogs(streamCtx, pb.SandboxGetLogsRequest_builder{
+				SandboxId:      r.sandboxID,
+				FileDescriptor: r.fd,
+				Timeout:        55,
+				LastEntryId:    r.lastEntryID,
+			}.Build())
+			if err != nil {
+				streamCancel()
+				retry, fatal := r.recoverFrom(err)
+				if retry {
+					continue
+				}
+				return fmt.Errorf("error getting output stream: %w", fatal)
+			}
+			r.stream = stream
+			r.setStreamCancel(streamCancel)
+		}
+
+		batch, err := r.stream.Recv()
+		if err != nil {
+			r.closeStream()
+			if err == io.EOF {
+				// The server closed this stream; carry on from lastEntryID.
+				continue
+			}
+			retry, fatal := r.recoverFrom(err)
+			if retry {
+				continue
+			}
+			return fmt.Errorf("error getting output stream: %w", fatal)
+		}
+
+		r.resetRetry()
+		r.lastEntryID = batch.GetEntryId()
+		// A batch carries several items, which concatenate into one read's
+		// worth. fill only runs with pending empty, so this starts from empty
+		// every time; the exec reader assigns instead because its stream sends
+		// one chunk per message.
+		for _, item := range batch.GetItems() {
+			r.pending = append(r.pending, item.GetData()...)
+		}
+		if batch.GetEof() {
+			r.completed = true
+		}
+		if len(r.pending) > 0 {
+			return nil
+		}
+	}
+}
+
+func outputStreamCp(commandRouterClient *taskCommandRouterClient, taskID, execID string, fd pb.FileDescriptor, deadline *time.Time) io.ReadCloser {
+	return commandRouterClient.ExecStdioRead(context.Background(), taskID, execID, fd, deadline)
+}
+
+// failedReader reports the error that kept a stream from opening.
+type failedReader struct{ err error }
+
+func (r failedReader) Read([]byte) (int, error) { return 0, r.err }
+func (r failedReader) Close() error             { return nil }

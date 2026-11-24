@@ -1,0 +1,1092 @@
+package test
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/fxamacker/cbor/v2"
+	modal "github.com/modal-labs/Alingo-Modal-Core/go"
+	"github.com/modal-labs/Alingo-Modal-Core/go/internal/grpcmock"
+	pb "github.com/modal-labs/Alingo-Modal-Core/go/proto/modal_proto"
+	"github.com/onsi/gomega"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+func TestFunctionCall(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	function, err := tc.Functions.FromName(ctx, "libmodal-test-support", "echo_string", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	result, err := function.Remote(ctx, nil, map[string]any{"s": "hello"})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(result).Should(gomega.Equal("output: hello"))
+
+	result, err = function.Remote(ctx, []any{"hello"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(result).Should(gomega.Equal("output: hello"))
+}
+
+func TestFunctionCallPreCborVersionError(t *testing.T) {
+	// test that calling a pre 1.2 function raises an error
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	function, err := tc.Functions.FromName(ctx, "test-support-1-1", "identity_with_repr", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	_, err = function.Remote(ctx, nil, map[string]any{"s": "hello"})
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).Should(gomega.ContainSubstring("Redeploy with Modal Python SDK >= 1.2"))
+}
+
+func TestFunctionCallGoMap(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	function, err := tc.Functions.FromName(ctx, "libmodal-test-support", "identity_with_repr", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	inputArg := map[string]any{"s": "hello"}
+	result, err := function.Remote(ctx, []any{inputArg}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	resultSlice, ok := result.([]any)
+	g.Expect(ok).Should(gomega.BeTrue())
+	g.Expect(len(resultSlice)).Should(gomega.Equal(2))
+
+	g.Expect(compareFlexible(resultSlice[0], inputArg)).Should(gomega.BeTrue())
+
+	reprResult, ok := resultSlice[1].(string)
+	g.Expect(ok).Should(gomega.BeTrue())
+	g.Expect(reprResult).Should(gomega.Equal(`{'s': 'hello'}`))
+}
+
+func TestFunctionCallDateTimeRoundtrip(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	function, err := tc.Functions.FromName(ctx, "libmodal-test-support", "identity_with_repr", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	testTime := time.Date(2024, 1, 15, 10, 30, 45, 123456789, time.UTC)
+	result, err := function.Remote(ctx, []any{testTime}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	// Parse the result - identity_with_repr returns [input, repr(input)]
+	resultSlice, ok := result.([]any)
+	g.Expect(ok).Should(gomega.BeTrue())
+	g.Expect(len(resultSlice)).Should(gomega.Equal(2))
+
+	reprResult, ok := resultSlice[1].(string)
+	g.Expect(ok).Should(gomega.BeTrue())
+
+	g.Expect(reprResult).Should(gomega.ContainSubstring("datetime.datetime"))
+	g.Expect(reprResult).Should(gomega.ContainSubstring("2024"))
+
+	receivedTime, ok := resultSlice[0].(time.Time)
+	g.Expect(ok).Should(gomega.BeTrue())
+
+	timeDiff := testTime.Sub(receivedTime)
+	if timeDiff < 0 {
+		timeDiff = -timeDiff
+	}
+
+	// Python's datetime has microsecond precision (not nanosecond)
+	// CBOR encodes time.Time with TimeRFC3339Nano (nanosecond precision)
+	// Python decodes to datetime (rounds to nearest microsecond)
+	// When Python re-encodes, we get back microsecond precision
+	// So we should expect to lose sub-microsecond precision (< 1000 ns)
+	//
+	// Our test uses 123456789 nanoseconds = 123.456789 milliseconds
+	// Python will round to 123456 microseconds = 123.456 milliseconds
+	// So we should lose exactly 789 nanoseconds
+	g.Expect(timeDiff).Should(gomega.BeNumerically("<", time.Microsecond))
+
+	g.Expect(receivedTime.Truncate(time.Microsecond)).Should(gomega.Equal(testTime.Truncate(time.Microsecond)))
+}
+
+func TestFunctionCallLargeInput(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	function, err := tc.Functions.FromName(ctx, "libmodal-test-support", "bytelength", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	len := 3 * 1000 * 1000 // More than 2 MiB, offload to blob storage
+	input := make([]byte, len)
+	result, err := function.Remote(ctx, []any{input}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(result).Should(gomega.Equal(uint64(len)))
+}
+
+func TestFunctionNotFound(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	_, err := tc.Functions.FromName(ctx, "libmodal-test-support", "not_a_real_function", nil)
+	g.Expect(err).Should(gomega.BeAssignableToTypeOf(modal.NotFoundError{}))
+}
+
+func TestFunctionCallInputPlane(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	function, err := tc.Functions.FromName(ctx, "libmodal-test-support", "input_plane", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	result, err := function.Remote(ctx, []any{"hello"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(result).Should(gomega.Equal("output: hello"))
+}
+
+func TestFunctionGetCurrentStats(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := newGRPCMockClient(t)
+
+	grpcmock.HandleUnary(
+		mock, "/FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			return pb.FunctionGetResponse_builder{
+				FunctionId: "fid-stats",
+			}.Build(), nil
+		},
+	)
+
+	f, err := mock.Functions.FromName(ctx, "test-app", "test-function", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	grpcmock.HandleUnary(
+		mock, "/FunctionGetCurrentStats",
+		func(req *pb.FunctionGetCurrentStatsRequest) (*pb.FunctionStats, error) {
+			g.Expect(req.GetFunctionId()).To(gomega.Equal("fid-stats"))
+			return pb.FunctionStats_builder{Backlog: 3, NumTotalTasks: 7}.Build(), nil
+		},
+	)
+
+	stats, err := f.GetCurrentStats(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(stats).To(gomega.Equal(&modal.FunctionCurrentStats{Backlog: 3, NumTotalRunners: 7}))
+
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func TestFunctionUpdateAutoscaler(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := newGRPCMockClient(t)
+
+	grpcmock.HandleUnary(
+		mock, "/FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			return pb.FunctionGetResponse_builder{
+				FunctionId: "fid-auto",
+			}.Build(), nil
+		},
+	)
+
+	f, err := mock.Functions.FromName(ctx, "test-app", "test-function", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	currentSettings := pb.AutoscalerSettings_builder{}
+
+	grpcmock.HandleUnary(
+		mock, "/FunctionUpdateSchedulingParams",
+		func(req *pb.FunctionUpdateSchedulingParamsRequest) (*pb.FunctionUpdateSchedulingParamsResponse, error) {
+			g.Expect(req.GetFunctionId()).To(gomega.Equal("fid-auto"))
+			s := req.GetSettings()
+
+			MinContainers := s.GetMinContainers()
+			MaxContainers := s.GetMaxContainers()
+			BufferContainers := s.GetBufferContainers()
+			ScaledownWindow := s.GetScaledownWindow()
+
+			g.Expect(MinContainers).To(gomega.Equal(uint32(1)))
+			g.Expect(MaxContainers).To(gomega.Equal(uint32(10)))
+			g.Expect(BufferContainers).To(gomega.Equal(uint32(2)))
+			g.Expect(ScaledownWindow).To(gomega.Equal(uint32(300)))
+
+			currentSettings.MinContainers = &MinContainers
+			currentSettings.MaxContainers = &MaxContainers
+			currentSettings.BufferContainers = &BufferContainers
+			currentSettings.ScaledownWindow = &ScaledownWindow
+
+			return pb.FunctionUpdateSchedulingParamsResponse_builder{
+				CurrentSettings: currentSettings.Build(),
+			}.Build(), nil
+		},
+	)
+
+	scaledownWindow := 300 * time.Second
+
+	settings, err := f.UpdateAutoscaler(ctx, &modal.FunctionUpdateAutoscalerParams{
+		MinContainers:    ptrU32(1),
+		MaxContainers:    ptrU32(10),
+		BufferContainers: ptrU32(2),
+		ScaledownWindow:  &scaledownWindow,
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	g.Expect(*settings.MinContainers).To(gomega.Equal(uint32(1)))
+	g.Expect(*settings.MaxContainers).To(gomega.Equal(uint32(10)))
+	g.Expect(*settings.BufferContainers).To(gomega.Equal(uint32(2)))
+	g.Expect(*settings.ScaledownWindow).To(gomega.Equal(time.Duration(300) * time.Second))
+
+	grpcmock.HandleUnary(
+		mock, "/FunctionUpdateSchedulingParams",
+		func(req *pb.FunctionUpdateSchedulingParamsRequest) (*pb.FunctionUpdateSchedulingParamsResponse, error) {
+			g.Expect(req.GetFunctionId()).To(gomega.Equal("fid-auto"))
+			s := req.GetSettings()
+
+			MinContainers := s.GetMinContainers()
+			g.Expect(MinContainers).To(gomega.Equal(uint32(2)))
+			currentSettings.MinContainers = &MinContainers
+
+			return pb.FunctionUpdateSchedulingParamsResponse_builder{
+				CurrentSettings: currentSettings.Build(),
+			}.Build(), nil
+		},
+	)
+
+	settings, err = f.UpdateAutoscaler(ctx, &modal.FunctionUpdateAutoscalerParams{
+		MinContainers: ptrU32(2),
+	})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	g.Expect(*settings.MinContainers).To(gomega.Equal(uint32(2)))
+	g.Expect(*settings.MaxContainers).To(gomega.Equal(uint32(10)))
+	g.Expect(*settings.BufferContainers).To(gomega.Equal(uint32(2)))
+	g.Expect(*settings.ScaledownWindow).To(gomega.Equal(time.Duration(300) * time.Second))
+
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func ptrU32(v uint32) *uint32 { return &v }
+
+func TestFunctionGetWebURL(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := newGRPCMockClient(t)
+
+	grpcmock.HandleUnary(
+		mock, "FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			return pb.FunctionGetResponse_builder{
+				FunctionId: "fid-normal",
+			}.Build(), nil
+		},
+	)
+
+	f, err := mock.Functions.FromName(ctx, "libmodal-test-support", "echo_string", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(f.GetWebURL()).To(gomega.Equal(""))
+
+	grpcmock.HandleUnary(
+		mock, "FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			g.Expect(req.GetAppName()).To(gomega.Equal("libmodal-test-support"))
+			g.Expect(req.GetObjectTag()).To(gomega.Equal("web_endpoint"))
+			return pb.FunctionGetResponse_builder{
+				FunctionId:     "fid-web",
+				HandleMetadata: pb.FunctionHandleMetadata_builder{WebUrl: "https://endpoint.internal"}.Build(),
+			}.Build(), nil
+		},
+	)
+
+	wef, err := mock.Functions.FromName(ctx, "libmodal-test-support", "web_endpoint", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(wef.GetWebURL()).To(gomega.Equal("https://endpoint.internal"))
+
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func TestFunctionFromNameWithVersion(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := newGRPCMockClient(t)
+
+	grpcmock.HandleUnary(
+		mock, "FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			g.Expect(req.GetAppName()).To(gomega.Equal("libmodal-test-support"))
+			g.Expect(req.GetObjectTag()).To(gomega.Equal("echo_string"))
+			g.Expect(req.GetAppVersion()).To(gomega.Equal(int32(3)))
+			return pb.FunctionGetResponse_builder{
+				FunctionId: "fid-versioned",
+			}.Build(), nil
+		},
+	)
+
+	f, err := mock.Functions.FromName(ctx, "libmodal-test-support", "echo_string", &modal.FunctionFromNameParams{Version: 3})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(f.FunctionID).To(gomega.Equal("fid-versioned"))
+
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func TestFunctionFromNameWithDotNotation(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	_, err := tc.Functions.FromName(ctx, "libmodal-test-support", "MyClass.myMethod", nil)
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).To(gomega.Equal("cannot retrieve Cls methods using Functions.FromName(). Use:\n  cls, _ := client.Cls.FromName(ctx, \"libmodal-test-support\", \"MyClass\", nil)\n  instance, _ := cls.Instance(ctx, nil)\n  m, _ := instance.Method(\"myMethod\")"))
+}
+
+func TestWebEndpointRemoteCallError(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	function, err := tc.Functions.FromName(ctx, "libmodal-test-support", "web_endpoint_echo", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	_, err = function.Remote(ctx, []any{"hello"}, nil)
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err).Should(gomega.BeAssignableToTypeOf(modal.InvalidError{}))
+	g.Expect(err.Error()).Should(gomega.ContainSubstring("A webhook Function cannot be invoked for remote execution with 'Remote'"))
+}
+
+func TestWebEndpointSpawnCallError(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	function, err := tc.Functions.FromName(ctx, "libmodal-test-support", "web_endpoint_echo", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	_, err = function.Spawn(ctx, []any{"hello"}, nil)
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err).Should(gomega.BeAssignableToTypeOf(modal.InvalidError{}))
+	g.Expect(err.Error()).Should(gomega.ContainSubstring("A webhook Function cannot be invoked for remote execution with 'Spawn'"))
+}
+
+func mockFunctionGetSupportingCbor(mock *grpcmock.MockClient, functionID string) {
+	grpcmock.HandleUnary(
+		mock, "/FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			return pb.FunctionGetResponse_builder{
+				FunctionId: functionID,
+				HandleMetadata: pb.FunctionHandleMetadata_builder{
+					SupportedInputFormats: []pb.DataFormat{pb.DataFormat_DATA_FORMAT_CBOR},
+				}.Build(),
+			}.Build(), nil
+		},
+	)
+}
+
+func mockFunctionMapExpectingInvocationType(
+	mock *grpcmock.MockClient,
+	g *gomega.WithT,
+	invocationType pb.FunctionCallInvocationType,
+	functionCallID string,
+) {
+	grpcmock.HandleUnary(
+		mock, "/FunctionMap",
+		func(req *pb.FunctionMapRequest) (*pb.FunctionMapResponse, error) {
+			g.Expect(req.GetFunctionCallInvocationType()).To(gomega.Equal(invocationType))
+			g.Expect(req.GetFunctionCallType()).To(gomega.Equal(pb.FunctionCallType_FUNCTION_CALL_TYPE_UNARY))
+			g.Expect(req.GetPipelinedInputs()).To(gomega.HaveLen(1))
+			return pb.FunctionMapResponse_builder{
+				FunctionCallId:  functionCallID,
+				FunctionCallJwt: "fc-jwt",
+				PipelinedInputs: []*pb.FunctionPutInputsResponseItem{
+					pb.FunctionPutInputsResponseItem_builder{InputJwt: "input-jwt"}.Build(),
+				},
+			}.Build(), nil
+		},
+	)
+}
+
+func TestFunctionSpawnSendsAsyncInvocationType(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := newGRPCMockClient(t)
+	mockFunctionGetSupportingCbor(mock, "fid-spawn")
+
+	f, err := mock.Functions.FromName(ctx, "test-app", "test-function", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	mockFunctionMapExpectingInvocationType(
+		mock, g, pb.FunctionCallInvocationType_FUNCTION_CALL_INVOCATION_TYPE_ASYNC, "fc-spawn")
+
+	fc, err := f.Spawn(ctx, []any{"hello"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(fc.FunctionCallID).To(gomega.Equal("fc-spawn"))
+
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func TestFunctionRemoteSendsSyncInvocationType(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := newGRPCMockClient(t)
+	mockFunctionGetSupportingCbor(mock, "fid-remote")
+
+	f, err := mock.Functions.FromName(ctx, "test-app", "test-function", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	mockFunctionMapExpectingInvocationType(
+		mock, g, pb.FunctionCallInvocationType_FUNCTION_CALL_INVOCATION_TYPE_SYNC, "fc-remote")
+
+	grpcmock.HandleUnary(
+		mock, "/FunctionGetOutputs",
+		func(req *pb.FunctionGetOutputsRequest) (*pb.FunctionGetOutputsResponse, error) {
+			g.Expect(req.GetFunctionCallId()).To(gomega.Equal("fc-remote"))
+			data, err := cbor.Marshal("output: hello")
+			if err != nil {
+				return nil, err
+			}
+			return pb.FunctionGetOutputsResponse_builder{
+				Outputs: []*pb.FunctionGetOutputsItem{
+					pb.FunctionGetOutputsItem_builder{
+						Result: pb.GenericResult_builder{
+							Status: pb.GenericResult_GENERIC_STATUS_SUCCESS,
+							Data:   data,
+						}.Build(),
+						DataFormat: pb.DataFormat_DATA_FORMAT_CBOR,
+					}.Build(),
+				},
+			}.Build(), nil
+		},
+	)
+
+	result, err := f.Remote(ctx, []any{"hello"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(result).To(gomega.Equal("output: hello"))
+
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+// compareFlexible compares two values with flexible type handling
+func compareFlexible(a, b interface{}) bool {
+	// Handle nil cases explicitly
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+
+	// Handle map comparisons
+	av := reflect.ValueOf(a)
+	bv := reflect.ValueOf(b)
+
+	if av.Kind() == reflect.Map && bv.Kind() == reflect.Map {
+		return compareMaps(a, b)
+	}
+	// For other types, fall back to reflect.DeepEqual
+	return reflect.DeepEqual(a, b)
+}
+
+// compareMaps compares two maps with flexible key type handling
+func compareMaps(a, b interface{}) bool {
+	av := reflect.ValueOf(a)
+	bv := reflect.ValueOf(b)
+
+	if av.Kind() != reflect.Map || bv.Kind() != reflect.Map {
+		return false
+	}
+
+	if av.Len() != bv.Len() {
+		return false
+	}
+
+	for _, key := range av.MapKeys() {
+		aVal := av.MapIndex(key)
+
+		// Try to find the corresponding key in b
+		// Handle cases where key types might differ (string vs interface{})
+		var bVal reflect.Value
+		found := false
+
+		for _, bKey := range bv.MapKeys() {
+			if compareFlexible(key.Interface(), bKey.Interface()) {
+				bVal = bv.MapIndex(bKey)
+				found = true
+				break
+			}
+		}
+
+		if !found || !bVal.IsValid() {
+			return false
+		}
+
+		// Use flexible comparison for values
+		if !compareFlexible(aVal.Interface(), bVal.Interface()) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func TestFunctionOptionsPb(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ctx := context.Background()
+
+	mock := newGRPCMockClient(t)
+
+	grpcmock.HandleUnary(
+		mock,
+		"FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			return pb.FunctionGetResponse_builder{
+				FunctionId: "fid-test",
+			}.Build(), nil
+		},
+	)
+
+	grpcmock.HandleUnary(
+		mock,
+		"FunctionBindParams",
+		func(req *pb.FunctionBindParamsRequest) (*pb.FunctionBindParamsResponse, error) {
+			reqBuilder := pb.FunctionBindParamsRequest_builder{}
+			optBuilder := pb.FunctionOptions_builder{}
+
+			concurrencyLimit := uint32(1)
+			batchMaxSize := uint32(1)
+
+			optBuilder.ConcurrencyLimit = &concurrencyLimit
+			optBuilder.BatchMaxSize = &batchMaxSize
+			optBuilder.SecretIds = []string{}
+
+			reqBuilder.FunctionId = "fid-test"
+			reqBuilder.FunctionOptions = optBuilder.Build()
+			reqBuilder.SerializedParams = []byte{}
+			reqBuilder.EnvironmentName = "test"
+
+			expected := reqBuilder.Build()
+
+			g.Expect(req.GetFunctionId()).To(gomega.Equal(expected.GetFunctionId()))
+			g.Expect(req.GetSerializedParams()).To(gomega.Equal(expected.GetSerializedParams()))
+			g.Expect(req.GetSerializedParams()).To(gomega.Equal(expected.GetSerializedParams()))
+
+			opts := req.GetFunctionOptions()
+			expectedOpts := expected.GetFunctionOptions()
+
+			g.Expect(opts.GetSecretIds()).To(gomega.Equal(expectedOpts.GetSecretIds()))
+			g.Expect(opts.GetMountIds()).To(gomega.Equal(expectedOpts.GetMountIds()))
+			g.Expect(opts.GetResources()).To(gomega.Equal(expectedOpts.GetResources()))
+			g.Expect(opts.GetRetryPolicy()).To(gomega.Equal(expectedOpts.GetRetryPolicy()))
+			g.Expect(opts.GetConcurrencyLimit()).To(gomega.Equal(expectedOpts.GetConcurrencyLimit()))
+			g.Expect(opts.GetTimeoutSecs()).To(gomega.Equal(expectedOpts.GetTimeoutSecs()))
+			g.Expect(opts.GetTaskIdleTimeoutSecs()).To(gomega.Equal(expectedOpts.GetTaskIdleTimeoutSecs()))
+			g.Expect(opts.GetWarmPoolSize()).To(gomega.Equal(expectedOpts.GetWarmPoolSize()))
+			g.Expect(opts.GetVolumeMounts()).To(gomega.Equal(expectedOpts.GetVolumeMounts()))
+			g.Expect(opts.GetTargetConcurrentInputs()).To(gomega.Equal(expectedOpts.GetTargetConcurrentInputs()))
+			g.Expect(opts.GetReplaceVolumeMounts()).To(gomega.Equal(expectedOpts.GetReplaceVolumeMounts()))
+			g.Expect(opts.GetReplaceSecretIds()).To(gomega.Equal(expectedOpts.GetReplaceSecretIds()))
+			g.Expect(opts.GetBufferContainers()).To(gomega.Equal(expectedOpts.GetBufferContainers()))
+			g.Expect(opts.GetMaxConcurrentInputs()).To(gomega.Equal(expectedOpts.GetMaxConcurrentInputs()))
+			g.Expect(opts.GetBatchMaxSize()).To(gomega.Equal(expectedOpts.GetBatchMaxSize()))
+			g.Expect(opts.GetBatchLingerMs()).To(gomega.Equal(expectedOpts.GetBatchLingerMs()))
+			g.Expect(opts.GetSchedulerPlacement()).To(gomega.Equal(expectedOpts.GetSchedulerPlacement()))
+			g.Expect(opts.GetCloudProviderStr()).To(gomega.Equal(expectedOpts.GetCloudProviderStr()))
+			g.Expect(opts.GetReplaceCloudBucketMounts()).To(gomega.Equal(expectedOpts.GetReplaceCloudBucketMounts()))
+			g.Expect(opts.GetCloudBucketMounts()).To(gomega.Equal(expectedOpts.GetCloudBucketMounts()))
+
+			respBuilder := pb.FunctionBindParamsResponse_builder{}
+			respBuilder.BoundFunctionId = "fid-bound"
+
+			return respBuilder.Build(), nil
+		},
+	)
+
+	fn, err := mock.Functions.FromName(ctx, "libmodal-test-support", "echo_string", nil)
+	g.Expect(err).To(gomega.BeNil())
+
+	maxContainers := 1
+	batchMaxSize := 1
+
+	options := modal.FunctionWithOptionsParams{
+		MaxContainers: &maxContainers,
+	}
+
+	batch := modal.FunctionWithBatchingParams{
+		MaxBatchSize: batchMaxSize,
+	}
+
+	_, err = fn.WithOptions(&options).WithBatching(&batch).Instance(ctx)
+	g.Expect(err).To(gomega.BeNil())
+}
+
+func TestEmptyInstance(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	ctx := context.Background()
+	mock := newGRPCMockClient(t)
+
+	grpcmock.HandleUnary(
+		mock,
+		"FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			return pb.FunctionGetResponse_builder{
+				FunctionId: "fid-test",
+			}.Build(), nil
+		},
+	)
+
+	// goal is to NOT send FunctionBindParams RPC if there is no configuration
+
+	echo, err := mock.Functions.FromName(ctx, "libmodal-test-support", "echo_string", nil)
+	if err != nil {
+		t.Fatalf("Failed to get Function: %v", err)
+	}
+
+	instance, err := echo.Instance(ctx)
+	g.Expect(err).To(gomega.BeNil())
+
+	g.Expect(instance.FunctionID).To(gomega.Equal(echo.FunctionID))
+}
+
+func TestInstanceUsesBoundHandleMetadataThresholds(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := newGRPCMockClient(t)
+	mockFunctionGetSupportingCbor(mock, "fid-base")
+
+	fn, err := mock.Functions.FromName(ctx, "test-app", "test-function", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	// The bind response carries a tiny max_object_size_bytes so that even a small input must be
+	// offloaded to blob storage. The bound variant should adopt this metadata (matching Python).
+	tinyLimit := uint64(1)
+	grpcmock.HandleUnary(
+		mock, "/FunctionBindParams",
+		func(req *pb.FunctionBindParamsRequest) (*pb.FunctionBindParamsResponse, error) {
+			return pb.FunctionBindParamsResponse_builder{
+				BoundFunctionId: "fid-bound",
+				HandleMetadata: pb.FunctionHandleMetadata_builder{
+					SupportedInputFormats: []pb.DataFormat{pb.DataFormat_DATA_FORMAT_CBOR},
+					MaxObjectSizeBytes:    &tinyLimit,
+				}.Build(),
+			}.Build(), nil
+		},
+	)
+
+	maxContainers := 1
+	inst, err := fn.WithOptions(&modal.FunctionWithOptionsParams{MaxContainers: &maxContainers}).Instance(ctx)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(inst.FunctionID).To(gomega.Equal("fid-bound"))
+
+	// With the tiny bound threshold, Remote must reach BlobCreate even for a small input. We return
+	// a response without an upload URL so the upload fails deterministically, proving the bound
+	// metadata was used. If the bound metadata were ignored (stale 2 MiB base limit), the input
+	// would inline and BlobCreate would never be called.
+	grpcmock.HandleUnary(
+		mock, "/BlobCreate",
+		func(req *pb.BlobCreateRequest) (*pb.BlobCreateResponse, error) {
+			return pb.BlobCreateResponse_builder{BlobId: "bl-1"}.Build(), nil
+		},
+	)
+
+	_, err = inst.Remote(ctx, []any{"hello"}, nil)
+	g.Expect(err).Should(gomega.HaveOccurred())
+	g.Expect(err.Error()).Should(gomega.ContainSubstring("missing upload URL in BlobCreate response"))
+}
+
+func TestFunctionFromID(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []string{"function", "class", "server", "missing", "denied"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+			mc := grpcmock.NewMockClient()
+			defer mc.Close()
+			grpcmock.HandleUnary(mc, "/FunctionGetById", func(req *pb.FunctionGetByIdRequest) (*pb.FunctionGetByIdResponse, error) {
+				g.Expect(req.GetFunctionId()).To(gomega.Equal("fu-test"))
+				if kind == "missing" {
+					return nil, status.Error(codes.NotFound, "missing")
+				}
+				if kind == "denied" {
+					return nil, status.Error(codes.PermissionDenied, "denied")
+				}
+				return pb.FunctionGetByIdResponse_builder{
+					Function:       pb.FunctionData_builder{IsClass: kind == "class", IsServer: kind == "server"}.Build(),
+					HandleMetadata: pb.FunctionHandleMetadata_builder{WebUrl: "https://test.modal.run", AppId: "ap-test"}.Build(),
+				}.Build(), nil
+			})
+			fn, err := mc.Functions.FromID(t.Context(), "fu-test")
+			switch kind {
+			case "function":
+				g.Expect(err).NotTo(gomega.HaveOccurred())
+				g.Expect(fn.FunctionID).To(gomega.Equal("fu-test"))
+				g.Expect(fn.GetWebURL()).To(gomega.Equal("https://test.modal.run"))
+				g.Expect(fn.Logs).NotTo(gomega.BeNil())
+			case "class", "server":
+				g.Expect(err).To(gomega.BeAssignableToTypeOf(modal.InvalidError{}))
+			case "missing":
+				g.Expect(err).To(gomega.BeAssignableToTypeOf(modal.NotFoundError{}))
+			case "denied":
+				g.Expect(status.Code(err)).To(gomega.Equal(codes.PermissionDenied))
+			}
+			g.Expect(mc.AssertExhausted()).To(gomega.Succeed())
+		})
+	}
+}
+
+func TestFunctionInfoClsMethod(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+	tc := newTestClient(t)
+
+	cls, err := tc.Cls.FromName(ctx, "libmodal-test-support", "EchoCls", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	cpu := 4.0
+	for _, c := range []*modal.Cls{cls, cls.WithOptions(&modal.ClsWithOptionsParams{CPU: &cpu})} {
+		instance, err := c.Instance(ctx, nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		method, err := instance.Method("echo_string")
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+		info, err := method.Info(ctx, nil)
+		g.Expect(err).ShouldNot(gomega.HaveOccurred())
+		g.Expect(info.MethodNames).To(gomega.ContainElement("echo_string"))
+		g.Expect(slices.IsSorted(info.MethodNames)).To(gomega.BeTrue())
+	}
+}
+
+// mockFunctionInfo returns a Function with two GPU fallbacks whose Info calls
+// are served by the returned mock.
+func mockFunctionInfo(t *testing.T) (*grpcmock.MockClient, *modal.Function) {
+	mock := newGRPCMockClient(t)
+	grpcmock.HandleUnary(mock, "/FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			return pb.FunctionGetResponse_builder{FunctionId: "fu-info"}.Build(), nil
+		},
+	)
+	f, err := mock.Functions.FromName(t.Context(), "test-app", "test-function", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newFunction := func(gpuType string) *pb.Function {
+		return pb.Function_builder{
+			ImageId:     "im-123",
+			TimeoutSecs: 300,
+			SecretIds:   []string{"st-orig"},
+			VolumeMounts: []*pb.VolumeMount{
+				pb.VolumeMount_builder{MountPath: "/orig", VolumeId: "vo-orig"}.Build(),
+			},
+			Resources: pb.Resources_builder{
+				MilliCpu:  1000,
+				MemoryMb:  256,
+				GpuConfig: pb.GPUConfig_builder{GpuType: gpuType, Count: 1}.Build(),
+			}.Build(),
+		}.Build()
+	}
+	grpcmock.HandleUnary(mock, "/FunctionGetById",
+		func(req *pb.FunctionGetByIdRequest) (*pb.FunctionGetByIdResponse, error) {
+			if req.GetFunctionId() != "fu-info" {
+				return nil, status.Errorf(codes.NotFound, "unexpected function %s", req.GetFunctionId())
+			}
+			return pb.FunctionGetByIdResponse_builder{
+				Function: pb.FunctionData_builder{
+					IsClass: true,
+					RankedFunctions: []*pb.FunctionData_RankedFunction{
+						pb.FunctionData_RankedFunction_builder{Rank: 0, Function: newFunction("H100")}.Build(),
+						pb.FunctionData_RankedFunction_builder{Rank: 1, Function: newFunction("A100")}.Build(),
+					},
+					MethodDefinitions: map[string]*pb.MethodDefinition{
+						"b": pb.MethodDefinition_builder{}.Build(),
+						"a": pb.MethodDefinition_builder{}.Build(),
+					},
+				}.Build(),
+			}.Build(), nil
+		},
+	)
+	return mock, f
+}
+
+func TestFunctionInfoWithoutOptions(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	mock, f := mockFunctionInfo(t)
+
+	info, err := f.Info(t.Context(), nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(*info.CPU).To(gomega.Equal(1.0))
+	g.Expect(info.CPULimit).To(gomega.BeNil())
+	g.Expect(*info.MemoryMiB).To(gomega.Equal(uint32(256)))
+	g.Expect(info.GPUs).To(gomega.Equal([]struct {
+		GpuType string
+		Count   uint32
+	}{{GpuType: "H100", Count: 1}, {GpuType: "A100", Count: 1}}))
+	g.Expect(info.Timeout).To(gomega.Equal(5 * time.Minute))
+	g.Expect(info.SecretIDs).To(gomega.Equal([]string{"st-orig"}))
+	g.Expect(info.Volumes).To(gomega.Equal(map[string]struct {
+		VolumeID string
+		ReadOnly bool
+		SubPath  *string
+	}{"/orig": {VolumeID: "vo-orig"}}))
+	g.Expect(info.MethodNames).To(gomega.Equal([]string{"a", "b"}))
+	g.Expect(info.MethodDetails).To(gomega.BeEmpty())
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func TestFunctionInfoWithOptions(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	mock, f := mockFunctionInfo(t)
+
+	memoryLimitMiB, memoryMiB := 1024, 512
+	gpu := "L4:2"
+	info, err := f.WithOptions(&modal.FunctionWithOptionsParams{
+		MemoryMiB:      &memoryMiB,
+		MemoryLimitMiB: &memoryLimitMiB,
+		GPU:            &gpu,
+		// Empty lists keep the Function's own Secrets and Volumes.
+		Secrets: []*modal.Secret{},
+		Volumes: map[string]*modal.Volume{},
+	}).Info(t.Context(), nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	// Unset resource fields keep their original values.
+	g.Expect(*info.CPU).To(gomega.Equal(1.0))
+	g.Expect(*info.MemoryMiB).To(gomega.Equal(uint32(512)))
+	g.Expect(*info.MemoryLimitMiB).To(gomega.Equal(uint32(1024)))
+	g.Expect(info.GPUs).To(gomega.Equal([]struct {
+		GpuType string
+		Count   uint32
+	}{{GpuType: "L4", Count: 2}}))
+	g.Expect(info.SecretIDs).To(gomega.Equal([]string{"st-orig"}))
+	g.Expect(info.Volumes).To(gomega.Equal(map[string]struct {
+		VolumeID string
+		ReadOnly bool
+		SubPath  *string
+	}{"/orig": {VolumeID: "vo-orig"}}))
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func TestFunctionInfoUnresolvedSecrets(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	mock, f := mockFunctionInfo(t)
+
+	secret, err := mock.Secrets.FromMap(t.Context(), map[string]string{"B": "2"}, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	// Neither Secret exists on Modal yet, so no IDs are reported, but they still
+	// replace the Function's own Secrets.
+	info, err := f.WithOptions(&modal.FunctionWithOptionsParams{
+		Env:     map[string]string{"A": "1"},
+		Secrets: []*modal.Secret{secret},
+	}).Info(t.Context(), nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(info.SecretIDs).To(gomega.BeEmpty())
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func TestFunctionInfoInvalidOptions(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	mock := newGRPCMockClient(t)
+	grpcmock.HandleUnary(mock, "/FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			return pb.FunctionGetResponse_builder{FunctionId: "fu-info", Function: &pb.FunctionData{}}.Build(), nil
+		},
+	)
+	f, err := mock.Functions.FromName(t.Context(), "test-app", "test-function", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	timeout := 500 * time.Millisecond
+	_, err = f.WithOptions(&modal.FunctionWithOptionsParams{Timeout: &timeout}).Info(t.Context(), nil)
+	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("timeout must be at least 1 second")))
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func TestFunctionInfoEmptyCls(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	mock := newGRPCMockClient(t)
+	grpcmock.HandleUnary(mock, "/FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			return pb.FunctionGetResponse_builder{FunctionId: "fu-info"}.Build(), nil
+		},
+	)
+
+	grpcmock.HandleUnary(mock, "/FunctionGetById",
+		func(req *pb.FunctionGetByIdRequest) (*pb.FunctionGetByIdResponse, error) {
+			if req.GetFunctionId() != "fu-info" {
+				return nil, status.Errorf(
+					codes.NotFound,
+					"unexpected function %s",
+					req.GetFunctionId(),
+				)
+			}
+
+			return pb.FunctionGetByIdResponse_builder{
+				Function: pb.FunctionData_builder{
+					IsClass: true,
+					RankedFunctions: []*pb.FunctionData_RankedFunction{
+						pb.FunctionData_RankedFunction_builder{
+							Rank:     0,
+							Function: pb.Function_builder{}.Build(),
+						}.Build(),
+					},
+					MethodDefinitions: map[string]*pb.MethodDefinition{},
+				}.Build(),
+			}.Build(), nil
+		},
+	)
+
+	ctx := t.Context()
+	f, err := mock.Functions.FromName(t.Context(), "test-app", "test-function", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	info, err := f.Info(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	g.Expect(info.MethodNames).Should(gomega.BeEmpty())
+	g.Expect(info.MethodDetails).Should(gomega.BeEmpty())
+
+	g.Expect(info.MethodNames).ShouldNot(gomega.BeNil())
+	g.Expect(info.MethodDetails).ShouldNot(gomega.BeNil())
+}
+
+func TestFunctionInfoCaching(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	numCalls := 0
+	getFunctionData := func(idx int) *pb.FunctionData {
+		numCalls++
+
+		return pb.FunctionData_builder{
+			IsClass: true,
+			RankedFunctions: []*pb.FunctionData_RankedFunction{
+				pb.FunctionData_RankedFunction_builder{
+					Rank: 0,
+					Function: pb.Function_builder{
+						ImageId:     fmt.Sprintf("im-%d", idx),
+						TimeoutSecs: 300,
+					}.Build(),
+				}.Build(),
+			},
+			MethodDefinitions: map[string]*pb.MethodDefinition{},
+		}.Build()
+	}
+
+	mock := newGRPCMockClient(t)
+	grpcmock.HandleUnary(mock, "/FunctionGet",
+		func(req *pb.FunctionGetRequest) (*pb.FunctionGetResponse, error) {
+			return pb.FunctionGetResponse_builder{FunctionId: "fu-info", Function: getFunctionData(0)}.Build(), nil
+		},
+	)
+
+	grpcmock.HandleUnary(mock, "/FunctionGetById",
+		func(req *pb.FunctionGetByIdRequest) (*pb.FunctionGetByIdResponse, error) {
+			if req.GetFunctionId() != "fu-info" {
+				return nil, status.Errorf(
+					codes.NotFound,
+					"unexpected function %s",
+					req.GetFunctionId(),
+				)
+			}
+
+			return pb.FunctionGetByIdResponse_builder{
+				Function: getFunctionData(1),
+			}.Build(), nil
+		},
+	)
+
+	ctx := t.Context()
+	f, err := mock.Functions.FromName(ctx, "test-app", "test-function", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(numCalls).To(gomega.Equal(1))
+
+	firstInfo, err := f.Info(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(numCalls).To(gomega.Equal(1))
+
+	secondInfo, err := f.Info(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	// Second call didn't hit the RPC
+	g.Expect(numCalls).To(gomega.Equal(1))
+
+	// Equality of pointers so they should be the same exact object
+	g.Expect(firstInfo).To(gomega.Equal(secondInfo))
+
+	memoryLimitMiB, memoryMiB := 1024, 512
+	configuredInfo, err := f.WithOptions(&modal.FunctionWithOptionsParams{
+		MemoryMiB:      &memoryMiB,
+		MemoryLimitMiB: &memoryLimitMiB,
+	}).Info(t.Context(), nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(numCalls).To(gomega.Equal(1))
+	g.Expect(firstInfo).ShouldNot(gomega.Equal(configuredInfo))
+
+	refreshedInfo, err := f.Info(ctx, &modal.FunctionInfoParams{Refresh: true})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	// refresh call did hit RPC
+	g.Expect(numCalls).To(gomega.Equal(2))
+
+	g.Expect(firstInfo).ShouldNot(gomega.Equal(refreshedInfo))
+
+	// Check that multiple calls to .WithOptions() doesn't poison the cached FunctionData struct
+	cpuLimit, cpu := 16.0, 8.0
+	configuredInfo1, err := f.WithOptions(&modal.FunctionWithOptionsParams{
+		CPU:      &cpu,
+		CPULimit: &cpuLimit,
+	}).Info(t.Context(), nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	configuredInfo2, err := f.WithOptions(&modal.FunctionWithOptionsParams{
+		MemoryMiB:      &memoryMiB,
+		MemoryLimitMiB: &memoryLimitMiB,
+	}).Info(t.Context(), nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	g.Expect(*configuredInfo1.CPU).To(gomega.BeEquivalentTo(cpu))
+	g.Expect(*configuredInfo1.CPULimit).To(gomega.BeEquivalentTo(cpuLimit))
+	g.Expect(configuredInfo1.MemoryMiB).To(gomega.BeNil())
+	g.Expect(configuredInfo1.MemoryLimitMiB).To(gomega.BeNil())
+
+	g.Expect(configuredInfo2.CPU).To(gomega.BeNil())
+	g.Expect(configuredInfo2.CPULimit).To(gomega.BeNil())
+	g.Expect(*configuredInfo2.MemoryMiB).To(gomega.BeEquivalentTo(memoryMiB))
+	g.Expect(*configuredInfo2.MemoryLimitMiB).To(gomega.BeEquivalentTo(memoryLimitMiB))
+}

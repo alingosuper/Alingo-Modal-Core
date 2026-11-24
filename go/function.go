@@ -1,0 +1,1525 @@
+package modal
+
+// Function calls and invocations, to be used with Modal Functions.
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/fxamacker/cbor/v2"
+	pickle "github.com/kisielk/og-rek"
+	pb "github.com/modal-labs/Alingo-Modal-Core/go/proto/modal_proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+// FunctionService provides Function related operations.
+type FunctionService interface {
+	FromID(ctx context.Context, functionID string) (*Function, error)
+	FromName(ctx context.Context, appName string, name string, params *FunctionFromNameParams) (*Function, error)
+}
+
+type functionServiceImpl struct{ client *Client }
+
+// From: modal/_utils/blob_utils.py
+const maxObjectSizeBytes int = 2 * 1024 * 1024 // 2 MiB
+const maxAsyncObjectSizeBytes int = 8 * 1024   // 8 KiB
+
+// From: Alingo-Modal-Core/modal/_utils/function_utils.py
+const outputsTimeout time.Duration = time.Second * 55
+
+// From: client/modal/_functions.py
+const maxSystemRetries = 8
+
+// Async invocations use the (smaller) async threshold. Mirrors `should_upload` in
+// modal/_utils/function_utils.py.
+func shouldUpload(numBytes int, maxObjectSize int, maxAsyncObjectSize int, invocationType pb.FunctionCallInvocationType) bool {
+	return numBytes > maxObjectSize ||
+		(invocationType == pb.FunctionCallInvocationType_FUNCTION_CALL_INVOCATION_TYPE_ASYNC && numBytes > maxAsyncObjectSize)
+}
+
+func timeNowSeconds() float64 {
+	return float64(time.Now().UnixNano()) / 1e9
+}
+
+// FunctionCurrentStats represents statistics for a running Function.
+type FunctionCurrentStats struct {
+	Backlog         int
+	NumTotalRunners int
+}
+
+// FunctionUpdateAutoscalerParams contains options for overriding a Function's autoscaler behavior.
+type FunctionUpdateAutoscalerParams struct {
+	MinContainers    *uint32
+	MaxContainers    *uint32
+	BufferContainers *uint32
+	ScaledownWindow  *time.Duration
+}
+
+// Function references a deployed Modal Function.
+type Function struct {
+	FunctionID string
+
+	// Logs provides access to logs emitted by this Function.
+	Logs *FunctionLogsManager
+
+	// Metrics provides metric samples and schema definitions.
+	Metrics *FunctionMetricsManager
+
+	handleMetadata *pb.FunctionHandleMetadata
+
+	client  *Client
+	options *functionOptions
+
+	cachedFunctionData *pb.FunctionData
+}
+
+func newFunction(
+	client *Client,
+	functionID string,
+	handleMetadata *pb.FunctionHandleMetadata,
+	options *functionOptions,
+	cachedFunctionData *pb.FunctionData,
+) *Function {
+	return &Function{
+		FunctionID: functionID,
+		Metrics:    &FunctionMetricsManager{client: client, functionID: functionID},
+		Logs: &FunctionLogsManager{
+			client:     client,
+			appID:      handleMetadata.GetAppId(),
+			functionID: functionID,
+		},
+		handleMetadata:     handleMetadata,
+		client:             client,
+		options:            options,
+		cachedFunctionData: cachedFunctionData,
+	}
+}
+
+// FromID references a Function by its ID.
+//
+//	client, err := modal.NewClient()
+//	if err != nil {
+//		return err
+//	}
+//	defer client.Close()
+//	fn, err := client.Functions.FromID(ctx, "fu-***")
+//	if err != nil {
+//		return err
+//	}
+//	fmt.Println(fn.getWebURL())
+func (s *functionServiceImpl) FromID(ctx context.Context, functionID string) (*Function, error) {
+	resp, err := s.client.cpClient.FunctionGetById(ctx, pb.FunctionGetByIdRequest_builder{FunctionId: functionID}.Build())
+	if status.Code(err) == codes.NotFound {
+		return nil, NotFoundError{fmt.Sprintf("Function '%s' not found", functionID)}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if resp.GetFunction().GetIsServer() {
+		return nil, InvalidError{fmt.Sprintf("%s is a Server and cannot be loaded with Functions.FromID().", functionID)}
+	}
+	if resp.GetFunction().GetIsClass() {
+		return nil, InvalidError{fmt.Sprintf("%s is a Cls and cannot be loaded with Functions.FromID().", functionID)}
+	}
+	return newFunction(s.client, functionID, resp.GetHandleMetadata(), &functionOptions{}, resp.GetFunction()), nil
+}
+
+// FunctionFromNameParams are options for client.Functions.FromName.
+type FunctionFromNameParams struct {
+	Environment string
+	// Version looks up a version-pinned Function deployed at this App version.
+	Version int
+}
+
+func hasOptions(o *functionOptions) bool {
+	return o != nil && *o != (functionOptions{})
+}
+
+// FromName references a Function from a deployed App by its name.
+func (s *functionServiceImpl) FromName(ctx context.Context, appName string, name string, params *FunctionFromNameParams) (*Function, error) {
+	if params == nil {
+		params = &FunctionFromNameParams{}
+	}
+
+	if strings.Contains(name, ".") {
+		parts := strings.SplitN(name, ".", 2)
+		clsName := parts[0]
+		methodName := parts[1]
+		return nil, fmt.Errorf("cannot retrieve Cls methods using Functions.FromName(). Use:\n  cls, _ := client.Cls.FromName(ctx, \"%s\", \"%s\", nil)\n  instance, _ := cls.Instance(ctx, nil)\n  m, _ := instance.Method(\"%s\")", appName, clsName, methodName)
+	}
+
+	resp, err := s.client.cpClient.FunctionGet(ctx, pb.FunctionGetRequest_builder{
+		AppName:         appName,
+		ObjectTag:       name,
+		EnvironmentName: firstNonEmpty(params.Environment, s.client.profile.Environment),
+		AppVersion:      int32(params.Version),
+	}.Build())
+
+	if status, ok := status.FromError(err); ok && status.Code() == codes.NotFound {
+		return nil, NotFoundError{fmt.Sprintf("Function '%s/%s' not found", appName, name)}
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	handleMetadata := resp.GetHandleMetadata()
+	s.client.logger.DebugContext(ctx, "Retrieved Function",
+		"function_id", resp.GetFunctionId(),
+		"app_name", appName,
+		"function_name", name)
+
+	return newFunction(s.client, resp.GetFunctionId(), handleMetadata, &functionOptions{}, resp.GetFunction()), nil
+}
+
+// pickleSerialize serializes Go data types to the Python pickle format.
+// NOTE: This is only used by Queue operations. Function calls use CBOR only.
+func pickleSerialize(v any) (bytes.Buffer, error) {
+	var inputBuffer bytes.Buffer
+
+	e := pickle.NewEncoder(&inputBuffer)
+	err := e.Encode(v)
+
+	if err != nil {
+		return bytes.Buffer{}, fmt.Errorf("error pickling data: %w", err)
+	}
+	return inputBuffer, nil
+}
+
+// pickleDeserialize deserializes from Python pickle into Go basic types.
+// NOTE: This is only used by Queue operations. Function calls use CBOR only.
+func pickleDeserialize(buffer []byte) (any, error) {
+	decoder := pickle.NewDecoder(bytes.NewReader(buffer))
+	result, err := decoder.Decode()
+	if err != nil {
+		return nil, fmt.Errorf("error unpickling data: %w", err)
+	}
+	return result, nil
+}
+
+// cborEncoder is configured with time tags enabled so that time.Time values
+// are represented as datetime objects in Python. Uses TimeRFC3339Nano to preserve
+// nanosecond precision (Python datetime has microsecond precision).
+//
+// Both options are required:
+//   - Time: TimeRFC3339Nano - specifies the format (RFC3339 with nanosecond precision)
+//   - TimeTag: EncTagRequired - wraps the time in CBOR tag 0, signaling it's a datetime
+//     Without the tag, Python would receive it as a plain string, not a datetime object.
+var cborEncoder, _ = cbor.EncOptions{
+	Time:    cbor.TimeRFC3339Nano,
+	TimeTag: cbor.EncTagRequired,
+}.EncMode()
+
+// cborSerialize serializes Go data types to the CBOR format.
+// Uses CBOR time tags so that time.Time values are represented as
+// datetime objects in Python.
+func cborSerialize(v any) ([]byte, error) {
+	data, err := cborEncoder.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("error encoding CBOR data: %w", err)
+	}
+	return data, nil
+}
+
+// cborDeserialize deserializes from CBOR into Go basic types.
+func cborDeserialize(buffer []byte) (any, error) {
+	var result any
+	err := cbor.Unmarshal(buffer, &result)
+	if err != nil {
+		return nil, fmt.Errorf("error decoding CBOR data: %w", err)
+	}
+	return result, nil
+}
+
+// createInput serializes inputs, makes a function call and returns its ID
+func (f *Function) createInput(ctx context.Context, args []any, kwargs map[string]any, invocationType pb.FunctionCallInvocationType) (*pb.FunctionInput, error) {
+
+	// Check supported input formats and require CBOR
+	supportedInputFormats := f.getSupportedInputFormats()
+	cborSupported := false
+	for _, format := range supportedInputFormats {
+		if format == pb.DataFormat_DATA_FORMAT_CBOR {
+			cborSupported = true
+			break
+		}
+	}
+
+	// Error if CBOR is not supported
+	if !cborSupported {
+		return nil, fmt.Errorf("cannot call Modal Function from Go SDK since it was deployed with an incompatible Python SDK version. Redeploy with Modal Python SDK >= 1.2")
+	}
+
+	// Use CBOR encoding
+	// Ensure args and kwargs are not nil to match expected behavior
+	cborArgs := args
+	if cborArgs == nil {
+		cborArgs = []any{}
+	}
+	cborKwargs := kwargs
+	if cborKwargs == nil {
+		cborKwargs = map[string]any{}
+	}
+	argsBytes, err := cborSerialize([]any{cborArgs, cborKwargs})
+	if err != nil {
+		return nil, err
+	}
+	dataFormat := pb.DataFormat_DATA_FORMAT_CBOR
+	metadata, err := f.getHandleMetadata()
+	if err != nil {
+		return nil, err
+	}
+	maxObjectSize := maxObjectSizeBytes
+	if metadata.HasMaxObjectSizeBytes() {
+		maxObjectSize = int(metadata.GetMaxObjectSizeBytes())
+	}
+	maxAsyncObjectSize := maxAsyncObjectSizeBytes
+	if metadata.HasMaxAsyncObjectSizeBytes() {
+		maxAsyncObjectSize = int(metadata.GetMaxAsyncObjectSizeBytes())
+	}
+	var argsBlobID *string
+	if shouldUpload(len(argsBytes), maxObjectSize, maxAsyncObjectSize, invocationType) {
+		blobID, err := blobUpload(ctx, f.client.cpClient, f.client.logger, argsBytes)
+		if err != nil {
+			return nil, err
+		}
+		argsBytes = nil
+		argsBlobID = &blobID
+	}
+	methodName := metadata.GetUseMethodName() // this is empty if the function is not a cls method
+	return pb.FunctionInput_builder{
+		Args:       argsBytes,
+		ArgsBlobId: argsBlobID,
+		DataFormat: dataFormat,
+		MethodName: &methodName,
+	}.Build(), nil
+}
+
+// getHandleMetadata returns the function's handle metadata or an error if not set.
+func (f *Function) getHandleMetadata() (*pb.FunctionHandleMetadata, error) {
+	if f.handleMetadata == nil {
+		return nil, fmt.Errorf("unexpected error: function has not been hydrated")
+	}
+	return f.handleMetadata, nil
+}
+
+// getSupportedInputFormats returns the supported input formats for this function.
+// Returns an empty slice if metadata is not available.
+func (f *Function) getSupportedInputFormats() []pb.DataFormat {
+	metadata, err := f.getHandleMetadata()
+	if err != nil {
+		// Return empty slice if metadata is not available - this will cause CBOR validation to fail
+		return []pb.DataFormat{}
+	}
+	if len(metadata.GetSupportedInputFormats()) > 0 {
+		return metadata.GetSupportedInputFormats()
+	}
+	return []pb.DataFormat{}
+}
+
+// getWebURL returns the web URL for this function, if it's a Web Function.
+// Returns empty string if metadata is not available or if not a Web Function.
+func (f *Function) getWebURL() string {
+	metadata, err := f.getHandleMetadata()
+	if err != nil {
+		return ""
+	}
+	return metadata.GetWebUrl()
+}
+
+func (f *Function) checkNoWebURL(fnName string) error {
+	webURL := f.getWebURL()
+	if webURL != "" {
+		return InvalidError{fmt.Sprintf(
+			"A webhook Function cannot be invoked for remote execution with '%s'. Invoke this Function via its web url '%s' instead",
+			fnName, webURL,
+		)}
+	}
+	return nil
+}
+
+// FunctionWithOptionsParams represents runtime options for a Modal Function.
+type FunctionWithOptionsParams struct {
+	CPU              *float64
+	CPULimit         *float64
+	MemoryMiB        *int
+	MemoryLimitMiB   *int
+	GPU              *string
+	Env              map[string]string
+	Secrets          []*Secret
+	Volumes          map[string]*Volume
+	Retries          *Retries
+	MaxContainers    *int
+	BufferContainers *int
+	ScaledownWindow  *time.Duration
+	Timeout          *time.Duration
+	RoutingRegion    *string
+}
+
+// FunctionWithConcurrencyParams represents concurrency configuration for a Modal Function.
+type FunctionWithConcurrencyParams struct {
+	MaxInputs    int
+	TargetInputs *int
+}
+
+// FunctionWithBatchingParams represents batching configuration for a Modal Function.
+type FunctionWithBatchingParams struct {
+	MaxBatchSize int
+	Wait         time.Duration
+}
+
+type functionOptions struct {
+	cpu                    *float64
+	cpuLimit               *float64
+	memoryMiB              *int
+	memoryLimitMiB         *int
+	gpu                    *string
+	env                    *map[string]string
+	secrets                *[]*Secret
+	volumes                *map[string]*Volume
+	retries                *Retries
+	maxContainers          *int
+	bufferContainers       *int
+	scaledownWindow        *time.Duration
+	timeout                *time.Duration
+	maxConcurrentInputs    *int
+	targetConcurrentInputs *int
+	batchMaxSize           *int
+	batchWait              *time.Duration
+	routingRegion          *string
+}
+
+func mergeFunctionOptions(base, new *functionOptions) *functionOptions {
+	if base == nil {
+		return new
+	}
+	if new == nil {
+		return base
+	}
+
+	merged := &functionOptions{
+		cpu:                    base.cpu,
+		cpuLimit:               base.cpuLimit,
+		memoryMiB:              base.memoryMiB,
+		memoryLimitMiB:         base.memoryLimitMiB,
+		gpu:                    base.gpu,
+		env:                    base.env,
+		secrets:                base.secrets,
+		volumes:                base.volumes,
+		retries:                base.retries,
+		maxContainers:          base.maxContainers,
+		bufferContainers:       base.bufferContainers,
+		scaledownWindow:        base.scaledownWindow,
+		timeout:                base.timeout,
+		maxConcurrentInputs:    base.maxConcurrentInputs,
+		targetConcurrentInputs: base.targetConcurrentInputs,
+		batchMaxSize:           base.batchMaxSize,
+		batchWait:              base.batchWait,
+		routingRegion:          base.routingRegion,
+	}
+
+	if new.cpu != nil {
+		merged.cpu = new.cpu
+	}
+	if new.cpuLimit != nil {
+		merged.cpuLimit = new.cpuLimit
+	}
+	if new.memoryMiB != nil {
+		merged.memoryMiB = new.memoryMiB
+	}
+	if new.memoryLimitMiB != nil {
+		merged.memoryLimitMiB = new.memoryLimitMiB
+	}
+	if new.gpu != nil {
+		merged.gpu = new.gpu
+	}
+	if new.env != nil {
+		merged.env = new.env
+	}
+	if new.secrets != nil {
+		merged.secrets = new.secrets
+	}
+	if new.volumes != nil {
+		merged.volumes = new.volumes
+	}
+	if new.retries != nil {
+		merged.retries = new.retries
+	}
+	if new.maxContainers != nil {
+		merged.maxContainers = new.maxContainers
+	}
+	if new.bufferContainers != nil {
+		merged.bufferContainers = new.bufferContainers
+	}
+	if new.scaledownWindow != nil {
+		merged.scaledownWindow = new.scaledownWindow
+	}
+	if new.timeout != nil {
+		merged.timeout = new.timeout
+	}
+	if new.maxConcurrentInputs != nil {
+		merged.maxConcurrentInputs = new.maxConcurrentInputs
+	}
+	if new.targetConcurrentInputs != nil {
+		merged.targetConcurrentInputs = new.targetConcurrentInputs
+	}
+	if new.batchMaxSize != nil {
+		merged.batchMaxSize = new.batchMaxSize
+	}
+	if new.batchWait != nil {
+		merged.batchWait = new.batchWait
+	}
+	if new.routingRegion != nil {
+		merged.routingRegion = new.routingRegion
+	}
+
+	return merged
+}
+
+func buildFunctionOptionsProto(options *functionOptions) (*pb.FunctionOptions, error) {
+	if !hasOptions(options) {
+		return nil, nil
+	}
+
+	builder := pb.FunctionOptions_builder{}
+
+	if options.cpu != nil || options.cpuLimit != nil || options.memoryMiB != nil || options.memoryLimitMiB != nil || options.gpu != nil {
+		resBuilder := pb.Resources_builder{}
+
+		if options.cpu == nil && options.cpuLimit != nil {
+			return nil, fmt.Errorf("must also specify non-zero CPU request when CPULimit is specified")
+		}
+		if options.cpu != nil {
+			if *options.cpu <= 0 {
+				return nil, fmt.Errorf("the CPU request (%f) must be a positive number", *options.cpu)
+			}
+			resBuilder.MilliCpu = uint32(*options.cpu * 1000)
+			if options.cpuLimit != nil {
+				if *options.cpuLimit < *options.cpu {
+					return nil, fmt.Errorf("the CPU request (%f) cannot be higher than CPULimit (%f)", *options.cpu, *options.cpuLimit)
+				}
+				resBuilder.MilliCpuMax = uint32(*options.cpuLimit * 1000)
+			}
+		}
+
+		if options.memoryMiB == nil && options.memoryLimitMiB != nil {
+			return nil, fmt.Errorf("must also specify non-zero MemoryMiB request when MemoryLimitMiB is specified")
+		}
+		if options.memoryMiB != nil {
+			if *options.memoryMiB <= 0 {
+				return nil, fmt.Errorf("the MemoryMiB request (%d) must be a positive number", *options.memoryMiB)
+			}
+			resBuilder.MemoryMb = uint32(*options.memoryMiB)
+			if options.memoryLimitMiB != nil {
+				if *options.memoryLimitMiB < *options.memoryMiB {
+					return nil, fmt.Errorf("the MemoryMiB request (%d) cannot be higher than MemoryLimitMiB (%d)", *options.memoryMiB, *options.memoryLimitMiB)
+				}
+				resBuilder.MemoryMbMax = uint32(*options.memoryLimitMiB)
+			}
+		}
+
+		if options.gpu != nil {
+			gpuConfig, err := parseGPUConfig(*options.gpu)
+			if err != nil {
+				return nil, err
+			}
+			resBuilder.GpuConfig = gpuConfig
+		}
+		builder.Resources = resBuilder.Build()
+	}
+
+	secretIds := []string{}
+	if options.secrets != nil {
+		for _, secret := range *options.secrets {
+			if secret != nil {
+				secretIds = append(secretIds, secret.SecretID)
+			}
+		}
+	}
+
+	builder.SecretIds = secretIds
+	if len(secretIds) > 0 {
+		builder.ReplaceSecretIds = true
+	}
+
+	if options.volumes != nil {
+		volumeMounts := []*pb.VolumeMount{}
+		for mountPath, volume := range *options.volumes {
+			if volume != nil {
+				volumeMounts = append(volumeMounts, volumeToMountProto(mountPath, volume))
+			}
+		}
+		builder.VolumeMounts = volumeMounts
+		if len(volumeMounts) > 0 {
+			builder.ReplaceVolumeMounts = true
+		}
+	}
+
+	if options.retries != nil {
+		builder.RetryPolicy = pb.FunctionRetryPolicy_builder{
+			Retries:            uint32(options.retries.MaxRetries),
+			BackoffCoefficient: options.retries.BackoffCoefficient,
+			InitialDelayMs:     uint32(options.retries.InitialDelay / time.Millisecond),
+			MaxDelayMs:         uint32(options.retries.MaxDelay / time.Millisecond),
+		}.Build()
+	}
+
+	if options.maxContainers != nil {
+		v := uint32(*options.maxContainers)
+		builder.ConcurrencyLimit = &v
+	}
+	if options.bufferContainers != nil {
+		v := uint32(*options.bufferContainers)
+		builder.BufferContainers = &v
+	}
+
+	if options.scaledownWindow != nil {
+		if *options.scaledownWindow < time.Second {
+			return nil, fmt.Errorf("scaledownWindow must be at least 1 second, got %v", *options.scaledownWindow)
+		}
+		if (*options.scaledownWindow)%time.Second != 0 {
+			return nil, fmt.Errorf("scaledownWindow must be a whole number of seconds, got %v", *options.scaledownWindow)
+		}
+		v := uint32((*options.scaledownWindow) / time.Second)
+		builder.TaskIdleTimeoutSecs = &v
+	}
+	if options.timeout != nil {
+		if *options.timeout < time.Second {
+			return nil, fmt.Errorf("timeout must be at least 1 second, got %v", *options.timeout)
+		}
+		if (*options.timeout)%time.Second != 0 {
+			return nil, fmt.Errorf("timeout must be a whole number of seconds, got %v", *options.timeout)
+		}
+		v := uint32((*options.timeout) / time.Second)
+		builder.TimeoutSecs = &v
+	}
+
+	if options.maxConcurrentInputs != nil {
+		v := uint32(*options.maxConcurrentInputs)
+		builder.MaxConcurrentInputs = &v
+	}
+	if options.targetConcurrentInputs != nil {
+		v := uint32(*options.targetConcurrentInputs)
+		builder.TargetConcurrentInputs = &v
+	}
+
+	if options.batchMaxSize != nil {
+		v := uint32(*options.batchMaxSize)
+		builder.BatchMaxSize = &v
+	}
+	if options.batchWait != nil {
+		v := uint64((*options.batchWait) / time.Millisecond)
+		builder.BatchLingerMs = &v
+	}
+
+	if options.routingRegion != nil {
+		builder.RoutingRegion = options.routingRegion
+	}
+
+	return builder.Build(), nil
+}
+
+// bindParameters processes the parameters and binds them to the function.
+func bindParameters(
+	ctx context.Context,
+	client *Client,
+	functionID string,
+	options *functionOptions,
+	schema []*pb.ClassParameterSpec,
+	parameters map[string]any,
+) (*pb.FunctionBindParamsResponse, error) {
+	if options == nil {
+		options = &functionOptions{}
+	}
+
+	mergedSecrets, err := mergeEnvIntoSecrets(ctx, client, options.env, options.secrets)
+	if err != nil {
+		return nil, err
+	}
+
+	// FunctionOptions only carries secret IDs, so any locally-created Secrets
+	// (and env vars) must be hydrated into server-side Secrets first.
+	if err := hydrateSecrets(ctx, client, mergedSecrets); err != nil {
+		return nil, err
+	}
+
+	mergedOptions := mergeFunctionOptions(options, &functionOptions{
+		secrets: &mergedSecrets,
+		env:     nil, // nil'ing env just to clarify it's not needed anymore
+	})
+
+	serializedParams, err := encodeParameterSet(schema, parameters)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize parameters: %w", err)
+	}
+
+	functionOptions, err := buildFunctionOptionsProto(mergedOptions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build function options: %w", err)
+	}
+
+	bindResp, err := client.cpClient.FunctionBindParams(ctx, pb.FunctionBindParamsRequest_builder{
+		FunctionId:       functionID,
+		SerializedParams: serializedParams,
+		FunctionOptions:  functionOptions,
+		EnvironmentName:  client.profile.Environment,
+	}.Build())
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to bind parameters: %w", err)
+	}
+
+	return bindResp, nil
+}
+
+func (f *Function) WithOptions(options *FunctionWithOptionsParams) *Function {
+	if options == nil {
+		options = &FunctionWithOptionsParams{}
+	}
+
+	var secretsPtr *[]*Secret
+	if options.Secrets != nil {
+		s := options.Secrets
+		secretsPtr = &s
+	}
+	var volumesPtr *map[string]*Volume
+	if options.Volumes != nil {
+		v := options.Volumes
+		volumesPtr = &v
+	}
+	var envPtr *map[string]string
+	if options.Env != nil {
+		e := options.Env
+		envPtr = &e
+	}
+
+	merged := mergeFunctionOptions(f.options, &functionOptions{
+		cpu:              options.CPU,
+		cpuLimit:         options.CPULimit,
+		memoryMiB:        options.MemoryMiB,
+		memoryLimitMiB:   options.MemoryLimitMiB,
+		gpu:              options.GPU,
+		env:              envPtr,
+		secrets:          secretsPtr,
+		volumes:          volumesPtr,
+		retries:          options.Retries,
+		maxContainers:    options.MaxContainers,
+		bufferContainers: options.BufferContainers,
+		scaledownWindow:  options.ScaledownWindow,
+		timeout:          options.Timeout,
+		routingRegion:    options.RoutingRegion,
+	})
+
+	return newFunction(f.client, f.FunctionID, f.handleMetadata, merged, f.cachedFunctionData)
+}
+
+func (f *Function) WithConcurrency(params *FunctionWithConcurrencyParams) *Function {
+	if params == nil {
+		params = &FunctionWithConcurrencyParams{}
+	}
+
+	merged := mergeFunctionOptions(f.options, &functionOptions{
+		maxConcurrentInputs:    &params.MaxInputs,
+		targetConcurrentInputs: params.TargetInputs,
+	})
+
+	return newFunction(f.client, f.FunctionID, f.handleMetadata, merged, f.cachedFunctionData)
+}
+
+func (f *Function) WithBatching(params *FunctionWithBatchingParams) *Function {
+	if params == nil {
+		params = &FunctionWithBatchingParams{}
+	}
+
+	merged := mergeFunctionOptions(f.options, &functionOptions{
+		batchMaxSize: &params.MaxBatchSize,
+		batchWait:    &params.Wait,
+	})
+
+	return newFunction(f.client, f.FunctionID, f.handleMetadata, merged, f.cachedFunctionData)
+}
+
+func (f *Function) Instance(ctx context.Context) (*Function, error) {
+	if f == nil {
+		return nil, fmt.Errorf("failed to dereference function")
+	}
+
+	boundFnID := f.FunctionID
+	handleMetadata := f.handleMetadata
+
+	if hasOptions(f.options) {
+		bindResp, err := bindParameters(ctx, f.client, f.FunctionID, f.options, []*pb.ClassParameterSpec{}, map[string]any{})
+		if err != nil {
+			return nil, err
+		}
+
+		boundFnID = bindResp.GetBoundFunctionId()
+		handleMetadata = bindResp.GetHandleMetadata()
+	}
+
+	return newFunction(f.client, boundFnID, handleMetadata, &functionOptions{}, nil), nil
+}
+
+// FunctionGetCurrentStatsParams are options for Function.GetCurrentStats.
+type FunctionGetCurrentStatsParams struct{}
+
+// Remote executes a single input on a remote Function.
+func (f *Function) Remote(ctx context.Context, args []any, kwargs map[string]any) (any, error) {
+	f.client.logger.DebugContext(ctx, "Executing function call", "function_id", f.FunctionID)
+	if err := f.checkNoWebURL("Remote"); err != nil {
+		return nil, err
+	}
+	input, err := f.createInput(ctx, args, kwargs, pb.FunctionCallInvocationType_FUNCTION_CALL_INVOCATION_TYPE_SYNC)
+	if err != nil {
+		return nil, err
+	}
+	invocation, err := f.createRemoteInvocation(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	// TODO(ryan): Add tests for retries.
+	retryCount := uint32(0)
+	for {
+		output, err := invocation.awaitOutput(ctx, nil)
+		if err == nil {
+			f.client.logger.DebugContext(ctx, "Function call completed", "function_id", f.FunctionID)
+			return output, nil
+		}
+		if errors.As(err, &InternalFailure{}) && retryCount <= maxSystemRetries {
+			f.client.logger.DebugContext(ctx, "Retrying function call due to internal failure",
+				"function_id", f.FunctionID,
+				"retry_count", retryCount)
+			if retryErr := invocation.retry(ctx, retryCount); retryErr != nil {
+				return nil, retryErr
+			}
+			retryCount++
+			continue
+		}
+		return nil, err
+	}
+}
+
+// createRemoteInvocation creates an Invocation using either the input plane or control plane.
+func (f *Function) createRemoteInvocation(ctx context.Context, input *pb.FunctionInput) (invocation, error) {
+	metadata, err := f.getHandleMetadata()
+	if err != nil {
+		return nil, err
+	}
+	inputPlaneURL := metadata.GetInputPlaneUrl()
+	if inputPlaneURL != "" {
+		ipClient, err := f.client.ipClient(ctx, inputPlaneURL)
+		if err != nil {
+			return nil, err
+		}
+		return createInputPlaneInvocation(ctx, ipClient, f.client.logger, f.FunctionID, input)
+	}
+	return createControlPlaneInvocation(ctx, f.client.cpClient, f.client.logger, f.FunctionID, input, pb.FunctionCallInvocationType_FUNCTION_CALL_INVOCATION_TYPE_SYNC)
+}
+
+// Spawn starts running a single input on a remote Function.
+func (f *Function) Spawn(ctx context.Context, args []any, kwargs map[string]any) (*FunctionCall, error) {
+	f.client.logger.DebugContext(ctx, "Spawning function call", "function_id", f.FunctionID)
+	if err := f.checkNoWebURL("Spawn"); err != nil {
+		return nil, err
+	}
+	input, err := f.createInput(ctx, args, kwargs, pb.FunctionCallInvocationType_FUNCTION_CALL_INVOCATION_TYPE_ASYNC)
+	if err != nil {
+		return nil, err
+	}
+	invocation, err := createControlPlaneInvocation(ctx, f.client.cpClient, f.client.logger, f.FunctionID, input, pb.FunctionCallInvocationType_FUNCTION_CALL_INVOCATION_TYPE_ASYNC)
+	if err != nil {
+		return nil, err
+	}
+	functionCall := newFunctionCall(
+		f.client,
+		invocation.FunctionCallID,
+		f.FunctionID,
+		f.handleMetadata.GetAppId(),
+	)
+	f.client.logger.DebugContext(ctx, "Function call spawned",
+		"function_id", f.FunctionID,
+		"function_call_id", invocation.FunctionCallID)
+	return functionCall, nil
+}
+
+// GetCurrentStats returns a FunctionCurrentStats object with statistics about the Function.
+func (f *Function) GetCurrentStats(ctx context.Context, params *FunctionGetCurrentStatsParams) (*FunctionCurrentStats, error) {
+	resp, err := f.client.cpClient.FunctionGetCurrentStats(ctx, pb.FunctionGetCurrentStatsRequest_builder{
+		FunctionId: f.FunctionID,
+	}.Build())
+	if err != nil {
+		return nil, err
+	}
+
+	return &FunctionCurrentStats{
+		Backlog:         int(resp.GetBacklog()),
+		NumTotalRunners: int(resp.GetNumTotalTasks()),
+	}, nil
+}
+
+type FunctionAutoscalerSettings struct {
+	MinContainers    *uint32
+	MaxContainers    *uint32
+	BufferContainers *uint32
+	ScaledownWindow  *time.Duration
+}
+
+// UpdateAutoscaler overrides the current autoscaler behavior for this Function.
+func (f *Function) UpdateAutoscaler(ctx context.Context, params *FunctionUpdateAutoscalerParams) (*FunctionAutoscalerSettings, error) {
+	if params == nil {
+		params = &FunctionUpdateAutoscalerParams{}
+	}
+
+	settingsBuilder := pb.AutoscalerSettings_builder{
+		MinContainers:    params.MinContainers,
+		MaxContainers:    params.MaxContainers,
+		BufferContainers: params.BufferContainers,
+	}
+
+	if params.ScaledownWindow != nil {
+		seconds := uint32(params.ScaledownWindow.Seconds())
+		settingsBuilder.ScaledownWindow = &seconds
+	}
+
+	settings := settingsBuilder.Build()
+
+	resp, err := f.client.cpClient.FunctionUpdateSchedulingParams(ctx, pb.FunctionUpdateSchedulingParamsRequest_builder{
+		FunctionId:           f.FunctionID,
+		WarmPoolSizeOverride: 0, // Deprecated field, always set to 0
+		Settings:             settings,
+	}.Build())
+	if err != nil {
+		return nil, err
+	}
+
+	settings = resp.GetCurrentSettings()
+	if settings == nil {
+		return nil, InternalFailure{Exception: "failed to get current autoscaler settings"}
+	}
+
+	var MinContainers *uint32 = nil
+	if settings.HasMinContainers() {
+		tmp := settings.GetMinContainers()
+		MinContainers = &tmp
+	}
+	var MaxContainers *uint32 = nil
+	if settings.HasMaxContainers() {
+		tmp := settings.GetMaxContainers()
+		MaxContainers = &tmp
+	}
+	var BufferContainers *uint32 = nil
+	if settings.HasBufferContainers() {
+		tmp := settings.GetBufferContainers()
+		BufferContainers = &tmp
+	}
+	var ScaledownWindow *time.Duration = nil
+	if settings.HasScaledownWindow() {
+		tmp := time.Duration(settings.GetScaledownWindow()) * time.Second
+		ScaledownWindow = &tmp
+	}
+
+	return &FunctionAutoscalerSettings{
+		MinContainers:    MinContainers,
+		MaxContainers:    MaxContainers,
+		BufferContainers: BufferContainers,
+		ScaledownWindow:  ScaledownWindow,
+	}, nil
+}
+
+// GetWebURL returns the URL of a Function running as a Web Function.
+// Returns empty string if this Function is not a Web Function.
+func (f *Function) GetWebURL() string {
+	return f.getWebURL()
+}
+
+// StatsPercentile is a percentile measurement, with percentile expressed from 0 to 100.
+type StatsPercentile struct {
+	Percentile float64
+	Value      float64
+}
+
+// StatsPercentileDistribution contains a metric's unit and percentile measurements.
+type StatsPercentileDistribution struct {
+	Unit        string
+	Percentiles []StatsPercentile
+}
+
+func statsDistributions(stats map[string]*pb.StatsPercentileDistribution) map[string]StatsPercentileDistribution {
+	result := make(map[string]StatsPercentileDistribution, len(stats))
+	for key, distribution := range stats {
+		percentiles := make([]StatsPercentile, 0, len(distribution.GetPercentiles()))
+		for _, p := range distribution.GetPercentiles() {
+			percentiles = append(percentiles, StatsPercentile{Percentile: float64(p.GetPercentileBasisPoints()) / 100, Value: p.GetValue()})
+		}
+		result[key] = StatsPercentileDistribution{Unit: distribution.GetUnit(), Percentiles: percentiles}
+	}
+	return result
+}
+
+// FunctionStats contains historical Function statistics for a time range.
+type FunctionStats struct {
+	Since                       time.Time
+	Until                       time.Time
+	InputSuccessCount           uint64
+	InputFailureCount           uint64
+	InputTimeoutCount           uint64
+	InputRunningAtEndCount      uint64
+	ContainerStartedCount       uint64
+	ContainerErrorCount         uint64
+	ContainerCreatingAtEndCount uint64
+	VariantCount                uint32
+	InputPercentileStats        map[string]StatsPercentileDistribution
+	ContainerPercentileStats    map[string]StatsPercentileDistribution
+	AllVariants                 bool
+}
+
+// FunctionStatsParams contains options for Function.Stats.
+type FunctionStatsParams struct {
+	// Since is inclusive and defaults to one hour before Until.
+	Since *time.Time
+	// Until is exclusive and defaults to the current time.
+	Until *time.Time
+	// Container restricts statistics to this container ID.
+	Container string
+	// AllVariants aggregates the base Function and its variants.
+	AllVariants bool
+}
+
+// Stats returns historical statistics. The default range is the last hour; the maximum range is 7 days.
+//
+// Read statistics for the last hour:
+//
+//	fn, err := client.Functions.FromName(ctx, "libmodal-test-support", "echo_string", nil)
+//	if err != nil {
+//		return err
+//	}
+//	stats, err := fn.Stats(ctx, nil)
+//	if err != nil {
+//		return err
+//	}
+//	fmt.Println(stats.InputSuccessCount, stats.InputFailureCount)
+//
+// Include all variants over the last 24 hours:
+//
+//	until := time.Now()
+//	since := until.Add(-24 * time.Hour)
+//	variantStats, err := fn.Stats(ctx, &modal.FunctionStatsParams{
+//		Since:       &since,
+//		Until:       &until,
+//		AllVariants: true,
+//	})
+//	if err != nil {
+//		return err
+//	}
+//	for metric, distribution := range variantStats.InputPercentileStats {
+//		fmt.Println(metric, distribution.Unit, distribution.Percentiles)
+//	}
+//
+// Set Container to a container ID to restrict statistics to that container.
+func (f *Function) Stats(ctx context.Context, params *FunctionStatsParams) (*FunctionStats, error) {
+	if params == nil {
+		params = &FunctionStatsParams{}
+	}
+	until := time.Now().UTC()
+	if params.Until != nil {
+		until = params.Until.UTC()
+	}
+	since := until.Add(-time.Hour)
+	if params.Since != nil {
+		since = params.Since.UTC()
+	}
+	if !since.Before(until) {
+		return nil, InvalidError{Exception: "`since` must be before `until`."}
+	}
+	req := pb.FunctionGetTimeRangeStatsRequest_builder{
+		FunctionId: f.FunctionID, Since: timestamppb.New(since), Until: timestamppb.New(until), Rollup: params.AllVariants,
+	}.Build()
+	if params.Container != "" {
+		req.SetContainerId(params.Container)
+	}
+	resp, err := f.client.cpClient.FunctionGetTimeRangeStats(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return &FunctionStats{
+		Since: resp.GetSince().AsTime(), Until: resp.GetUntil().AsTime(),
+		InputSuccessCount:           resp.GetInputSuccessCount(),
+		InputFailureCount:           resp.GetInputFailureCount(),
+		InputTimeoutCount:           resp.GetInputTimeoutCount(),
+		InputRunningAtEndCount:      resp.GetInputRunningAtEndCount(),
+		ContainerStartedCount:       resp.GetContainerStartedCount(),
+		ContainerErrorCount:         resp.GetContainerErrorCount(),
+		ContainerCreatingAtEndCount: resp.GetContainerCreatingAtEndCount(),
+		VariantCount:                resp.GetVariantCount(),
+		InputPercentileStats:        statsDistributions(resp.GetInputPercentileStats()),
+		ContainerPercentileStats:    statsDistributions(resp.GetContainerPercentileStats()),
+		AllVariants:                 params.AllVariants,
+	}, nil
+}
+
+// FunctionInfoParams are options for Function.Info.
+type FunctionInfoParams struct {
+	Refresh bool
+}
+
+// FunctionInfo contains the configuration of a Function, including any
+// overrides applied with WithOptions, WithConcurrency, or WithBatching.
+type FunctionInfo struct {
+	CPU            *float64
+	CPULimit       *float64
+	MemoryMiB      *uint32
+	MemoryLimitMiB *uint32
+	GPUs           []struct {
+		GpuType string
+		Count   uint32
+	}
+	EphemeralDiskMiB *uint32
+
+	ImageID string
+
+	StartupTimeout *time.Duration
+	Timeout        time.Duration
+	MaxRetries     *uint32
+
+	Nonpreemptible bool
+	Regions        []string
+	RoutingRegion  *string
+	Cloud          *string
+
+	ClusterInfo *struct {
+		Size       uint32
+		Rdma       bool
+		FabricSize *uint32
+	}
+
+	BatchingInfo *struct {
+		MaxBatchSize uint32
+		WaitMs       uint64
+	}
+
+	ConcurrencyInfo *struct {
+		MaxInputs    *uint32
+		TargetInputs *uint32
+	}
+
+	Schedule *string
+
+	RestrictModalAccess bool
+	BlockNetwork        bool
+	SingleUseContainers bool
+
+	Volumes map[string]struct {
+		VolumeID string
+		ReadOnly bool
+		SubPath  *string
+	}
+
+	CloudBucketMounts map[string]struct {
+		BucketName string
+		BucketType string // "s3", "r2", "gcp"
+		ReadOnly   bool
+		KeyPrefix  *string
+	}
+
+	SecretIDs []string
+
+	WebInfo *struct {
+		WebURL          string
+		Method          *string
+		Unauthenticated bool
+	}
+
+	MethodNames   []string
+	MethodDetails map[string]struct {
+		WebURL          string
+		Method          *string
+		Unauthenticated bool
+	}
+}
+
+// applyFunctionOptions overrides fn's configuration with options, following the
+// same rules as binding a Function with those options.
+func applyFunctionOptions(fn *pb.Function, options *pb.FunctionOptions) {
+	if options.GetReplaceVolumeMounts() {
+		fn.SetVolumeMounts(options.GetVolumeMounts())
+	}
+	if options.GetReplaceSecretIds() {
+		fn.SetSecretIds(options.GetSecretIds())
+	}
+	if options.HasResources() {
+		resources := fn.GetResources()
+		if resources == nil {
+			resources = &pb.Resources{}
+			fn.SetResources(resources)
+		}
+		proto.Merge(resources, options.GetResources())
+	}
+	if options.HasRetryPolicy() {
+		fn.SetRetryPolicy(options.GetRetryPolicy())
+	}
+	if options.HasTimeoutSecs() {
+		fn.SetTimeoutSecs(options.GetTimeoutSecs())
+	}
+	if options.HasMaxConcurrentInputs() {
+		fn.SetMaxConcurrentInputs(options.GetMaxConcurrentInputs())
+	}
+	if options.HasTargetConcurrentInputs() {
+		fn.SetTargetConcurrentInputs(options.GetTargetConcurrentInputs())
+	}
+	if options.HasBatchMaxSize() {
+		fn.SetBatchMaxSize(options.GetBatchMaxSize())
+	}
+	if options.HasBatchLingerMs() {
+		fn.SetBatchLingerMs(options.GetBatchLingerMs())
+	}
+	if options.HasRoutingRegion() {
+		fn.SetRoutingRegion(options.GetRoutingRegion())
+	}
+}
+
+// Info returns the configuration of the Function, including any overrides
+// applied with WithOptions, WithConcurrency, or WithBatching.
+//
+// SecretIDs only includes Secrets that already exist on Modal. Secrets created
+// locally (e.g. with Secrets.FromMap) that have not been used yet, and the
+// Secret holding env vars passed to WithOptions, are not included.
+func (f *Function) Info(ctx context.Context, params *FunctionInfoParams) (*FunctionInfo, error) {
+	if params == nil {
+		params = &FunctionInfoParams{}
+	}
+
+	if params.Refresh || f.cachedFunctionData == nil {
+		req := pb.FunctionGetByIdRequest_builder{
+			FunctionId: f.FunctionID,
+		}.Build()
+
+		resp, err := f.client.cpClient.FunctionGetById(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+
+		f.cachedFunctionData = resp.GetFunction()
+	}
+
+	return f.buildInfo()
+}
+
+func (f *Function) buildInfo() (*FunctionInfo, error) {
+	options, err := buildFunctionOptionsProto(f.options)
+	if err != nil {
+		return nil, err
+	}
+	if options != nil {
+		// Only Secrets that already exist on Modal have IDs to report, but binding
+		// replaces the Function's Secrets whenever any Secrets or env vars are set.
+		var secrets []*Secret
+		if f.options.secrets != nil {
+			secrets = *f.options.secrets
+		}
+		hasEnv := f.options.env != nil && len(*f.options.env) > 0
+		if len(secrets) > 0 || hasEnv {
+			ids := []string{}
+			for i, s := range secrets {
+				if s == nil {
+					return nil, InvalidError{Exception: fmt.Sprintf("secret at index %d must not be nil", i)}
+				}
+				if s.SecretID != "" {
+					ids = append(ids, s.SecretID)
+				}
+			}
+			options.SetSecretIds(ids)
+			options.SetReplaceSecretIds(true)
+		}
+	}
+
+	if f.cachedFunctionData == nil {
+		return nil, InvalidError{Exception: "Could not parse FunctionData proto"}
+	}
+
+	functionData, ok := proto.Clone(f.cachedFunctionData).(*pb.FunctionData)
+	if !ok {
+		return nil, InvalidError{Exception: "Could not parse FunctionData proto"}
+	}
+
+	rankedFunctions := functionData.GetRankedFunctions()
+	if len(rankedFunctions) == 0 {
+		return nil, InvalidError{Exception: "Could not parse FunctionData proto - no functions provided"}
+	}
+
+	if options != nil {
+		for _, rf := range rankedFunctions {
+			applyFunctionOptions(rf.GetFunction(), options)
+		}
+	}
+
+	firstFunction := rankedFunctions[0].GetFunction()
+
+	ret := FunctionInfo{}
+
+	ret.ImageID = firstFunction.GetImageId()
+
+	if x := firstFunction.GetStartupTimeoutSecs(); x > 0 {
+		startupTimeout := time.Duration(x) * time.Second
+		ret.StartupTimeout = &startupTimeout
+	}
+
+	ret.Timeout = time.Duration(firstFunction.GetTimeoutSecs()) * time.Second
+
+	if x := firstFunction.GetRetryPolicy(); x != nil {
+		retries := x.GetRetries()
+		ret.MaxRetries = &retries
+	}
+
+	resources := firstFunction.GetResources()
+
+	if x := resources.GetMilliCpu(); x > 0 {
+		y := float64(x) / 1000.0
+		ret.CPU = &y
+	}
+	if x := resources.GetMilliCpuMax(); x > 0 {
+		y := float64(x) / 1000.0
+		ret.CPULimit = &y
+	}
+
+	if x := resources.GetMemoryMb(); x > 0 {
+		ret.MemoryMiB = &x
+	}
+	if x := resources.GetMemoryMbMax(); x > 0 {
+		ret.MemoryLimitMiB = &x
+	}
+
+	if x := resources.GetEphemeralDiskMb(); x > 0 {
+		ret.EphemeralDiskMiB = &x
+	}
+
+	type GpuConfig = struct {
+		GpuType string
+		Count   uint32
+	}
+
+	ret.GPUs = make([]GpuConfig, 0, len(rankedFunctions))
+
+	// In the case where the base function has multiple GPU fallbacks and this is a variant with a
+	// GPU override, we don't want to repeat that override multiple times for each fallback, hence
+	// we have this check up front which creates a single entry for the GPU override.
+	if options != nil && options.GetResources().GetGpuConfig().GetCount() != 0 {
+		config := options.GetResources().GetGpuConfig()
+
+		ret.GPUs = append(ret.GPUs, GpuConfig{config.GetGpuType(), config.GetCount()})
+	} else {
+		for _, fn := range rankedFunctions {
+			config := fn.GetFunction().GetResources().GetGpuConfig()
+			if config.GetCount() == 0 {
+				continue
+			}
+
+			ret.GPUs = append(ret.GPUs, GpuConfig{config.GetGpuType(), config.GetCount()})
+		}
+	}
+
+	schedulerPlacement := firstFunction.GetSchedulerPlacement()
+	ret.Nonpreemptible = schedulerPlacement.GetNonpreemptible()
+	if x := schedulerPlacement.GetRegions(); len(x) > 0 {
+		ret.Regions = x
+	}
+
+	if x := firstFunction.GetRoutingRegion(); x != "" {
+		ret.RoutingRegion = &x
+	}
+
+	if x := firstFunction.GetCloudProviderStr(); len(x) > 0 {
+		ret.Cloud = &x
+	}
+
+	if x := firstFunction.GetSchedule(); x != nil {
+		if cron := x.GetCron(); cron != nil {
+			cronStr := fmt.Sprintf("Cron(%s, %s)", cron.GetCronString(), cron.GetTimezone())
+			ret.Schedule = &cronStr
+		} else if period := x.GetPeriod(); period != nil {
+			periodArgs := make([]string, 0, 7)
+			if years := period.GetYears(); years > 0 {
+				periodArgs = append(periodArgs, fmt.Sprintf("years=%d", years))
+			}
+			if months := period.GetMonths(); months > 0 {
+				periodArgs = append(periodArgs, fmt.Sprintf("months=%d", months))
+			}
+			if weeks := period.GetWeeks(); weeks > 0 {
+				periodArgs = append(periodArgs, fmt.Sprintf("weeks=%d", weeks))
+			}
+			if days := period.GetDays(); days > 0 {
+				periodArgs = append(periodArgs, fmt.Sprintf("days=%d", days))
+			}
+			if hours := period.GetHours(); hours > 0 {
+				periodArgs = append(periodArgs, fmt.Sprintf("hours=%d", hours))
+			}
+			if minutes := period.GetMinutes(); minutes > 0 {
+				periodArgs = append(periodArgs, fmt.Sprintf("minutes=%d", minutes))
+			}
+			if seconds := period.GetSeconds(); seconds > 0 {
+				periodArgs = append(periodArgs, fmt.Sprintf("seconds=%f", seconds))
+			}
+
+			periodStr := fmt.Sprintf("Period(%s)", strings.Join(periodArgs, ", "))
+			ret.Schedule = &periodStr
+		}
+	}
+
+	type VolumeMountInfo = struct {
+		VolumeID string
+		ReadOnly bool
+		SubPath  *string
+	}
+
+	ret.Volumes = make(map[string]VolumeMountInfo, len(firstFunction.GetVolumeMounts()))
+	for _, vm := range firstFunction.GetVolumeMounts() {
+		var subPath *string = nil
+		if x := vm.GetSubPath(); x != "" {
+			subPath = &x
+		}
+
+		ret.Volumes[vm.GetMountPath()] = VolumeMountInfo{
+			vm.GetVolumeId(),
+			vm.GetReadOnly(),
+			subPath,
+		}
+	}
+
+	type CloudBucketMountInfo = struct {
+		BucketName string
+		BucketType string // "s3", "r2", "gcp"
+		ReadOnly   bool
+		KeyPrefix  *string
+	}
+
+	ret.CloudBucketMounts = make(map[string]CloudBucketMountInfo, len(firstFunction.GetCloudBucketMounts()))
+	for _, cbm := range firstFunction.GetCloudBucketMounts() {
+		var keyPrefix *string = nil
+		if x := cbm.GetKeyPrefix(); x != "" {
+			keyPrefix = &x
+		}
+
+		bucketType := "s3"
+		if x := cbm.GetBucketType(); x == pb.CloudBucketMount_R2 {
+			bucketType = "r2"
+		} else if x == pb.CloudBucketMount_GCP {
+			bucketType = "gcp"
+		}
+
+		ret.CloudBucketMounts[cbm.GetMountPath()] = CloudBucketMountInfo{
+			cbm.GetBucketName(),
+			bucketType,
+			cbm.GetReadOnly(),
+			keyPrefix,
+		}
+	}
+
+	type WebhookInfo = struct {
+		WebURL          string
+		Method          *string
+		Unauthenticated bool
+	}
+	if wc := functionData.GetWebhookConfig(); wc.GetType() != pb.WebhookType_WEBHOOK_TYPE_UNSPECIFIED {
+		var method *string = nil
+		if x := wc.GetMethod(); x != "" {
+			method = &x
+		}
+
+		ret.WebInfo = &WebhookInfo{
+			functionData.GetWebUrl(),
+			method,
+			!wc.GetRequiresProxyAuth(),
+		}
+	}
+
+	if mds := functionData.GetMethodDefinitions(); functionData.GetIsClass() {
+		methodNames := make([]string, 0, len(mds))
+		methodDetails := make(map[string]WebhookInfo, len(mds))
+
+		for name, def := range mds {
+			methodNames = append(methodNames, name)
+			if wc := def.GetWebhookConfig(); wc.GetType() != pb.WebhookType_WEBHOOK_TYPE_UNSPECIFIED {
+				var method *string = nil
+				if x := wc.GetMethod(); x != "" {
+					method = &x
+				}
+
+				methodDetails[name] = WebhookInfo{
+					def.GetWebUrl(),
+					method,
+					!wc.GetRequiresProxyAuth(),
+				}
+			}
+		}
+
+		slices.Sort(methodNames)
+		ret.MethodNames = methodNames
+		ret.MethodDetails = methodDetails
+	}
+
+	type ClusterInfo = struct {
+		Size       uint32
+		Rdma       bool
+		FabricSize *uint32
+	}
+
+	if functionData.GetXExperimentalGroupSize() > 0 {
+		var fabricSize *uint32 = nil
+		if x := functionData.GetXExperimentalFabricSize(); x > 0 {
+			fabricSize = &x
+		}
+
+		ret.ClusterInfo = &ClusterInfo{
+			functionData.GetXExperimentalGroupSize(),
+			resources.GetRdma(),
+			fabricSize,
+		}
+	}
+
+	type BatchingInfo = struct {
+		MaxBatchSize uint32
+		WaitMs       uint64
+	}
+
+	if firstFunction.GetBatchMaxSize() > 0 {
+		ret.BatchingInfo = &BatchingInfo{
+			firstFunction.GetBatchMaxSize(),
+			firstFunction.GetBatchLingerMs(),
+		}
+	}
+
+	type ConcurrencyInfo = struct {
+		MaxInputs    *uint32
+		TargetInputs *uint32
+	}
+
+	if mci, tci := firstFunction.GetMaxConcurrentInputs(), firstFunction.GetTargetConcurrentInputs(); mci > 0 || tci > 0 {
+		var m *uint32 = nil
+		if mci > 0 {
+			m = &mci
+		}
+
+		var t *uint32 = nil
+		if tci > 0 {
+			t = &tci
+		}
+
+		ret.ConcurrencyInfo = &ConcurrencyInfo{
+			m,
+			t,
+		}
+	}
+
+	ret.BlockNetwork = firstFunction.GetBlockNetwork()
+	ret.RestrictModalAccess = firstFunction.GetUntrusted()
+	ret.SingleUseContainers = firstFunction.GetSingleUseContainers()
+
+	ret.SecretIDs = firstFunction.GetSecretIds()
+
+	return &ret, nil
+}

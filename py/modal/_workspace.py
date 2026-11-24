@@ -1,0 +1,1028 @@
+# Copyright Modal Labs 2025
+import builtins
+import warnings
+from collections.abc import AsyncGenerator, Mapping
+from contextlib import aclosing
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Optional
+
+from google.protobuf.empty_pb2 import Empty
+
+from modal.exception import DeprecationError, InvalidError, NotFoundError
+from modal.types import MemberTokenInfo, ServiceUserInfo
+from modal_proto import api_pb2
+
+from ._audit_logs import _rpcs
+from ._audit_logs.count import count_audit_logs
+from ._audit_logs.list import fetch_audit_logs, fetch_newest_audit_logs
+from ._load_context import LoadContext
+from ._object import _Object
+from ._resolver import Resolver
+from ._utils.time_utils import is_utc_month_aligned, locale_tz, parse_billing_cycle, timestamp_to_localized_dt
+from .client import _Client
+from .types import (
+    AuditEvent,
+    BillingReportItem,
+    ProxyTokenInfo,
+    TokenData,
+    WorkspaceBillingSummary,
+    WorkspaceMemberInfo,
+    WorkspaceSettings,
+)
+
+_AUDIT_LOG_DEFAULT_LIMIT = 100
+_AUDIT_LOG_DEFAULT_WINDOW = timedelta(days=7)
+
+
+def _member_role_from_proto(proto_value: int) -> str:
+    match proto_value:
+        case api_pb2.MEMBER_ROLE_USER:
+            return "member"
+        case api_pb2.MEMBER_ROLE_MANAGER:
+            return "manager"
+        case api_pb2.MEMBER_ROLE_OWNER:
+            return "owner"
+        case _:
+            raise ValueError(f"Unknown workspace member role: {proto_value}")
+
+
+class _WorkspaceMembersManager:
+    """mdmd:namespace"""
+
+    def __init__(self, workspace: "_Workspace"):
+        """mdmd:hidden"""
+        self._workspace = workspace
+
+    async def list(self) -> builtins.list[WorkspaceMemberInfo]:
+        """Return the members of the Workspace.
+
+        **Examples:**
+
+        ```python notest
+        members = modal.Workspace.from_context().members.list()
+        print([m.name for m in members])
+        ```
+        """
+        await self._workspace.hydrate()
+        resp = await self._workspace.client._stub.WorkspaceMembersList(Empty())
+        return [
+            WorkspaceMemberInfo(
+                user_id=item.user_id,
+                name=item.member_displayname,
+                email=item.email,
+                role=_member_role_from_proto(item.member_role),
+                joined_at=timestamp_to_localized_dt(item.joined_at),
+                last_active_at=timestamp_to_localized_dt(item.last_active_at) if item.last_active_at else None,
+            )
+            for item in sorted(resp.members, key=lambda x: x.member_displayname)
+        ]
+
+
+class _Workspace(_Object, type_prefixes=("ac",)):
+    _name: Optional[str] = None
+
+    def __init__(self):
+        """mdmd:hidden"""
+        raise RuntimeError("`Workspace(...)` constructor is not allowed. Use `Workspace.from_context` instead.")
+
+    @property
+    def name(self) -> Optional[str]:
+        return self._name
+
+    @property
+    def members(self) -> "_WorkspaceMembersManager":
+        """Namespace with methods for managing the membership of a Workspace."""
+        return _WorkspaceMembersManager(self)
+
+    @property
+    def audit_logs(self) -> "_WorkspaceAuditLogsManager":
+        """Namespace for reading [Workspace audit logs](https://modal.com/docs/guide/audit-logs)."""
+        return _WorkspaceAuditLogsManager(self)
+
+    @staticmethod
+    def from_context(*, client: Optional[_Client] = None) -> "_Workspace":
+        """Look up the Workspace associated with the current context.
+
+        This returns the Workspace that the active Modal credentials authenticate against
+        (i.e., your active profile or the `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` environment
+        variables). If called inside a Modal container, it returns the Workspace that the
+        container is running in.
+        """
+
+        async def _load(
+            self: "_Workspace", resolver: Resolver, load_context: LoadContext, existing_object_id: Optional[str]
+        ):
+            response = await load_context.client._stub.WorkspaceNameLookup(Empty())
+            self._name = response.username or None
+            self._client = load_context.client
+            self._is_hydrated = True
+
+        return _Workspace._from_loader(
+            _load,
+            "Workspace.from_context()",
+            hydrate_lazily=True,
+            load_context_overrides=LoadContext(client=client),
+        )
+
+    @property
+    def billing(self) -> "_WorkspaceBillingManager":
+        """Namespace for Workspace billing APIs."""
+        return _WorkspaceBillingManager(self)
+
+    @property
+    def proxy_tokens(self) -> "_WorkspaceProxyTokenManager":
+        """Namespace with methods for managing the proxy tokens in a Workspace.
+
+        See [the guide](https://modal.com/docs/guide/webhook-proxy-auth) for more information on proxy tokens.
+        """
+        return _WorkspaceProxyTokenManager(self)
+
+    @property
+    def settings(self) -> "_WorkspaceSettingsManager":
+        """Namespace for Workspace settings APIs."""
+        return _WorkspaceSettingsManager(self)
+
+    @property
+    def service_users(self) -> "_WorkspaceServiceUserManager":
+        """Namespace for managing Service Users in a Workspace.
+
+        See [the guide](https://modal.com/docs/guide/service-users) for more information about Service
+        Users.
+        """
+        return _WorkspaceServiceUserManager(self)
+
+    @property
+    def member_tokens(self) -> "_WorkspaceMemberTokenManager":
+        """Namespace for managing Member API Tokens in a Workspace."""
+        return _WorkspaceMemberTokenManager(self)
+
+
+class _WorkspaceAuditLogsManager:
+    """mdmd:namespace"""
+
+    def __init__(self, workspace: _Workspace):
+        """mdmd:hidden"""
+        self._workspace = workspace
+
+    @staticmethod
+    def _range(since: datetime | None, until: datetime | None) -> tuple[int, int]:
+        until = until or datetime.now(timezone.utc)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=locale_tz())
+        until = until.astimezone(timezone.utc)
+        if since is None:
+            since = until - _AUDIT_LOG_DEFAULT_WINDOW
+        elif since.tzinfo is None:
+            since = since.replace(tzinfo=locale_tz())
+        since = since.astimezone(timezone.utc)
+        return int(since.timestamp() * 1000), int(until.timestamp() * 1000)
+
+    async def fetch(
+        self,
+        query: str = "",
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int | None = None,
+    ) -> AsyncGenerator[AuditEvent, None]:
+        """Fetch the Workspace's audit events, oldest-first.
+
+        Audit events record the sensitive actions that change a Workspace's state: who did
+        what, when, to which resource, and from where. Reading them requires the Enterprise
+        plan and either a Workspace Owner or Manager role, or a role that grants audit log
+        read access. See [the guide](https://modal.com/docs/guide/audit-logs) for more
+        information.
+
+        With no arguments, return the latest 100 events in the past seven days,
+        ordered oldest-first. Workspaces with fewer than 100 events in that window
+        return only those events.
+
+        A `since` or `until` datetime without a timezone is treated as local time. The range
+        between them is limited by the server, currently to seven days.
+
+        Args:
+            query: Query selecting which events to return, e.g.
+                `action:environment.create -status:failure`. Defaults to an empty string,
+                which matches all events.
+                See the query guide [here](https://modal.com/docs/guide/audit-logs#filtering).
+            since: Inclusive start time. Defaults to seven days before `until`.
+            until: Exclusive end time. Defaults to now.
+            limit: Return the newest `limit` matching events in the interval; must be
+                positive if provided. Defaults to 100 when `since` is omitted, or no
+                limit (every event in the interval) when `since` is provided.
+
+        Examples:
+            ```python notest
+            from datetime import datetime, timezone
+
+            ws = modal.Workspace.from_context()
+            latest_events = list(ws.audit_logs.fetch())  # defaults to latest 100 from past week
+            latest_500_events = list(ws.audit_logs.fetch(limit=500))  # latest 500 from past week
+
+            # latest 100 environment creations from past week, excluding failed attempts
+            environment_creation_events = list(ws.audit_logs.fetch("action:environment.create -status:failure"))
+
+            # latest 100 environment creations or deletions from past week
+            environment_change_events = list(ws.audit_logs.fetch("action:(environment.create OR environment.delete)"))
+
+            # return every event in range
+            start = datetime(2026, 10, 1, tzinfo=timezone.utc)
+            end = datetime(2026, 10, 8, tzinfo=timezone.utc)
+            first_week_of_october_events = list(ws.audit_logs.fetch(since=start, until=end))
+            ```
+        """
+        oldest_ms, newest_ms = self._range(since, until)
+        if limit is not None and limit < 1:
+            raise InvalidError("limit must be positive.")
+        await self._workspace.hydrate()
+        client = self._workspace.client
+        config = await _rpcs.get_settings(client)
+        if since is None or limit is not None:
+            entries = await fetch_newest_audit_logs(
+                query, oldest_ms, newest_ms, limit or _AUDIT_LOG_DEFAULT_LIMIT, client=client, config=config
+            )
+            for entry in entries:
+                yield AuditEvent._from_proto(entry)
+            return
+        stream = fetch_audit_logs(
+            query,
+            oldest_ms,
+            newest_ms,
+            client=client,
+            config=config,
+        )
+        async with aclosing(stream):
+            async for entry in stream:
+                yield AuditEvent._from_proto(entry)
+
+    async def count(
+        self,
+        query: str = "",
+        *,
+        since: datetime,
+        until: datetime | None = None,
+    ) -> int:
+        """Count the Workspace's audit events.
+
+        Audit events record the sensitive actions that change a Workspace's state: who did
+        what, when, to which resource, and from where. Reading them requires the Enterprise
+        plan and either a Workspace Owner or Manager role, or a role that grants audit log
+        read access. See [the guide](https://modal.com/docs/guide/audit-logs) for more
+        information.
+
+        An explicit `since` is required to select the start of the time range.
+
+        A `since` or `until` datetime without a timezone is treated as local time. The range
+        between them is limited by the server, currently to seven days.
+
+        Args:
+            query: Query selecting which events to return, e.g.
+                `action:environment.create -status:failure`. Defaults to an empty string,
+                which matches all events.
+                See the query guide [here](https://modal.com/docs/guide/audit-logs#filtering).
+            since: Inclusive start time (required).
+            until: Exclusive end time. Defaults to now.
+
+        Examples:
+            ```python notest
+            from datetime import datetime, timedelta, timezone
+
+            ws = modal.Workspace.from_context()
+            start = datetime.now(timezone.utc) - timedelta(days=7)
+            past_week_count = ws.audit_logs.count(since=start)
+
+            # environments created or deleted in the past week
+            environment_change_count = ws.audit_logs.count(
+                "action:(environment.create OR environment.delete)", since=start
+            )
+
+            start = datetime(2026, 10, 1, tzinfo=timezone.utc)
+            end = datetime(2026, 10, 8, tzinfo=timezone.utc)
+            first_week_of_october_count = ws.audit_logs.count(since=start, until=end)
+            ```
+        """
+        oldest_ms, newest_ms = self._range(since, until)
+        await self._workspace.hydrate()
+        client = self._workspace.client
+        config = await _rpcs.get_settings(client)
+        return await count_audit_logs(client, query, oldest_ms, newest_ms, config)
+
+
+class _WorkspaceProxyTokenManager:
+    """mdmd:namespace"""
+
+    def __init__(self, workspace: "_Workspace"):
+        """mdmd:hidden"""
+        self._workspace = workspace
+
+    async def create(self, name: str = "") -> TokenData:
+        """Create a new proxy token for the Workspace.
+
+        Args:
+            name: An optional name to help identify the token.
+
+        Examples:
+            ```python notest
+            token = modal.Workspace.from_context().proxy_tokens.create(name="production-webhooks")
+            print(token.token_id, token.token_secret)
+            ```
+        """
+        await self._workspace.hydrate()
+        resp = await self._workspace.client._stub.WebhookTokenCreate(api_pb2.WebhookTokenCreateRequest(name=name))
+        return TokenData(token_id=resp.token_id, token_secret=resp.token_secret)
+
+    async def update(self, proxy_token_id: str, *, name: str) -> None:
+        """Update a proxy token in the Workspace.
+
+        An empty name removes the token's name.
+
+        Args:
+            proxy_token_id: The token ID (`wk-...`) to update.
+            name: The updated name for the token.
+
+        Examples:
+            ```python notest
+            ws = modal.Workspace.from_context()
+            ws.proxy_tokens.update(token_id, name="production-webhooks")
+            ```
+        """
+        await self._workspace.hydrate()
+        await self._workspace.client._stub.WebhookTokenUpdate(
+            api_pb2.WebhookTokenUpdateRequest(token_id=proxy_token_id, name=name)
+        )
+
+    async def list(self, environment_name: Optional[str] = None) -> builtins.list[ProxyTokenInfo]:
+        """List proxy tokens in the Workspace.
+
+        Args:
+            environment_name: When provided, list only the tokens associated with this environment.
+
+        Examples:
+            ```python notest
+            ws = modal.Workspace.from_context()
+
+            # List all proxy tokens in the Workspace
+            tokens = ws.proxy_tokens.list()
+            print([t.token_id for t in tokens])
+
+            # List only the proxy tokens associated with a specific Environment
+            env_tokens = ws.proxy_tokens.list(environment_name="prod")
+            ```
+        """
+        await self._workspace.hydrate()
+        if environment_name is None:
+            resp = await self._workspace.client._stub.WebhookTokenList(Empty())
+        else:
+            resp = await self._workspace.client._stub.WebhookTokenListForEnvironment(
+                api_pb2.WebhookTokenListForEnvironmentRequest(environment_name=environment_name)
+            )
+        return [
+            ProxyTokenInfo(
+                token_id=token.token_id,
+                created_at=timestamp_to_localized_dt(token.created_at),
+                scoped=token.scoped,
+                name=token.name,
+                created_by=token.created_by.username,
+            )
+            for token in resp.tokens
+        ]
+
+    async def allow(self, proxy_token_id: str, environment_name: str) -> None:
+        """Allow a proxy token to authenticate requests to a given Environment.
+
+        Args:
+            proxy_token_id: The token ID (`wk-...`) to operate on.
+            environment_name: The name of the environment to allow access to.
+
+        Examples:
+            ```python notest
+            ws = modal.Workspace.from_context()
+            token = ws.proxy_tokens.create()
+            ws.proxy_tokens.allow(token.token_id, "prod")
+            ```
+        """
+        await self._workspace.hydrate()
+        environment_id = await self._environment_id(environment_name)
+        req = api_pb2.WebhookTokenEnvironmentAddRequest(token_id=proxy_token_id, environment_id=environment_id)
+        await self._workspace.client._stub.WebhookTokenEnvironmentAdd(req)
+
+    async def revoke(self, proxy_token_id: str, environment_name: str) -> None:
+        """Revoke a proxy token's access to a given Environment.
+
+        The proxy token is not deleted, and it will continue to authenticate requests to any
+        other Environments it is associated with.
+
+        Args:
+            proxy_token_id: The token ID (`wk-...`) to operate on.
+            environment_name: The name of the environment to revoke access from.
+
+        Examples:
+            ```python notest
+            ws = modal.Workspace.from_context()
+            ws.proxy_tokens.revoke(token_id, "prod")
+            ```
+        """
+        await self._workspace.hydrate()
+        environment_id = await self._environment_id(environment_name)
+        req = api_pb2.WebhookTokenEnvironmentRemoveRequest(token_id=proxy_token_id, environment_id=environment_id)
+        await self._workspace.client._stub.WebhookTokenEnvironmentRemove(req)
+
+    async def delete(self, proxy_token_id: str) -> None:
+        """Delete a proxy token from the Workspace.
+
+        This cannot be reverted. Any clients currently using the token will immediately
+        lose access to associated resources.
+
+        Args:
+            proxy_token_id: The token ID (`wk-...`) to delete.
+
+        Examples:
+            ```python notest
+            modal.Workspace.from_context().proxy_tokens.delete(token_id)
+            ```
+        """
+        await self._workspace.hydrate()
+        await self._workspace.client._stub.WebhookTokenDelete(api_pb2.TokenDeleteRequest(token_id=proxy_token_id))
+
+    async def _environment_id(self, environment_name: str) -> str:
+        # The environment-association RPCs key on environment ID, so resolve the name first.
+        from ._environments import _Environment
+
+        environment = await _Environment.from_name(environment_name, client=self._workspace.client).hydrate()
+        return environment.object_id
+
+
+class _WorkspaceBillingRates(Mapping[str, Decimal]):
+    def __init__(
+        self, rates: Mapping[str, str], warnings: Mapping[str, str], errors: Mapping[str, str], formatted: str
+    ):
+        self._rates = {k: Decimal(v) for k, v in rates.items()}
+        self._warnings = warnings
+        self._errors = errors
+        self._formatted = formatted
+
+    def __getitem__(self, key: str) -> Decimal:
+        if key in self._errors:
+            raise DeprecationError(self._errors[key])
+        elif key in self._warnings:
+            warnings.warn(self._warnings[key], DeprecationError)
+
+        return self._rates[key]
+
+    def __iter__(self):
+        for k in self._rates:
+            # We don't want iteration over the dict to surface any deprecated keys
+            if k in self._warnings:
+                continue
+            if k in self._errors:
+                continue
+
+            yield k
+
+    def __len__(self):
+        return len(set(self._rates.keys()) - set(self._warnings.keys()) - set(self._errors.keys()))
+
+    # Ensures that `rates.get()` doesn't throw `DeprecationError`s
+    # fixme(ayush): pyright seems to assume that the return type of `.get` for a `Mapping[K, V]` is
+    # always `V` regardless of the type of `default`. Fix this somehow?
+    def get(self, key, default=None):  # pyright: ignore [reportIncompatibleMethodOverride]
+        try:
+            return self[key]
+        except KeyError:
+            return default
+        except DeprecationError as e:
+            warnings.warn(str(e), DeprecationError)
+            return default
+
+    # Ensures that `'k' in rates` doesn't throw `DeprecationError`s
+    def __contains__(self, key):
+        try:
+            self[key]
+        except (KeyError, DeprecationError):
+            return False
+        else:
+            return True
+
+    def __str__(self) -> str:
+        return self._formatted
+
+    def __repr__(self) -> str:
+        return repr({k: v for k, v in self.items()})
+
+
+class _WorkspaceBillingManager:
+    """mdmd:namespace"""
+
+    def __init__(self, workspace: _Workspace):
+        """mdmd:hidden"""
+        self._workspace = workspace
+
+    async def rates(self) -> _WorkspaceBillingRates:
+        """Return current pricing rates for the given workspace.
+
+        Returns:
+            A single mapping containing cost values. All values are reported as `decimal.Decimal`s.
+        """
+
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        response = await self._workspace.client._stub.WorkspaceBillingRates(
+            api_pb2.WorkspaceBillingRatesRequest(),
+        )
+
+        return _WorkspaceBillingRates(
+            response.rates,
+            response.deprecation_warnings,
+            response.deprecation_errors,
+            response.formatted,
+        )
+
+    async def report(
+        self,
+        *,
+        start: datetime,  # Start of the report, inclusive
+        end: datetime | None = None,  # End of the report, exclusive
+        resolution: str = "d",  # Resolution, e.g. "d" for daily or "h" for hourly
+        tag_names: list[str] | None = None,  # Optional additional metadata to include
+    ) -> list[BillingReportItem]:
+        """Return a cost report for all Workspace usage, broken down by object and time.
+
+        Args:
+            start: Start of the report, inclusive and rounded to the beginning of the interval.
+                Must be in UTC or timezone-naive (interpreted as UTC).
+            end: End of the report, exclusive. Must be in UTC or timezone-naive. Partial final
+                intervals will be excluded from the report.
+            resolution: Resolution, e.g. "d" for daily or "h" for hourly.
+            tag_names: List of tag names; each row will include the tag name and value in use
+                for that object during the relevant time interval. Pass `["*"]` to include all
+                tags in the report.
+
+        Returns:
+            A list of `BillingReportItem` dataclasses. Each item reports the cost attributed to
+            a specific Modal object during a given time interval. Cost is further broken down by
+            the resource type that generated it (e.g. CPU, Memory, specific GPU usage). Note that
+            the specific resource types included in the breakdown are subject to change as Modal's
+            billing model evolves.
+
+        See also:
+            - [`modal billing report`](https://modal.com/docs/cli/latest/billing#modal-billing-report):
+              A workspace report CLI that has convenience features around relative time range queries
+              and JSON/CSV output.
+            - [`Environment.billing.report()`](https://modal.com/docs/sdk/py/latest/Environment#billingreport):
+              An analogous report API that is scoped to a specific Environment.
+
+        """
+        if tag_names is None:
+            tag_names = []
+
+        if end is None:
+            end = datetime.now(timezone.utc)
+
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        elif start.tzinfo != timezone.utc:
+            raise InvalidError("Timezone-aware 'start' parameter must be in UTC.")
+
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        elif end.tzinfo != timezone.utc:
+            raise InvalidError("Timezone-aware 'end' parameter must be in UTC.")
+
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        request = api_pb2.WorkspaceBillingReportRequest(
+            resolution=resolution,
+            tag_names=tag_names,
+        )
+        request.start_timestamp.FromDatetime(start)
+        request.end_timestamp.FromDatetime(end)
+
+        return [
+            BillingReportItem._from_proto(pb_item)
+            async for pb_item in self._workspace.client._stub.WorkspaceBillingReport.unary_stream(request)
+        ]
+
+    async def summary(
+        self,
+        cycle: str | datetime | None = None,  # Start of the summary, inclusive
+    ) -> WorkspaceBillingSummary:
+        """Return a summary of workspace cost over a single billing cycle determined by `cycle`
+
+        Args:
+            cycle: Start of the summary, inclusive. Must be the first of a month, and must be in UTC
+                or timezone-naive (interpreted as UTC). If provided as a string, it must either be
+                formatted as an ISO 8601 month (YYYY-MM), or must be one of the convenience spellings
+                "this month" or "last month". If not provided, `cycle` defaults to the first of the
+                current month (in which case a summary is generated for the current billing cycle).
+
+        Returns:
+            A single `WorkspaceBillingSummary` dataclass containing the following fields:
+            - `metered_cost` representing cost before any adjustments,
+            - `billed_cost` representing the cost actually invoiced, including all adjustments,
+            - `adjustments` containing a breakdown of the adjustments that make up the difference
+              between `metered_cost` and `billed_cost`. This can include discounts for free volume
+              storage, adjustments due to plan credits, etc. The exact keys of this are subject to
+              change as Modal's billing model evolves.
+            - `metered_cost_breakdown` containing a breakdown of that cost by the Modal resources
+              that generated it. The exact keys of this are subject to change as Modal's billing
+              model evolves.
+
+            All values are reported as `decimal.Decimal`s.
+
+        See also:
+            - [`modal billing summary`](https://modal.com/docs/cli/latest/billing#modal-billing-summary):
+              A workspace summary CLI that has convenience features around relative time range queries.
+            - [`Environment.billing.summary()`](https://modal.com/docs/sdk/py/latest/Environment#billingsummary):
+              An analogous summary API that is scoped to a specific Environment.
+        """
+
+        if cycle is None:
+            cycle = datetime.now(timezone.utc).replace(
+                day=1,
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+        elif isinstance(cycle, str):
+            cycle = parse_billing_cycle(cycle)
+
+        if cycle.tzinfo is None:
+            cycle = cycle.replace(tzinfo=timezone.utc)
+        elif cycle.tzinfo != timezone.utc:
+            raise InvalidError("Timezone-aware 'cycle' parameter must be in UTC.")
+
+        if not is_utc_month_aligned(cycle):
+            raise InvalidError("Provided 'cycle' parameter must be the first of a month.")
+
+        if cycle > datetime.now(timezone.utc):
+            raise InvalidError("Provided 'cycle' parameter cannot be in the future.")
+
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        request = api_pb2.WorkspaceBillingSummaryRequest()
+        request.start_timestamp.FromDatetime(cycle)
+
+        return WorkspaceBillingSummary._from_proto(await self._workspace.client._stub.WorkspaceBillingSummary(request))
+
+
+class _WorkspaceSettingsManager:
+    """mdmd:namespace"""
+
+    @classmethod
+    def _valid_settings(cls):
+        """mdmd:hidden"""
+        return ("default-environment", "image-builder-version")
+
+    def __init__(self, workspace: _Workspace):
+        """mdmd:hidden"""
+        self._workspace = workspace
+
+    async def list(self):
+        """Return a the current workspace settings.
+
+        Returns:
+            A `WorkspaceSettings` dataclass.
+        """
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+        resp = await self._workspace.client._stub.WorkspaceSettings(Empty())
+        return WorkspaceSettings(
+            default_environment=resp.default_environment_name, image_builder_version=resp.image_builder_version
+        )
+
+    async def _set_image_builder_version(self, version: str) -> None:
+        """mdmd:hidden
+        Set the image builder version for the Workspace.
+        """
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+        req = api_pb2.WorkspaceSetImageBuilderVersionRequest(new_image_builder_version=version)
+        await self._workspace.client._stub.WorkspaceSetImageBuilderVersion(req)
+
+    async def _set_default_environment(self, name: str) -> None:
+        """Set the default environment for the Workspace."""
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+        req = api_pb2.WorkspaceSetDefaultEnvironmentRequest(environment_name=name)
+        await self._workspace.client._stub.WorkspaceSetDefaultEnvironment(req)
+
+    async def set(self, name: str, value: str) -> None:
+        """Set a workspace setting to a new value. Must be workspace manager or owner.
+
+        The following settings can be updated:
+
+        - image-builder-version: The image builder version determines the software included in our base images.
+        - default-environment: The default environment when the environment is omitted from SDK or CLI methods.
+
+        Args:
+            name: The name of the setting.
+            value: The new value of the setting.
+
+        Examples:
+            ```python notest
+            modal.Workspace.from_context().settings.set("default-environment", "dev")
+            ```
+        """
+        match name:
+            case "image-builder-version":
+                await self._set_image_builder_version(value)
+            case "default-environment":
+                await self._set_default_environment(value)
+            case _:
+                raise ValueError(f"Unknown setting {name!r}. Valid settings: {', '.join(self._valid_settings())}")
+
+
+class _WorkspaceServiceUserManager:
+    """mdmd:namespace"""
+
+    def __init__(self, workspace: _Workspace):
+        """mdmd:hidden"""
+        self._workspace = workspace
+
+    async def create(self, name: str, *, expires_in: int | None) -> TokenData:
+        """Create a new Service User in the current workspace.
+
+        To call this function, you are required to have Manager permissions in the Workspace.
+
+        Args:
+            name: The name of the new Service User. Must consistent only of alphanumeric, '-', or '_'
+                characters.
+            expires_in: An expiration time, in seconds, after which the token will stop working. If
+                `None`, the token will never expire.
+
+        Returns:
+            A `TokenData` dataclass containing the credentials for the Service User. Note that this
+            is the only time you will be able to view these credentials.
+
+        Examples:
+
+        ```python notest
+        ws = modal.Workspace.from_context()
+
+        # Creates a Service User named "test-service-user", whose credentials expire after one year.
+        service_user_token_data = ws.service_users.create(
+            "test-service-user",
+            expires_in=datetime.timedelta(days=365).total_seconds(),
+        )
+        ```
+        """
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        if expires_in is None:
+            req = api_pb2.ServiceUserCreateRequest(name=name)
+        else:
+            req = api_pb2.ServiceUserCreateRequest(name=name, expires_in_seconds=expires_in)
+
+        resp = await self._workspace.client._stub.ServiceUserCreate(req)
+
+        return TokenData(token_id=resp.token_id, token_secret=resp.token_secret)
+
+    async def set_role(
+        self,
+        service_user_name: str,
+        environment_name: str,
+        *,
+        role: str,
+    ) -> None:
+        """Set the role of a specified Service User within an Environment.
+
+        To call this function, you are required to have Manager permissions in the Workspace.
+
+        Args:
+            service_user_name: The name of the Service User.
+            environment_name: The name of the Environment to which the Service User's new role will
+                apply.
+            role: The access level to grant this Service User.
+
+        Examples:
+
+        ```python notest
+        ws = modal.Workspace.from_context()
+        # Grants Service User "test-service-user" the Viewer role in Environment "production"
+        ws.service_users.set_role("test-service-user", "production", role="viewer")
+
+        # Revokes access to "production" from Service User "test-service-user"
+        ws.service_users.set_role("test-service-user", "production", role="no-access")
+        ```
+        """
+
+        if not role:
+            raise InvalidError("Invalid argument: `role` must not be empty.")
+
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        from ._environments import _Environment
+
+        env = _Environment.from_name(environment_name, client=self._workspace.client)
+        await env.hydrate()
+
+        await self._workspace.client._stub.EnvironmentRoleSet(
+            api_pb2.EnvironmentRoleSetRequest(
+                service_user_name=service_user_name,
+                environment_id=env.object_id,
+                role_str=role,
+            )
+        )
+
+    async def info(self, name: str) -> ServiceUserInfo:
+        """Get information about a specific Service User.
+
+        Args:
+            name: The name of the Service User to introspect.
+
+        Returns:
+            A `ServiceUserInfo` dataclass containing information about the Service User.
+
+        Examples:
+
+        ```python notest
+        ws = modal.Workspace.from_context()
+        service_user = ws.service_users.info("test-service-user")
+        ```
+        """
+
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        resp = await self._workspace.client._stub.ServiceUserInfo(
+            api_pb2.ServiceUserInfoRequest(service_user_name=name)
+        )
+
+        return ServiceUserInfo._from_proto(resp.service_user)
+
+    async def list(self) -> list[ServiceUserInfo]:
+        """List all Service Users in the current workspace.
+
+        Returns:
+            A list of `ServiceUserInfo` dataclasses.
+
+        Examples:
+
+        ```python notest
+        ws = modal.Workspace.from_context()
+        for service_user in ws.service_users.list():
+            print(service_user.name)
+        ```
+        """
+
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        resp = await self._workspace.client._stub.ServiceUserList(Empty())
+
+        return [ServiceUserInfo._from_proto(su) for su in resp.service_users]
+
+    async def delete(self, name: str, *, allow_missing: bool = False) -> None:
+        """Permanently delete a Service User.
+
+        Args:
+            name: The name of the Service User to delete.
+            allow_missing: If `True`, do not throw an exception if the Service User does not exist.
+
+        Examples:
+
+        ```python notest
+        ws = modal.Workspace.from_context()
+        ws.service_users.delete("test-service-user")
+        ```
+        """
+
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        try:
+            await self._workspace.client._stub.ServiceUserDelete(
+                api_pb2.ServiceUserDeleteRequest(service_user_name=name)
+            )
+        except NotFoundError:
+            if not allow_missing:
+                raise
+
+
+class _WorkspaceMemberTokenManager:
+    """mdmd:namespace"""
+
+    def __init__(self, workspace: _Workspace):
+        self._workspace = workspace
+
+    async def disable(self, *token_ids: str) -> None:
+        """Disable member tokens in the specified Workspace.
+
+        If you are a Workspace Manager or Owner, you can use this method to disable any token in the
+        Workspace. Otherwise, you can only disable tokens that you have created. Disabled tokens cannot
+        be used to authenticate with Modal, but can be re-enabled at any point.
+
+        Args:
+            *token_ids: The ID(s) of any tokens you want to disable.
+
+        Examples:
+
+        ```python notest
+        ws = modal.Workspace.from_context()
+        ws.member_tokens.disable("ak-0123456789abcdefghijkl", "ak-mnopqrstuvwxyz01234567")
+        ```
+
+        See Also:
+            - [`Workspace.member_tokens.enable()`](https://modal.com/docs/sdk/py/latest/Workspace#member_tokensenable):
+              A function that re-enables a disabled token, so that it may be used again.
+            - [`modal workspace member-tokens disable`](https://modal.com/docs/cli/latest/workspace#modal-workspace-member-tokens-disable)
+              Command-line equivalent to this function.
+
+        """
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        await self._workspace.client._stub.TokenDisable(api_pb2.TokenDisableRequest(token_ids=list(set(token_ids))))
+
+    async def enable(self, *token_ids: str) -> None:
+        """Re-enable member tokens that have been disabled in the specified Workspace.
+
+        If you are a Workspace Manager or Owner, you can use this method to enable any token in the
+        Workspace. Otherwise, you can only enable tokens that you have created.
+
+        Args:
+            *token_ids: The ID(s) of any tokens you want to enable.
+
+        Examples:
+
+        ```python notest
+        ws = modal.Workspace.from_context()
+        ws.member_tokens.enable("ak-0123456789abcdefghijkl", "ak-mnopqrstuvwxyz01234567")
+        ```
+
+        See Also:
+            - [`Workspace.member_tokens.disable()`](https://modal.com/docs/sdk/py/latest/Workspace#member_tokensdisable).
+              A function that disables a token, so that it may not be used to authenticate with Modal.
+            - [`modal workspace member-tokens enable`](https://modal.com/docs/cli/latest/workspace#modal-workspace-member-tokens-enable)
+              Command-line equivalent to this function.
+        """
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        await self._workspace.client._stub.TokenEnable(api_pb2.TokenEnableRequest(token_ids=list(set(token_ids))))
+
+    async def delete(self, *token_ids: str, allow_missing: bool = False) -> "list[str]":
+        """Delete member tokens in the specified Workspace.
+
+        If you are a Workspace Manager or Owner, you can use this method to delete any token in the
+        Workspace. Otherwise, you can only delete member tokens that you have created.
+
+        Args:
+            *token_ids: The ID(s) of the token(s) you would like to delete.
+            allow_missing: If `True`, do not throw an exception if some of the tokens do not exist.
+
+        Returns:
+            A list of the tokens that were successfully deleted.
+
+        Examples:
+
+        ```python notest
+        ws = modal.Workspace.from_context()
+        ws.member_tokens.delete("ak-0123456789abcdefghijkl", "ak-mnopqrstuvwxyz01234567")
+        ```
+        """
+
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        resp = await self._workspace.client._stub.TokenDelete(
+            req=api_pb2.TokenDeleteRequest(
+                token_ids=token_ids,
+                allow_missing=allow_missing,
+            )
+        )
+
+        return list(resp.deleted_token_ids)
+
+    # .list() must be defined last, as otherwise it masks the builtin `list` type in annotations
+    async def list(self) -> "list[MemberTokenInfo]":
+        """List Member Tokens in the specified Workspace.
+
+        If you are a Manager or an Owner of this Workspace, this method will return a list of all the
+        Member Tokens in the Workspace. Otherwise, this method will only return the Tokens you have
+        created.
+
+        Returns:
+            A list of `MemberTokenInfo` dataclasses.
+
+        Examples:
+
+        ```python notest
+        ws = modal.Workspace.from_context()
+        for member_token in ws.member_tokens.list():
+            print(member_token)
+        ```
+        """
+        if not self._workspace._is_hydrated:
+            await self._workspace.hydrate()
+
+        resp = await self._workspace.client._stub.TokensList(Empty())
+
+        return [MemberTokenInfo._from_proto(token) for token in resp.tokens]
